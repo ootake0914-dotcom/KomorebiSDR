@@ -33,6 +33,7 @@ class AudioOutput:
         self.is_prerolled = False
         self.current_device = None
         self._last_default_name = None
+        self._want_running = False
         self._device_watch_thread = None
         self._device_watch_stop = threading.Event()
         self.preroll_threshold = 8  # 深層ジッターバッファ: 約400ms (8チャンク) 蓄積して完全安定再生
@@ -222,7 +223,11 @@ class AudioOutput:
         s = sd.OutputStream(**kwargs)
         s.start()
         self.stream = s
-        self.current_device = device_idx
+        try:
+            # 実際に開いたデバイス番号を保持 (device指定なしの場合は解決値)
+            self.current_device = int(s.device)
+        except Exception:
+            self.current_device = device_idx
         self.is_running = True
         self.is_prerolled = False
 
@@ -280,7 +285,10 @@ class AudioOutput:
 
     def _reopen_for_device(self, device_idx):
         """デバイス変更 (イヤホン挿抜等) でストリームを開き直す。
-        キューとリミッタ状態は保持し、再プレロールで滑らかに再接続する。"""
+        キューとリミッタ状態は保持し、再プレロールで滑らかに再接続する。
+        開き直し失敗に備え、複数候補 (一致インデックス→PortAudio既定→全出力
+        デバイス) を順に試し、最後はPortAudio再初期化も行う。失敗しても
+        _want_running が立っていれば監視ループが毎秒リトライする。"""
         if self.stream is not None:
             try:
                 self.stream.stop()
@@ -289,16 +297,50 @@ class AudioOutput:
                 pass
             self.stream = None
         self.is_prerolled = False
+
+        candidates = []
+        if device_idx is not None:
+            candidates.append(int(device_idx))
+        candidates.append(None)  # PortAudio既定
         try:
-            self._open_stream(device_idx)
+            for d in sd.query_devices():
+                if d.get("max_output_channels", 0) > 0:
+                    candidates.append(int(d["index"]))
+        except Exception:
+            pass
+        # 重複除去
+        seen = set()
+        uniq = []
+        for c in candidates:
+            if c not in seen:
+                seen.add(c)
+                uniq.append(c)
+
+        for c in uniq:
+            try:
+                self._open_stream(c)
+                return True
+            except Exception:
+                self.stream = None
+                continue
+        # 最後の手段: PortAudioを再初期化して再試行 (デバイス抜き差しで
+        # PortAudioのデバイス一覧が陳腐化した場合の回復)
+        try:
+            sd._terminate()
+            sd._initialize()
+            self._open_stream(None)
+            return True
         except Exception:
             self.stream = None
             self.is_running = False
+            return False
 
     def _start_device_watch(self):
         """Windows既定再生デバイスを監視し、変更時にストリームを再オープンする。
-        (イヤホン挿抜はWindowsが既定デバイスを切替えるが、開いたストリームは
-        旧デバイスに張り付いたまま無音になるため)"""
+        - 既定デバイス名の変化 (Headphones⇔Speakers)
+        - 抜き差し後のPortAudioデバイス再列挙による番号ずれ
+        - ストリーム死 (再オープン失敗)
+        のいずれかを0.5秒間隔で検出し、複数候補へフォールバックしながら復帰する。"""
         self._device_watch_stop.clear()
         try:
             from win_audio import _win_default_output_name
@@ -310,21 +352,40 @@ class AudioOutput:
             last = self._last_default_name
             while not self._device_watch_stop.is_set():
                 try:
-                    if self.is_running:
+                    if self._want_running:
                         try:
                             from win_audio import _win_default_output_name
                             name = _win_default_output_name()
                         except Exception:
                             name = None
+                        need = False
+                        matched = None
                         if name is not None and name != last:
                             last = name
                             self._last_default_name = name
-                            idx = self._match_output_index(name, self.current_device)
-                            if idx is not None and idx != self.current_device:
-                                self._reopen_for_device(idx)
+                            need = True
+                        if not self.is_running:
+                            # ストリーム死 (再オープン失敗等) も回復対象
+                            need = True
+                        elif name:
+                            # 抜き差しでWindowsがデバイスを再列挙するとPortAudioの
+                            # 番号がずれる (例: Headphones 4→3, 5は入力に変化)。
+                            # 名前が同じでも現在のストリーム実デバイスが既定名と
+                            # 一致しなくなったら再オープンする。
+                            matched = self._match_output_index(name, self.current_device)
+                            if (matched is not None
+                                    and self.current_device is not None
+                                    and matched != self.current_device):
+                                need = True
+                        if need:
+                            idx = matched if matched is not None else (
+                                self._match_output_index(name, self.current_device)
+                                if name else None)
+                            self._reopen_for_device(idx)
                 except Exception:
                     pass
-                self._device_watch_stop.wait(1.0)
+                # 0.5秒間隔 (Core Audioクエリ約10ms。抜き差し検出の遅延を最小化)
+                self._device_watch_stop.wait(0.5)
 
         t = threading.Thread(target=loop, daemon=True, name="audio-device-watch")
         self._device_watch_thread = t
@@ -333,6 +394,7 @@ class AudioOutput:
     def start(self):
         if self.is_running:
             return
+        self._want_running = True
         self.is_prerolled = False
         self.remainder = np.empty((0, 2), dtype=np.float32)
         self.last_out_samples = np.zeros(2, dtype=np.float32)
@@ -348,6 +410,7 @@ class AudioOutput:
         self._start_device_watch()
 
     def stop(self):
+        self._want_running = False
         self._device_watch_stop.set()
         if self._device_watch_thread is not None:
             self._device_watch_thread.join(timeout=1.5)

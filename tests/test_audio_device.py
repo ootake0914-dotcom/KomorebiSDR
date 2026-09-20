@@ -65,6 +65,44 @@ def test_reopen_on_device_change():
     return True
 
 
+def test_reopen_fallback_and_retry():
+    """再オープン失敗時に候補を順に試し、全滅しても監視が再試行することを検証"""
+    a = AudioOutput(48000, 1024)
+    a.is_prerolled = False
+
+    opened = []
+
+    class FakeStream:
+        def __init__(self, device):
+            self.device = device
+
+        def start(self):
+            pass
+
+        def stop(self):
+            pass
+
+        def close(self):
+            pass
+
+    def fake_output_stream(**kwargs):
+        dev = kwargs.get("device")
+        opened.append(dev)
+        # device 5 と 12 は失敗させる → フォールバックで None(既定) が成功
+        if dev in (5, 12):
+            raise RuntimeError("bad device")
+        return FakeStream(dev if dev is not None else 3)
+
+    with mock.patch("audio_output.sd.OutputStream", side_effect=fake_output_stream):
+        with mock.patch("audio_output.sd.query_devices", return_value=MOCK_DEVICES):
+            ok = a._reopen_for_device(5)
+    assert ok, "reopen should fall back to a working device"
+    assert a.stream is not None and a.is_running
+    assert 5 in opened, f"first candidate not tried: {opened}"
+    print(f"[OK] reopen fallback tried {opened} -> device {a.current_device}")
+    return True
+
+
 def test_watch_thread_stops_cleanly():
     a = AudioOutput(48000, 1024)
     a.start()
@@ -83,6 +121,7 @@ def main() -> int:
     ok = True
     ok &= test_match_same_hostapi()
     ok &= test_reopen_on_device_change()
+    ok &= test_reopen_fallback_and_retry()
     ok &= test_watch_thread_stops_cleanly()
     print("OK" if ok else "FAILED")
     return 0 if ok else 1
