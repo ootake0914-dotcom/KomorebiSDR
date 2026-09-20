@@ -249,6 +249,7 @@ class CognitiveSpeechMusicTracker:
         self.speech_prob = 0.0   # 0.0: 音楽, 1.0: 音声/トーク
         self.enabled = True
         self.primed = False
+        self._eq_wet = 0.0       # dry/wetクロスフェード (選局直後のジャンプ防止)
         
         # 簡易パラメトリックEQフィルタ状態
         # 120Hz HPF (低域ブーミー抑制)
@@ -272,6 +273,7 @@ class CognitiveSpeechMusicTracker:
     def reset(self):
         self.speech_prob = 0.0
         self.primed = False
+        self._eq_wet = 0.0
         self.hp_x1_l = self.hp_y1_l = 0.0
         self.hp_x1_r = self.hp_y1_r = 0.0
         self.pk_x1_l = self.pk_x2_l = self.pk_y1_l = self.pk_y2_l = 0.0
@@ -339,33 +341,42 @@ class CognitiveSpeechMusicTracker:
         """
         音声確率に応じて、明瞭度チルトEQ (トーク) と 完全フラット (音楽) を
         シームレスに適用する。
+        選局リセット直後は speech_prob が瞬時に立ち上がるため、dry/wet
+        クロスフェード(約0.3s)でゲインジャンプ(+1.28倍)をクリックにしない。
+        HPF状態はバイパス中も常に更新し、ステレオ復帰時のstaleスパイクを防ぐ。
         """
-        if not self.enabled or len(audio) == 0 or self.speech_prob < 0.05:
+        if not self.enabled or len(audio) == 0:
+            return audio
+        is_stereo = (audio.ndim == 2)
+        chs = [audio[:, 0], audio[:, 1]] if is_stereo else [audio]
+        last0 = float(chs[0][-1]) if len(chs[0]) else 0.0
+        last1 = float(chs[1][-1]) if (len(chs) > 1 and len(chs[1])) else last0
+
+        bypass = self.speech_prob < 0.05
+        step = 1.0 / max(1.0, 0.30 * self.sample_rate / max(1, len(audio)))
+        if bypass:
+            self._eq_wet = max(0.0, self._eq_wet - step * 2.0)
+        else:
+            self._eq_wet = min(1.0, self._eq_wet + step)
+        if bypass and self._eq_wet <= 0.0:
+            self.hp_x1_l = last0
+            self.hp_x1_r = last1
             return audio
 
         prob = float(self.speech_prob)
-        is_stereo = (audio.ndim == 2)
-        out = np.empty_like(audio)
-
-        # 左右チャンネル別に適用
-        channels = [audio[:, 0], audio[:, 1]] if is_stereo else [audio]
-        out_channels = []
-
-        for ch_idx, ch in enumerate(channels):
-            # 1. 低域ブーミー低減 (120Hz 1次HPF)
-            # y[n] = x[n] - x[n-1] + r * y[n-1]
-            diff = np.diff(ch, prepend=(self.hp_x1_l if ch_idx == 0 else self.hp_x1_r))
-            if ch_idx == 0:
-                self.hp_x1_l = float(ch[-1])
-            else:
-                self.hp_x1_r = float(ch[-1])
-
-            # HPF出力をブレンド (prob=1.0 で完全適用, 0.0 で原音)
-            # 了解度ブースト: 3kHz帯域の倍音を強調 (+2dB)
-            boost = 1.0 + 0.28 * prob
-            modified_ch = (ch + 0.3 * prob * diff) * boost
-            out_channels.append(modified_ch.astype(np.float32))
-
+        wet = float(self._eq_wet)
+        boost = 1.0 + 0.28 * prob
+        outs = []
+        for i, ch in enumerate(chs):
+            x1 = self.hp_x1_l if i == 0 else self.hp_x1_r
+            # 1. 低域ブーミー低減 (120Hz 1次HPF): y = x - x1 + 0*...
+            diff = np.diff(ch, prepend=x1)
+            modified = (ch + 0.3 * prob * diff) * boost
+            if wet < 1.0:
+                modified = ch * (1.0 - wet) + modified * wet
+            outs.append(modified.astype(np.float32))
+        self.hp_x1_l = last0
+        self.hp_x1_r = last1
         if is_stereo:
-            return np.stack(out_channels, axis=1)
-        return out_channels[0]
+            return np.stack(outs, axis=1)
+        return outs[0]

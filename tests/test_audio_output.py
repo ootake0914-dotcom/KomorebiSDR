@@ -27,6 +27,7 @@ def main() -> int:
     ok = True
     ao = AudioOutput(48000, blocksize=BLOCK)
     ao.volume = 1.0
+    ao._vol_current = 1.0  # 音量ランプを整定済みにする (直接代入はテスト用)
 
     # 1) プレロール前は無音
     out = np.ones((BLOCK, 2), dtype=np.float32)
@@ -77,6 +78,7 @@ def main() -> int:
     ao3 = AudioOutput(48000, blocksize=BLOCK)
     ao3.is_prerolled = True
     ao3.volume = 0.5
+    ao3._vol_current = 0.5  # 音量ランプ整定済み扱い
     put(ao3, np.full((2048, 2), 0.4, dtype=np.float32))
     out = np.zeros((BLOCK, 2), dtype=np.float32)
     ao3._audio_callback(out, BLOCK, None, None)
@@ -85,6 +87,7 @@ def main() -> int:
     print(f"[{'OK' if good else 'FAIL'}] volume scaling (got {out[0, 0]:.3f}, expect 0.200)")
 
     ao3.volume = 2.0
+    ao3._vol_current = 2.0
     put(ao3, np.full((2048, 2), 0.9, dtype=np.float32))
     out = np.zeros((BLOCK, 2), dtype=np.float32)
     ao3._audio_callback(out, BLOCK, None, None)
@@ -92,6 +95,40 @@ def main() -> int:
     good = threshold_ok = peak <= 1.0 and peak > 0.8
     ok &= good
     print(f"[{'OK' if good else 'FAIL'}] soft limiter keeps peak <= 1.0 (peak {peak:.3f})")
+
+    # 5) アンダーラン復帰時のフェードイン (無音→任意振幅の段差クリック防止)
+    ao4 = AudioOutput(48000, blocksize=BLOCK)
+    ao4.is_prerolled = True
+    ao4.volume = 1.0
+    ao4._vol_current = 1.0
+    put(ao4, np.full((BLOCK, 2), 0.5, dtype=np.float32))
+    out = np.zeros((BLOCK, 2), dtype=np.float32)
+    ao4._audio_callback(out, BLOCK, None, None)
+    # キューを空にしてアンダーラン → 再プレロール → 復帰
+    out = np.zeros((BLOCK, 2), dtype=np.float32)
+    ao4._audio_callback(out, BLOCK, None, None)
+    # 再プレロール閾値(4)を満たすよう個別チャンクで4つ投入
+    for _ in range(4):
+        put(ao4, np.full((BLOCK, 2), 0.5, dtype=np.float32))
+    out = np.zeros((BLOCK, 2), dtype=np.float32)
+    ao4._audio_callback(out, BLOCK, None, None)
+    head, tail = float(abs(out[0, 0])), float(out[-1, 0])
+    good = head < 0.05 and abs(tail - 0.5) < 1e-6
+    ok &= good
+    print(f"[{'OK' if good else 'FAIL'}] underrun resume fades in (head={head:.3f}, tail={tail:.3f})")
+
+    # 6) last_out_samplesは音量適用前 (次回アンダーランでの二重適用-6dB段差防止)
+    ao5 = AudioOutput(48000, blocksize=BLOCK)
+    ao5.is_prerolled = True
+    ao5.volume = 0.5
+    ao5._vol_current = 0.5
+    put(ao5, np.full((BLOCK, 2), 0.4, dtype=np.float32))
+    out = np.zeros((BLOCK, 2), dtype=np.float32)
+    ao5._audio_callback(out, BLOCK, None, None)
+    saved = float(ao5.last_out_samples[0])
+    good = abs(saved - 0.4) < 1e-6
+    ok &= good
+    print(f"[{'OK' if good else 'FAIL'}] last_out_samples is pre-volume (got {saved:.3f}, expect 0.400)")
 
     print(f"     callback max time: {ao.callback_us_max:.0f} us")
     print("OK" if ok else "FAILED")

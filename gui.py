@@ -1242,6 +1242,9 @@ class SdrGui:
             return
         n = min(len(audio_pcm), 8192)
         chunk = np.asarray(audio_pcm[-n:], dtype=np.float32)
+        if chunk.ndim == 2:
+            # ステレオはL/Rを混ぜず片ch (L) を表示 (reshapeで交互に混ざるのを防ぐ)
+            chunk = chunk[:, 0]
         pw = r.width - 24
         seg = max(1, n // pw)
         m = (n // seg) * seg

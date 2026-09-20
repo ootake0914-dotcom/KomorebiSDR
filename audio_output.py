@@ -47,6 +47,14 @@ class AudioOutput:
         self._mask = np.empty(self._scratch.shape, dtype=bool)
         # フェード曲線 (最大32) とソフトリミッタ作業域も事前確保
         self._fade = (0.5 * (1.0 + np.cos(np.linspace(0.0, np.pi, 32, dtype=np.float32)))).astype(np.float32)
+        # 復帰用フェードイン (0→1)。無音から任意振幅で再開する段差を消す
+        self._fade_in = (0.5 * (1.0 - np.cos(np.pi * np.arange(1, 33) / 33.0))
+                         ).astype(np.float32)[:, None]
+        self._needs_fade_in = False
+        self._played_once = False
+        self._vol_current = float(self.volume)
+        self._vol_ramp = np.empty(len(self._scratch), dtype=np.float32)
+        self._preroll_default = self.preroll_threshold
         self._signbuf = np.empty_like(self._scratch)
         self._compbuf = np.empty_like(self._scratch)
 
@@ -85,15 +93,21 @@ class AudioOutput:
             self._mask = np.empty(self._scratch.shape, dtype=bool)
             self._signbuf = np.empty_like(self._scratch)
             self._compbuf = np.empty_like(self._scratch)
+            self._vol_ramp = np.empty(len(self._scratch), dtype=np.float32)
 
         # プレロール判定: バッファが深層クッション(約400ms)まで蓄積されるまで待機
         if not self.is_prerolled:
             if self.audio_queue.qsize() >= self.preroll_threshold:
                 self.is_prerolled = True
+                # 無音から復帰する場合のみフェードイン (初回再生は不要)
+                self._needs_fade_in = self._played_once
             else:
                 outdata.fill(0.0)
                 self.last_out_samples[:] = 0.0
                 return
+        elif self.preroll_threshold < self._preroll_default and self.audio_queue.qsize() >= self._preroll_default:
+            # アンダーランで縮めた閾値を、バッファが回復したら元へ戻す
+            self.preroll_threshold = self._preroll_default
 
         scratch = self._scratch
         n = 0
@@ -135,6 +149,8 @@ class AudioOutput:
                 scratch[n + fade_len:frames] = 0.0
             else:
                 scratch[n:frames] = 0.0
+            # 次コールバックの復帰時にフェードインを掛ける (無音→任意振幅の段差防止)
+            self._needs_fade_in = True
 
             # キューが完全に空なら再プレロール(4チャンク)して小刻みなバタつきを防止
             if self.audio_queue.empty() and len(self.remainder) == 0:
@@ -142,6 +158,17 @@ class AudioOutput:
                 self.preroll_threshold = 4
 
         data = scratch[:frames]
+
+        # フェード源は音量適用前の生サンプルを保存 (次回アンダーラン時、音量を
+        # 二重に掛けて -6dB 段差になるのを防ぐ)。n==0では前回保存値を使う。
+        raw_last = (scratch[n - 1].copy() if n > 0 else
+                    self.last_out_samples.copy())
+
+        # 無音からの復帰時は短いフェードイン (先頭クリック防止)
+        if self._needs_fade_in:
+            fl = min(len(self._fade_in), frames)
+            data[:fl] *= self._fade_in[:fl]
+            self._needs_fade_in = False
 
         # GUIスレッドと共有する状態は先頭でスナップショット (途中の書き換えを遮断)
         vol = self.volume
@@ -151,13 +178,27 @@ class AudioOutput:
         if muted:
             outdata[:, 0] = 0.0
             outdata[:, 1] = 0.0
+            self.last_out_samples[:] = raw_last
             us = (time.perf_counter() - t0) * 1e6
             if us > self.callback_us_max:
                 self.callback_us_max = us
             return
 
-        # 音量スケーリング (in-place、確保なし)
-        np.multiply(data, vol, out=data)
+        # 音量スケーリング (ブロック内で前回値から目標値へ線形ランプ。
+        # スライダー操作・ミュート解除の段差クリックを消す。確保なし)
+        vol = self.volume
+        if abs(vol - self._vol_current) > 1e-4:
+            # 線形ランプをin-place生成 (numpy版によりlinspaceのout=が使えないため)
+            rb = self._vol_ramp[:frames]
+            step = (vol - self._vol_current) / max(1, frames)
+            rb.fill(step)
+            np.cumsum(rb, out=rb)
+            rb += (self._vol_current - step)
+            data *= rb[:, None]
+            self._vol_current = vol
+        else:
+            np.multiply(data, vol, out=data)
+            self._vol_current = vol
 
         # ソフトリミッター (0.85超のみ圧縮。全て事前確保域＋out=で確保なし。
         # fancy-indexは確保を伴うため全フレーム演算＋where書戻し方式)
@@ -182,8 +223,9 @@ class AudioOutput:
         # ステレオ出力 (outdata は C-contiguous な (frames,2))
         outdata[:, 0] = data[:, 0]
         outdata[:, 1] = data[:, 1]
-        if n > 0:
-            self.last_out_samples[:] = data[n - 1]
+        # フェード源は音量・リミッタ適用前の生サンプルを保存 (二重適用防止)
+        self.last_out_samples[:] = raw_last
+        self._played_once = True
 
         us = (time.perf_counter() - t0) * 1e6
         if us > self.callback_us_max:
@@ -430,6 +472,8 @@ class AudioOutput:
             return
         self._want_running = True
         self.is_prerolled = False
+        self._played_once = False
+        self.preroll_threshold = self._preroll_default
         self.remainder = np.empty((0, 2), dtype=np.float32)
         self.last_out_samples = np.zeros(2, dtype=np.float32)
         self._lim_delay = np.zeros((self._lim_delay_n, 2), dtype=np.float32)

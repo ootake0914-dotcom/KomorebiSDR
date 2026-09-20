@@ -648,6 +648,9 @@ class SdrDspPipeline:
         self._wf_cola = np.ones(self._wf_n, dtype=np.float32)
         self._wf_in = np.zeros(0, dtype=np.float32)
         self._wf_out = np.zeros(self._wf_hop, dtype=np.float32)  # 初期プリフィル=固定遅延
+        # STFTがゼロ埋めで生じた追加遅延。mono側を同量遅らせて時間整合を保つ
+        # (ブロック長がホップの倍数でない場合に分離度が崩壊するのを防ぐ)
+        self._wf_extra_delay = 0
         self._wf_ola = np.zeros(self._wf_n, dtype=np.float32)
         self._wf_p = None                  # 番組パワーの時間平滑
         self._wf_g = None
@@ -837,6 +840,11 @@ class SdrDspPipeline:
         self._wf_p = None
         self._wf_g = None
         self._nr_floor_pow = 0.0
+        # STFT内部バッファもクリア (前局のL-R残響が新局の差信号へ混入するのを防ぐ)
+        self._wf_in = np.zeros(0, dtype=np.float32)
+        self._wf_out = np.zeros(self._wf_hop, dtype=np.float32)  # 固定遅延の初期プリフィル
+        self._wf_ola = np.zeros(self._wf_n, dtype=np.float32)
+        self._wf_extra_delay = 0
 
     def set_stereo_nr(self, enabled: bool):
         """ステレオノイズリダクションの有効/無効 (無効時はフルステレオ固定)"""
@@ -855,6 +863,11 @@ class SdrDspPipeline:
         self.deemph_sections = _deemph_sections(self.deemph_tau_us)
         self.deemph_x1 = self.deemph_y1 = 0.0
         self.deemph2_x1 = self.deemph2_y1 = 0.0
+        # Pythonフォールバックのチャンネル別状態もリセット (旧時定数の残留防止)
+        self.deemph_x1_l = self.deemph_y1_l = 0.0
+        self.deemph_x1_r = self.deemph_y1_r = 0.0
+        self.deemph2_x1_l = self.deemph2_y1_l = 0.0
+        self.deemph2_x1_r = self.deemph2_y1_r = 0.0
         self._deemph_state[:] = 0.0
         self._deemph2_state[:] = 0.0
         self._deemph_state_l[:] = 0.0
@@ -1252,7 +1265,9 @@ class SdrDspPipeline:
                 pass
 
         stereo_diff = None
-        if self._last_sin2 is not None and self._stereo_blend > 0.02:
+        _carrier_ok = (self._last_sin2 is not None
+                       and len(self._last_sin2) == len(demod_scaled))
+        if _carrier_ok and self._stereo_blend > 0.02:
             # BS.450準拠: 38kHz副搬送波はsin(2wt)。
             # PLLがth = wt - pi/2でロックしているため、sin(2*th) = sin(2wt - pi) = -sin(2wt)。
             # したがって同相復調キャリアは -self._last_sin2。
@@ -1310,6 +1325,9 @@ class SdrDspPipeline:
 
         self.is_stereo = False
         self.stereo_status = "MONO"
+        # モノラル中も遅延履歴を進めておく (ステレオ復帰時に履歴が古い/ゼロだと
+        # 先頭_nr_delayサンプルが無音になり2msの欠落クリックになる)
+        self._delay_mono(mono)
         # モノラル信号はステレオのセンター定位 (L=mono, R=mono) と完全に同一レベル (0dB差) で出力
         out_mono = self._post_process_wfm(mono, "")
         if ultra_gain < 0.999:
@@ -1317,10 +1335,15 @@ class SdrDspPipeline:
         return np.clip(out_mono, -1.0, 1.0)
 
     def _delay_mono(self, mono: np.ndarray) -> np.ndarray:
-        """monoを群遅延分だけ遅延させ、NRフィルタ通過後の差信号と時間整合を取る"""
-        d = self._nr_delay
+        """monoを群遅延分だけ遅延させ、NRフィルタ通過後の差信号と時間整合を取る。
+        NR経路の実遅延 (_nr_delay + STFTゼロ埋め分) に動的に一致させる。"""
+        d = self._nr_delay + int(getattr(self, "_wf_extra_delay", 0))
         if d <= 0 or len(mono) == 0:
             return mono
+        # 履歴長が不足する場合はゼロで延長 (遅延量を厳密に保つ)
+        if len(self.history_mono_delay) < d:
+            pad = np.zeros(d - len(self.history_mono_delay), dtype=np.float32)
+            self.history_mono_delay = np.concatenate((pad, self.history_mono_delay))
         y = np.concatenate((self.history_mono_delay, mono))[:len(mono)]
         if len(mono) >= d:
             self.history_mono_delay = mono[-d:].copy()
@@ -1489,8 +1512,12 @@ class SdrDspPipeline:
             y = self._wf_out[:n].copy()
             self._wf_out = self._wf_out[n:]
         else:
-            y = np.concatenate((self._wf_out, np.zeros(n - len(self._wf_out), dtype=np.float32)))
+            # 不足分だけゼロ埋めするが、その分の遅延を記録する (mono側を同量
+            # 遅らせて群遅延を一致させる。記録しないと分離度が恒久的に崩れる)
+            short = n - len(self._wf_out)
+            y = np.concatenate((self._wf_out, np.zeros(short, dtype=np.float32)))
             self._wf_out = np.zeros(0, dtype=np.float32)
+            self._wf_extra_delay = min(int(self._wf_extra_delay) + int(short), 1 << 20)
         if len(self._wf_out) > 8 * n:
             self._wf_out = self._wf_out[-2 * n:]
         return y
@@ -1526,10 +1553,9 @@ class SdrDspPipeline:
 
     def _update_stereo_pilot(self, mpx: np.ndarray):
         """19kHzパイロットPLLを更新し、ステレオブレンド係数とRDS用57kHz搬送波を生成する"""
-        # 4本すべてクリアしてから生成する。sin2/sin3を残すと、早期return・例外時に
-        # L-R復調が前ブロックの古い38kHz搬送波長で掛かり ValueError/ゴミ音になる。
-        self._last_cos2 = None
-        self._last_sin2 = None
+        # RDS用cos3/sin3は毎ブロック生成するため先にクリア (前ブロック長のまま
+        # 掛かると形状不一致になる)。ステレオ用cos2/sin2はパイロット消失時に
+        # 緩やかなブレンド解放のため保持し、長さ不一致はdemodulate_wfm側で弾く。
         self._last_cos3 = None
         self._last_sin3 = None
         if not (self.stereo_enabled or self.rds_enabled) or _NATIVE is None or len(mpx) < 64:
@@ -1551,17 +1577,13 @@ class SdrDspPipeline:
                 # パイロット不在ゲート: 19kHz帯が無音・微小のまま正規化PLLへ渡すと
                 # 入力が1e11級に膨張→PLL発散→C側の位相正規化が爆発し復帰不能
                 # (モノラル局・無信号でDSPスレッドがハングする)。ここで打ち切り、
-                # ブレンドを減衰させてモノラルへ落とす。弱電界ステレオの瞬断は
-                # 次ブロックで回復するため実害なし。
-                self._stereo_blend *= 0.9
+                # design されたブレンド解放ランプ (0.97) で滑らかにモノラルへ落とす。
+                # 搬送波を保持したままブレンドを絞るため、即時モノ切替の段差
+                # (実測0.58FS) が生じない。搬送波の長さ不一致はdemodulate_wfmで弾く。
+                self._stereo_blend = max(0.0, self._stereo_blend * 0.97)
                 self.stereo_blend = self._stereo_blend
                 self.stereo_pilot_lock = 0.0
                 self.stereo_pilot_ratio = 0.0
-                # 旧局の搬送波を使い回さない (ブレンド残存中のガラスノイズ防止)
-                self._last_cos2 = None
-                self._last_sin2 = None
-                self._last_cos3 = None
-                self._last_sin3 = None
                 return
             sig = np.ascontiguousarray(np.asarray(mpx, dtype=np.float32) / pilot_rms, dtype=np.float32)
             cos2 = np.empty(n, dtype=np.float32)
