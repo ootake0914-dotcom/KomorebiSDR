@@ -298,6 +298,8 @@ class SdrGui:
         self.live_peaks = []          # 表示中スペクトラムのliveピーク (ワンクリック選局用)
         self._last_peak_time = 0.0    # liveピーク更新時刻 (5Hz間引き)
         self.hover_freq_hz = None     # スペクトラム上のマウス位置の周波数
+        self.station_list_open = False  # 検出局プルダウンの開閉
+        self.station_list_scroll = 0    # プルダウンのスクロール行位置
         self.scan_status_text = "待機中 (Auto Seek / 全帯域スキャン可能)"
         self.telemetry_text = ""
 
@@ -471,8 +473,13 @@ class SdrGui:
         self.btn_scan_band = Button((tx, 332, fm_w, 30), t("scan_button"), self._request_scan,
                                     bg_color=(214, 240, 229), active_color=C_ACCENT)
         self.btn_scan_sw = Button((tx + fm_w + 6, 332, tw - fm_w - 6, 30), t("scan_sw_button"),
-                                  self._request_sw_scan, bg_color=(226, 236, 248), active_color=C_ACCENT)
+                                   self._request_sw_scan, bg_color=(226, 236, 248), active_color=C_ACCENT)
         btns.extend([self.btn_seek_prev, self.btn_seek_next, self.btn_scan_band, self.btn_scan_sw])
+        # 検出局プルダウン (25局でもワンクリック選局)
+        self.btn_station_list = Button((tx, 360, tw, 20), "▼ 検出局 (0)",
+                                       self._toggle_station_list,
+                                       bg_color=(232, 240, 250), active_color=C_BTN_ACTIVE2)
+        btns.append(self.btn_station_list)
         gap = 4
         mw = (tw - 5 * gap) // 6
         mode_defs = [("WFM", (212, 236, 248)), ("AM", (212, 236, 248)), ("NFM", (212, 236, 248)),
@@ -601,6 +608,88 @@ class SdrGui:
             self.scan_status_text = t("sw_scanning")
             self.on_sw_scan_request()
 
+    # ---- 検出局プルダウン ----
+    _SL_ROW_H = 26
+    _SL_HEADER_H = 30
+    _SL_VISIBLE = 12
+    _SL_WIDTH = 340
+
+    def _toggle_station_list(self):
+        if not self.detected_stations:
+            self.scan_status_text = "検出局なし (スキャンしてください)"
+            return
+        self.station_list_open = not self.station_list_open
+        self.station_list_scroll = 0
+
+    def _station_list_layout(self):
+        """プルダウンの配置を返す (panel_rect, row_rects, total)。純粋計算のみ。"""
+        total = len(self.detected_stations)
+        vis = min(total, self._SL_VISIBLE)
+        w, rh, hh = self._SL_WIDTH, self._SL_ROW_H, self._SL_HEADER_H
+        h = hh + vis * rh + 8
+        panel = pygame.Rect(self.width // 2 - w // 2, self.height // 2 - h // 2, w, h)
+        rows = [pygame.Rect(panel.x + 8, panel.y + hh + i * rh, w - 16, rh)
+                for i in range(vis)]
+        return panel, rows, total
+
+    def _station_list_click(self, mx: int, my: int) -> bool:
+        """プルダウン開閉中のクリック処理。消費したらTrue。"""
+        if not self.station_list_open:
+            return False
+        panel, rows, total = self._station_list_layout()
+        start = max(0, min(self.station_list_scroll, max(0, total - len(rows))))
+        for i, rc in enumerate(rows):
+            if rc.collidepoint(mx, my):
+                idx = start + i
+                if 0 <= idx < total:
+                    st = self.detected_stations[idx]
+                    self.center_freq = int(st["freq_hz"])
+                    self.scan_status_text = (
+                        f"局リスト選局: {st.get('name', '')} "
+                        f"({st.get('freq_mhz', st['freq_hz'] / 1e6):.2f}MHz, "
+                        f"SNR:+{st.get('snr_db', 0.0):.1f}dB)")
+                    if self.on_freq_change:
+                        self.on_freq_change(self.center_freq)
+                self.station_list_open = False
+                return True
+        # パネル外クリックで閉じる
+        if not panel.collidepoint(mx, my):
+            self.station_list_open = False
+        return True
+
+    def _draw_station_list(self):
+        if not self.station_list_open or not self.detected_stations:
+            return
+        panel, rows, total = self._station_list_layout()
+        dim = pygame.Surface((self.width, self.height), pygame.SRCALPHA)
+        dim.fill((10, 16, 28, 90))
+        self.screen.blit(dim, (0, 0))
+        pygame.draw.rect(self.screen, (248, 250, 253), panel, border_radius=12)
+        pygame.draw.rect(self.screen, (90, 110, 140), panel, width=2, border_radius=12)
+        title = cached_text(self.font_med, f"検出局 ({total})  — クリックで選局",
+                            (30, 60, 90))
+        self.screen.blit(title, (panel.x + 14, panel.y + 6))
+        start = max(0, min(self.station_list_scroll, max(0, total - len(rows))))
+        cur = int(self.center_freq)
+        for i, rc in enumerate(rows):
+            idx = start + i
+            if idx >= total:
+                break
+            st = self.detected_stations[idx]
+            sel = abs(int(st["freq_hz"]) - cur) < 50000
+            if sel:
+                pygame.draw.rect(self.screen, (214, 236, 248), rc, border_radius=6)
+            name = str(st.get("name", ""))[:18]
+            freq = st.get("freq_mhz", st["freq_hz"] / 1e6)
+            snr = st.get("snr_db", 0.0)
+            line = cached_text(self.font_small, f"{name}  {freq:.2f}MHz  +{snr:.1f}dB",
+                               (30, 50, 80))
+            self.screen.blit(line, (rc.x + 8, rc.y + 5))
+        if total > len(rows):
+            hint = cached_text(self.font_tiny, "ホイールでスクロール・Escで閉じる",
+                               (110, 128, 150))
+            self.screen.blit(hint, (panel.x + 14, panel.bottom - 20))
+
     def _toggle_stereo(self):
         if self.on_stereo_toggle:
             self.on_stereo_toggle()
@@ -646,6 +735,9 @@ class SdrGui:
                 self.running = False
                 return
 
+            if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+                self.station_list_open = False
+
             # マウス移動時の桁ホバー検出
             if event.type == pygame.MOUSEMOTION:
                 mx, my = event.pos
@@ -665,6 +757,15 @@ class SdrGui:
 
             if wheel_delta != 0:
                 mx, my = pygame.mouse.get_pos()
+                if self.station_list_open:
+                    panel, rows, total = self._station_list_layout()
+                    if panel.collidepoint(mx, my) and total > len(rows):
+                        self.station_list_scroll = max(
+                            0, min(total - len(rows),
+                                    self.station_list_scroll - wheel_delta))
+                        wheel_delta = 0
+            if wheel_delta != 0:
+                mx, my = pygame.mouse.get_pos()
                 if self.hero_rect.collidepoint(mx, my):
                     # ホバー中の桁、またはデフォルト100kHz刻みで同調
                     step = self.hovered_freq_digit if self.hovered_freq_digit is not None else 100000
@@ -677,7 +778,9 @@ class SdrGui:
             # スペクトラム・ウォーターフォールクリックによる同調 (検出局マーカーへの自動吸着対応)
             if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                 mx, my = event.pos
-                if self.spec_rect.collidepoint(mx, my) or self.wf_rect.collidepoint(mx, my):
+                if self.station_list_open:
+                    self._station_list_click(mx, my)
+                elif self.spec_rect.collidepoint(mx, my) or self.wf_rect.collidepoint(mx, my):
                     w = self.spec_rect.width
                     ratio = (mx - self.spec_rect.x) / w if w > 0 else 0.5
                     sr = self.sample_rate if self.sample_rate > 0 else 1152000
@@ -1061,8 +1164,6 @@ class SdrGui:
             if f_min <= pf <= f_max and (f_max - f_min) > 0:
                 p_x = r.x + int((pf - f_min) / (f_max - f_min) * r.width)
                 pygame.draw.line(self.screen, (0, 210, 170), (p_x, r.y + 30), (p_x, r.y + 40), 2)
-                pl = cached_text(self.font_tiny, f"{pf / 1e6:.2f}", (0, 190, 155))
-                self.screen.blit(pl, (p_x - 20, r.y + 41))
 
         # ホバー周波数表示
         if self.hover_freq_hz is not None and f_min <= self.hover_freq_hz <= f_max:
@@ -1170,7 +1271,10 @@ class SdrGui:
         self._draw_waterfall(spectrum_db)
         self._draw_waveform(audio_pcm)
         self._draw_telemetry()
+        if hasattr(self, "btn_station_list"):
+            self.btn_station_list.text = f"▼ 検出局 ({len(self.detected_stations)})"
         self._draw_controls()
+        self._draw_station_list()
 
         pygame.display.flip()
         self.clock.tick(30)
