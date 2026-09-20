@@ -210,7 +210,10 @@ def _clean_preset_list(v, default_mode: str) -> list:
 
 
 def load_config() -> dict:
-    cfg = dict(DEFAULT_CONFIG)
+    # 浅コピーだとプリセットリストがDEFAULT_CONFIGの参照を共有し、
+    # 呼出側のリスト直接変更で既定値が汚れるため深く複製する
+    cfg = {k: (list(v) if isinstance(v, list) else v)
+           for k, v in DEFAULT_CONFIG.items()}
     try:
         with open(CONFIG_PATH, "r", encoding="utf-8") as f:
             loaded = json.load(f)

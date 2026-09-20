@@ -34,9 +34,16 @@ class SdrApp:
     """SDRアプリケーション統合コントローラ (AutoTuner & DX機能搭載)"""
 
     def __init__(self, initial_freq=None, initial_mode=None, controller_type="hyper",
-                 config=None, country=None):
+                 config=None, country=None, stereo=None, stereo_nr=None):
         # ---- 設定・地域プロファイル ----
-        self.config = config if config is not None else load_config()
+        # configはコピーして使う (--mono等のセッション限り上書きを元cfgに
+        # 書き込まず、終了時のsave_configで永続化させないため)
+        self.config = dict(config) if config is not None else load_config()
+        # CLI一時上書き (--mono / --no-stereo-nr はこのセッションのみ有効・保存しない)
+        if stereo is not None:
+            self.config["stereo"] = bool(stereo)
+        if stereo_nr is not None:
+            self.config["stereo_nr"] = bool(stereo_nr)
         self.country = (country or self.config.get("country") or detect_country()).upper()
         self.profile = region_profile(self.country)
         if initial_freq is None:
@@ -89,6 +96,7 @@ class SdrApp:
         self.latest_audio = np.zeros(1024, dtype=np.float32)
         self.running = False
         self.sdr_thread = None
+        self.manual_gain_db = None  # 手動ゲイン値 (スキャン復元用)
 
         # GUIコールバック登録
         self.gui.on_freq_change = self.set_frequency
@@ -113,13 +121,10 @@ class SdrApp:
         self.gui.mode = self.mode
         self.gui.sample_rate = self.sample_rate
 
-    def _initial_presets(self):
-        """設定保存されたプリセット、無ければ地域既定 (日本は既知局) を返す"""
-        cached = self.config.get("presets_region") == self.profile["region"]
-        fm = self.config.get("presets_fm") or []
-        am = self.config.get("presets_am") or []
-        if cached and (fm or am):
-            return fm, am
+    def _region_defaults(self) -> tuple:
+        """地域既定プリセット (JPは既知局、他地域は空)"""
+        fm = []
+        am = []
         if self.profile["region"] == "JP":
             fm = [
                 {"name": "NHK水戸 83.2", "freq_hz": 83200000, "mode": "WFM"},
@@ -144,6 +149,17 @@ class SdrApp:
             ]
         return fm, am
 
+    def _initial_presets(self):
+        """設定保存されたプリセット、無ければ地域既定 (日本は既知局) を返す。
+        側面ごとに補完: 保存済みが空の側は地域既定へフォールバック (FMスキャンで
+        AM側が空に上書き保存されてもJP既定が復活する)。地域不一致時は既定へ戻す。"""
+        dfm, dam = self._region_defaults()
+        if self.config.get("presets_region") != self.profile["region"]:
+            return dfm, dam
+        fm = self.config.get("presets_fm")
+        am = self.config.get("presets_am")
+        return (fm if fm else dfm), (am if am else dam)
+
     def _update_presets_from_scan(self, stations):
         """スキャン結果の強力なFM局からプリセットを自動生成し、設定へ保存"""
         fm = [s for s in stations if s["freq_hz"] >= 24000000]
@@ -158,7 +174,8 @@ class SdrApp:
         self.config["presets_fm"] = fm_presets
         self.config["presets_region"] = self.profile["region"]
         save_config(self.config)
-        self.gui.set_presets(fm_presets, self.config.get("presets_am") or [])
+        # AM側はNoneで維持 (空リストを渡すとAMプリセットが消えるため)
+        self.gui.set_presets(fm_presets, None)
 
     def _update_presets_from_sw_scan(self, stations):
         """短波スキャン結果からAMプリセットを生成し、設定へ保存"""
@@ -181,7 +198,8 @@ class SdrApp:
         self.config["presets_am"] = am_presets
         self.config["presets_region"] = self.profile["region"]
         save_config(self.config)
-        self.gui.set_presets(self.config.get("presets_fm") or [], am_presets)
+        # FM側はNoneで維持 (空リストを渡すとFMプリセットが消えるため)
+        self.gui.set_presets(None, am_presets)
 
     def init_hardware(self):
         """RTL-SDRデバイスの初期化"""
@@ -220,8 +238,9 @@ class SdrApp:
         print("[*] Background full-band scan started...")
         self.cmd_queue.put(("SCAN", "auto_best"))
 
-    # 合体可能コマンド: 滞留中の同種は最新のみ適用 (スキャン中のスライダ連打対策)
-    _COALESCE_CMDS = ("FREQ", "MODE", "GAIN", "FILTER", "BFO")
+    # 合体可能コマンド: 滞留中の同種は最新のみ適用 (スキャン中のスライダ連打対策)。
+    # BFOは差分(±50Hz)コマンドのため合体すると押した分が消える→除外。
+    _COALESCE_CMDS = ("FREQ", "MODE", "GAIN", "FILTER")
 
     def _drain_commands(self):
         """キューを全排出して陳腐化コマンドを合体する。
@@ -305,6 +324,14 @@ class SdrApp:
 
     def _sdr_worker(self):
         """SDRデータ受信 & DSP処理ワーカースレッド"""
+        # FTZ/DAZ (denormalジッタ対策) はスレッド単位の設定のため、
+        # ワーカースレッドでも明示的に有効化する (import時はメインスレッドにのみ効く)
+        try:
+            from dsp import _NATIVE
+            if _NATIVE is not None and hasattr(_NATIVE, "sdr_fast_fpu"):
+                _NATIVE.sdr_fast_fpu()
+        except Exception:
+            pass
         # GUI描画(GIL)による一時的な処理落ちを吸収する深いバッファ (約6.9秒分)。
         # 浅いバッファだと溢れた生IQが捨てられ、音声が時間圧縮(早回し+飛び)になる。
         raw_queue = queue.Queue(maxsize=120)
@@ -370,14 +397,26 @@ class SdrApp:
             """帯域スキャンで変更された受信パラメータを通常受信状態へ復元"""
             self.driver.set_sample_rate(self.sample_rate)
             self._apply_frequency_and_mode(self.freq, self.mode)
-            self.controller.init_gains()
+            if self.use_controller:
+                # 自動モード: コントローラの探索へ戻す
+                self.controller.init_gains()
+            elif self.manual_gain_db is not None:
+                # 手動モード: ユーザーが設定した手動ゲインを復元 (スキャン中の33.8dB固定から戻す)
+                try:
+                    self.driver.set_gain_mode(True)
+                    self.driver.set_gain(self.manual_gain_db)
+                except Exception:
+                    pass
 
         def safe_band_scan(status_label: str, auto_best: bool = False):
             """USBストリームを安全に停止して帯域スキャンを実行 (失敗しても必ず復帰)"""
             nonlocal t_usb
             self.gui.scan_status_text = status_label
             if not stop_usb_stream(t_usb):
-                # 旧ストリーム残留: 新スレッドを立てず、旧スレッドの回復に委ねる
+                # 旧ストリーム残留: 新スレッドを立てず、旧スレッドの回復に委ねる。
+                # cancel_asyncで_setした _async_stop を必ず解除しないと、
+                # async_usb_loopが即時復帰を繰り返し永久に受信が止まる。
+                self.driver.resume_async()
                 usb_running.set()
                 self.gui.scan_status_text = "USB busy - scan skipped"
                 return []
@@ -422,6 +461,7 @@ class SdrApp:
             nonlocal t_usb
             self.gui.scan_status_text = status_label
             if not stop_usb_stream(t_usb):
+                self.driver.resume_async()
                 usb_running.set()
                 self.gui.scan_status_text = "USB busy - scan skipped"
                 return []
@@ -492,6 +532,7 @@ class SdrApp:
                         else:
                             self.use_controller = False
                             self.controller.enabled = False
+                            self.manual_gain_db = float(gain_val)
                             self.driver.set_gain_mode(True)
                             self.driver.set_gain(gain_val)
                             self.gui.is_auto_gain = False
@@ -500,18 +541,30 @@ class SdrApp:
                             self.gui.btn_gain_auto.bg_color = (206, 236, 224)
                             self.gui.scan_status_text = t("manual_gain_set", db=f"{gain_val:.1f}")
                     elif cmd == "FILTER":
-                        self.dsp.filter_mode = val
-                        # Cascade式の離散モード切替ではなく、Hyperは連続カットオフの手動固定として反映
-                        if self.controller_type == "hyper" and hasattr(self.controller, "set_filter_override"):
-                            self.controller.set_filter_override(val)
+                        if val == "auto":
+                            # 適応制御へ復帰 (Hyperはoverride解除、dspは既定モードへ)
+                            self.dsp.filter_mode = "clean"
+                            if self.controller_type == "hyper" and hasattr(self.controller, "set_filter_override"):
+                                self.controller.set_filter_override(None)
+                            if self.controller_type == "hyper" and hasattr(self.controller, "reset_tracking"):
+                                self.controller.reset_tracking()
+                        else:
+                            self.dsp.filter_mode = val
+                            # Cascade式の離散モード切替ではなく、Hyperは連続カットオフの手動固定として反映
+                            if self.controller_type == "hyper" and hasattr(self.controller, "set_filter_override"):
+                                self.controller.set_filter_override(val)
                     elif cmd == "SEEK":
-                        # 次局/前局シーク
+                        # 次局/前局シーク (AM/短波ではSW局リスト、FM/その他ではFM局リスト)
                         direction = val
+                        use_sw = (self.freq < 24000000)
                         # 初回シークは局リストが無いため帯域スキャンが必要
                         # (USBストリームを安全に停止しないとread_syncが競合・ハングする)
-                        if not self.tuner.discovered_stations:
-                            safe_band_scan(t("first_seek_scan"))
-                        st = self.tuner.seek_next(self.freq, direction=direction)
+                        if not (self.tuner.discovered_sw if use_sw else self.tuner.discovered_stations):
+                            if use_sw:
+                                safe_hf_scan(t("first_seek_scan"))
+                            else:
+                                safe_band_scan(t("first_seek_scan"))
+                        st = self.tuner.seek_next(self.freq, direction=direction, use_sw=use_sw)
                         if st:
                             self._apply_frequency_and_mode(st["freq_hz"], self.mode)
                             self.gui.center_freq = self.freq
@@ -666,7 +719,10 @@ class SdrApp:
                 now = time.time()
                 if now - getattr(self, "_last_worker_error_time", 0.0) > 2.0:
                     self._last_worker_error_time = now
-                    print(f"[ERROR] Receiver exception: {type(e).__name__}: {e}", file=sys.stderr)
+                    import traceback
+                    tb_lines = [line.strip() for line in traceback.format_exc().strip().splitlines()[-3:]]
+                    tb_info = " | ".join(tb_lines)
+                    print(f"[ERROR] Receiver exception: {type(e).__name__}: {e} [{tb_info}]", file=sys.stderr)
                 time.sleep(0.005)
 
         stop_usb_stream(t_usb)
@@ -766,14 +822,12 @@ def main():
     country = (args.country or cfg.get("country") or detected_country or "CCIR").upper()
     language = args.lang or cfg.get("language") or detect_language()
     i18n_set_language(language)
-    if args.mono:
-        cfg["stereo"] = False
-    if args.no_stereo_nr:
-        cfg["stereo_nr"] = False
 
     freq_hz = int(args.freq * 1e6) if args.freq is not None else None
     app = SdrApp(initial_freq=freq_hz, initial_mode=args.mode,
-                 controller_type=args.controller, config=cfg, country=country)
+                 controller_type=args.controller, config=cfg, country=country,
+                 stereo=(False if args.mono else None),
+                 stereo_nr=(False if args.no_stereo_nr else None))
 
     try:
         app.run()

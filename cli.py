@@ -38,20 +38,23 @@ def fm_scan_range() -> tuple[int, int]:
 
 def parse_freq_str(s: str) -> int:
     """'94.6M'/'594K'/'80000K'/'94600000'をHzへ。不正入力はSystemExitで clean 終了。
-    rstrip("MHZ")は文字集合除去(例:'80MM'→'80')のため接尾辞除去に置換。"""
+    rstrip("MHZ")は文字集合除去(例:'80MM'→'80')のため接尾辞除去に置換。
+    接尾辞なしで3000未満のみMHz扱い (594HZ は 594Hz のまま、594MHz にはしない)。"""
     t = s.strip().upper()
     mult = 1.0
+    matched = False
     for suffix, m in (("MHZ", 1e6), ("KHZ", 1e3), ("M", 1e6), ("K", 1e3), ("HZ", 1.0)):
         if t.endswith(suffix) and len(t) > len(suffix):
             t = t[: -len(suffix)].strip()
             mult = m
+            matched = True
             break
     try:
         val = float(t)
     except ValueError:
         raise SystemExit(f"周波数の形式が不正です: {s!r} (例: 94.6M, 594K)")
     hz = val * mult
-    if mult == 1.0 and val < 3000:
+    if not matched and val < 3000:
         # 後方互換: 単位無しで3000未満はMHz扱い
         hz = val * 1e6
     return int(hz)
@@ -194,6 +197,8 @@ def main():
 
     raw_queue = queue.Queue(maxsize=30)
     running = True
+    usb_enabled = threading.Event()
+    usb_enabled.set()
 
     def on_usb_data(raw_bytes):
         if not running:
@@ -206,10 +211,14 @@ def main():
         raw_queue.put(raw_bytes)
 
     def async_usb_thread():
-        try:
-            driver.read_async(on_usb_data, num_buffers=16, buffer_len=132096)
-        except Exception:
-            pass
+        while running:
+            if not usb_enabled.is_set():
+                time.sleep(0.05)
+                continue
+            try:
+                driver.read_async(on_usb_data, num_buffers=16, buffer_len=132096)
+            except Exception:
+                time.sleep(0.01)
 
     def dsp_worker():
         last_log_time = 0.0
@@ -268,6 +277,31 @@ def main():
         name = match_station_name(current_freq)
         print(f"\n[*] 同調変更: {current_freq / 1e6:.2f} MHz ({name})")
 
+    def do_seek(direction):
+        """局リスト未取得時はUSBを停止して安全にスキャン→復元してからシーク。
+        (非同期ストリーム動作中にread_syncすると競合・ハングするため)"""
+        nonlocal current_freq
+        if not tuner.discovered_stations:
+            print("\n[*] 局リスト未取得のためFM帯域スキャンを実行中...")
+            usb_enabled.clear()
+            driver.cancel_async(timeout=3.0)
+            try:
+                lo, hi = fm_scan_range()
+                tuner.scan_band(lo, hi, step_hz=1800000, snr_threshold=4.2)
+                # スキャン後の復元 (サンプルレート・ゲイン・受信周波数)
+                driver.set_sample_rate(sample_rate)
+                apply_frequency(current_freq)
+                if use_cascade:
+                    controller.init_gains()
+                else:
+                    driver.set_gain_mode(True)
+                    driver.set_gain(float(args.gain))
+            finally:
+                usb_enabled.set()
+        st = tuner.seek_next(current_freq, direction=direction)
+        if st:
+            retune_to(st["freq_hz"])
+
     try:
         while running:
             # キーボード入力チェック
@@ -277,14 +311,10 @@ def main():
                     break
                 elif ch == "n":
                     # 次局シーク
-                    nxt = tuner.seek_next(current_freq, direction=+1)
-                    if nxt:
-                        retune_to(nxt["freq_hz"])
+                    do_seek(+1)
                 elif ch == "p":
                     # 前局シーク
-                    prv = tuner.seek_next(current_freq, direction=-1)
-                    if prv:
-                        retune_to(prv["freq_hz"])
+                    do_seek(-1)
                 elif ch == "d":
                     # DXモード切り替え
                     controller.dx_mode = not controller.dx_mode

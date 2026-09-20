@@ -101,7 +101,29 @@ class RdsDecoder:
         self.groups = 0
         self.blocks = 0
         self._ps = [None] * 8
+        self._rt = [None] * 64      # 生バイト値 (0x0D=CR 終端を検出可能にする)
+        self._rt_ab = None          # RadioText A/Bフラグ (切替でバッファリセット)
+
+    def reset(self):
+        """選局・モード切替時にデコーダ状態を完全リセットする。"""
+        self._buf = np.zeros(0, dtype=np.float32)
+        self._phase = None
+        self._prev_soft = 0.0
+        self._pending = []
+        self._sync = False
+        self._search_from = 0
+        self.pi = 0
+        self._pi_hist.clear()
+        self.pty = None
+        self.tp = None
+        self.ps_name = ""
+        self.radio_text = ""
+        self.clock = None
+        self.groups = 0
+        self.blocks = 0
+        self._ps = [None] * 8
         self._rt = [None] * 64
+        self._rt_ab = None
 
     # ---------------- 信号処理 ----------------
     def _soft_bits(self, buf: np.ndarray, phase: float) -> np.ndarray:
@@ -138,6 +160,10 @@ class RdsDecoder:
         if len(x) == 0:
             return
         self._buf = np.concatenate((self._buf, np.asarray(x, dtype=np.float32)))
+        # タイミング未獲得時のバッファ無制限成長を防止 (最大2000シンボル分で切り捨て)
+        max_buf = int(self.sps * 2000)
+        if len(self._buf) > max_buf:
+            self._buf = self._buf[-max_buf:]
         if self._phase is None and not self._acquire_timing():
             return
         soft = self._soft_bits(self._buf, self._phase)
@@ -168,7 +194,9 @@ class RdsDecoder:
         o4 = block_offset(bits[78:104])
         if o2 != "B" or o4 != "D":
             return False
-        return o1 in ("A", "C", "C'") and o3 in ("C", "C'")
+        # RDS規格上 Block 1 のオフセットは常に "A" (PI符号)。
+        # "C"/"C'" を許容するとノイズからの誤検出率が3倍になるため厳格化。
+        return o1 == "A" and o3 in ("C", "C'")
 
     @staticmethod
     def _data16(bits: list) -> int:
@@ -203,6 +231,13 @@ class RdsDecoder:
         while len(self._pending) >= 104:
             group = self._pending[:104]
             del self._pending[:104]
+            # 同期後もCRCを再検証する (ノイズ・ビットずれによる誤PS/RT防止)。
+            # 1ブロックでも不正なら同期を外して再探索へ (ずれ続けると誤情報を出すため)。
+            if not self._group_valid(group):
+                self._sync = False
+                self._search_from = 0
+                self._pending = group + self._pending  # 捨てずに再探索へ
+                break
             self._process_group(group)
 
     def _process_group(self, bits: list):
@@ -230,29 +265,45 @@ class RdsDecoder:
                     self._ps[idx] = ch
             if all(c is not None for c in self._ps):
                 self.ps_name = "".join(self._ps).strip()
-        elif gtype in (2,) and not version_b:  # RadioText (0A: 64 chars)
+        elif gtype in (2,) and not version_b:  # RadioText (2A: 64 chars)
+            ab = (b2 >> 4) & 1
+            if self._rt_ab is not None and ab != self._rt_ab:
+                # A/Bフラグ切替: 新しい文が始まるためバッファをリセット
+                self._rt = [None] * 64
+            self._rt_ab = ab
             addr = b2 & 0xF
-            chars = [char_of((b3 >> 8) & 0xFF), char_of(b3 & 0xFF),
-                     char_of((b4 >> 8) & 0xFF), char_of(b4 & 0xFF)]
-            for i, ch in enumerate(chars):
+            raw3 = [(b3 >> 8) & 0xFF, b3 & 0xFF,
+                    (b4 >> 8) & 0xFF, b4 & 0xFF]
+            for i, rb in enumerate(raw3):
                 idx = addr * 4 + i
                 if 0 <= idx < 64:
-                    self._rt[idx] = ch
-            if all(c is not None for c in self._rt[:32]):
-                txt = "".join(c or " " for c in self._rt)
-                txt = txt.split("\r")[0].rstrip()
-                self.radio_text = txt
-        elif gtype == 4 and not version_b:  # 時計 (MJD + UTC)
-            mjd = b2
-            hour = (b3 >> 8) & 0x1F
-            minute = b3 & 0x3F
-            if mjd > 15079:
-                # MJD -> 年月日 (簡易換算)
-                yp = int((mjd - 15078.2) / 365.25)
-                mp = int((mjd - 14956.1 - int(yp * 365.25)) / 30.6001)
-                day = mjd - 14956 - int(yp * 365.25) - int(mp * 30.6001)
-                year = 1900 + yp + (1 if mp in (14, 15) else 0)
-                month = mp - 1 - (1 if mp in (14, 15) else 0) * 12
+                    self._rt[idx] = rb
+            # 表示: 32文字全部埋まった場合、またはCR (0x0D) 終端の短い文を表示
+            txt_raw = "".join(chr(c) if c == 0x0D else (char_of(c) if c is not None else " ")
+                              for c in self._rt)
+            if "\r" in txt_raw:
+                txt = txt_raw.split("\r")[0].rstrip()
+                if txt:
+                    self.radio_text = txt
+            elif all(c is not None for c in self._rt[:32]):
+                self.radio_text = txt_raw.rstrip()
+        elif gtype == 4 and not version_b:  # 時計 (EN 50067 4A: MJD 17bit + 5bit時 + 6bit分)
+            # MJD = (Bの下位2bit << 15) | (b3 >> 1)  (b3のbit0は時のMSB)
+            mjd = ((b2 & 3) << 15) | (b3 >> 1)
+            hour = ((b3 & 1) << 4) | ((b4 >> 12) & 0xF)
+            minute = (b4 >> 6) & 0x3F
+            if mjd > 15079 and hour < 24 and minute < 60:
+                # MJD -> 年月日 (Fliegel-Van Flandern / Richards アルゴリズム)
+                j = mjd + 2400001
+                a = j + 32044
+                b = (4 * a + 3) // 146097
+                c = a - (146097 * b) // 4
+                d = (4 * c + 3) // 1461
+                e = c - (1461 * d) // 4
+                m = (5 * e + 2) // 153
+                day = e - (153 * m + 2) // 5 + 1
+                month = m + 3 - 12 * (m // 10)
+                year = 100 * b + d - 4800 + m // 10
                 self.clock = (year, month, day, hour, minute)
 
     @property

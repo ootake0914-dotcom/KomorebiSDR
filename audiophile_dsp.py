@@ -63,10 +63,22 @@ class TpdfDitherNoiseShaper:
         else:
             return self._shape_channel(audio_float, is_right=False)
 
+    def process_float(self, audio_float: np.ndarray) -> np.ndarray:
+        """
+        float32パイプライン用: TPDFディザー＋ノイズシェーピングを適用し、
+        16bit量子化歪みを排除した正規化float32 [-1.0, 1.0] 配列を返す。
+        """
+        if not self.enabled or len(audio_float) == 0:
+            return audio_float
+        int16_arr = self.process_to_int16(audio_float)
+        return (int16_arr.astype(np.float32) * (1.0 / 32767.0))
+
     def _shape_channel(self, ch_float: np.ndarray, is_right: bool) -> np.ndarray:
         n = len(ch_float)
+        # 非有限数 (NaN/Inf) のサニタイズ (例外クラッシュ根絶)
+        ch_clean = np.nan_to_num(ch_float, nan=0.0, posinf=1.0, neginf=-1.0)
         # 16bitフルスケールにスケーリング
-        scaled = np.clip(ch_float * 32767.0, -32767.0, 32767.0)
+        scaled = np.clip(ch_clean * 32767.0, -32768.0, 32767.0)
 
         # 2つの独立した一様乱数の差分による三角分布TPDFディザー [-1.0, 1.0] LSB
         rng = np.random.default_rng()
@@ -134,11 +146,13 @@ class MinimumPhaseApodizer:
         log_mag = np.log(mag)
 
         # 2. ヒルベルト変換による因果的・最小位相スペクトルの計算
-        # 連続周波数上のヒルベルト変換作用素 (-j * sgn)
+        # 最小位相: φ(ω) = -Hilbert[ln|H|]。離散DFTでは正側 +j / 負側 -j。
+        # 旧符号 (負側 -1j) は最大位相になり出力が単位インパルス化していた
+        # (全帯域0dB) ため反転。実測で線形FIRの振幅特性と一致を確認済み。
         h_hilb = np.zeros(fft_len, dtype=np.complex128)
         half = fft_len // 2
-        h_hilb[1:half] = -1j
-        h_hilb[half+1:] = 1j
+        h_hilb[1:half] = 1j
+        h_hilb[half+1:] = -1j
         phase = np.real(np.fft.ifft(np.fft.fft(log_mag) * h_hilb))
 
         # 3. 最小位相スペクトルの逆変換
@@ -202,13 +216,16 @@ class ActiveDcServo:
 
     def _servo_channel(self, ch: np.ndarray, is_right: bool) -> np.ndarray:
         n = len(ch)
+        ch_clean = np.nan_to_num(ch, nan=0.0, posinf=1.0, neginf=-1.0)
         out = np.empty(n, dtype=np.float32)
         dc = self.dc_r if is_right else self.dc_l
+        if not np.isfinite(dc):
+            dc = 0.0
         alpha = self.alpha
 
         # 積分負帰還ループ: y[n] = x[n] - dc,  dc += alpha * y[n]
         for i in range(n):
-            y = ch[i] - dc
+            y = ch_clean[i] - dc
             dc += alpha * y
             out[i] = y
 

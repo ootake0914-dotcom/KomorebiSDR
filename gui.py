@@ -437,6 +437,24 @@ class SdrGui:
         if presets_am is not None:
             self.presets_am = am[:7]
         self._init_controls()
+        # _init_controls はボタンを新規作成するため、トグルの表示状態を再同期する
+        # (スキャンのたびにステレオ/NR/AFC/DX表示が既定値に戻る問題の修正)
+        self._sync_control_states()
+
+    def _sync_control_states(self):
+        """トグル系ボタンの表示を現在の内部状態に合わせる (set_presets等の再構築後)。"""
+        if hasattr(self, "btn_stereo"):
+            self.btn_stereo.text = t("stereo") if self.stereo_enabled else t("mono")
+            self.btn_stereo.bg_color = (206, 240, 226) if self.stereo_enabled else (246, 228, 228)
+        if hasattr(self, "btn_nr"):
+            self.btn_nr.text = f"{t('nr')}: {'ON' if self.nr_enabled else 'OFF'}"
+            self.btn_nr.bg_color = (226, 236, 248) if self.nr_enabled else (236, 238, 244)
+        if hasattr(self, "btn_afc"):
+            self.btn_afc.text = "AFC: ON" if self.is_afc_enabled else "AFC: OFF"
+            self.btn_afc.bg_color = (212, 232, 248) if self.is_afc_enabled else (236, 238, 244)
+        if hasattr(self, "btn_dx_mode"):
+            self.btn_dx_mode.text = "DX Boost: ON" if self.is_dx_mode else "DX: OFF"
+            self.btn_dx_mode.bg_color = (234, 224, 246) if self.is_dx_mode else (240, 243, 248)
 
     @staticmethod
     def _clean_presets(items, default_mode: str) -> list:
@@ -588,8 +606,12 @@ class SdrGui:
     def _toggle_filter(self):
         if not hasattr(self, "filter_mode"):
             self.filter_mode = "clean"
-        self.filter_mode = "wide" if self.filter_mode == "clean" else "clean"
-        self.btn_filter.text = f"Filter: {self.filter_mode.capitalize()}"
+        # clean -> wide -> narrow -> auto(適応) -> clean の循環
+        order = ["clean", "wide", "narrow", "auto"]
+        i = order.index(self.filter_mode) if self.filter_mode in order else 0
+        self.filter_mode = order[(i + 1) % len(order)]
+        label = "Auto" if self.filter_mode == "auto" else self.filter_mode.capitalize()
+        self.btn_filter.text = f"Filter: {label}"
         if hasattr(self, "on_filter_change") and self.on_filter_change:
             self.on_filter_change(self.filter_mode)
 
@@ -749,10 +771,13 @@ class SdrGui:
                             break
 
             # マウスホイールによる周波数同調 (桁単位ホイール同調)
+            # pygame2はMOUSEWHEELを出すため、MOUSEBUTTONDOWN(4/5)は旧SDLの
+            # フォールバック限定 (両対応だと1ノッチで二重に動く)
+            use_legacy_wheel = pygame.version.vernum[0] < 2
             wheel_delta = 0
             if event.type == pygame.MOUSEWHEEL:
                 wheel_delta = event.y
-            elif event.type == pygame.MOUSEBUTTONDOWN and event.button in (4, 5):
+            elif use_legacy_wheel and event.type == pygame.MOUSEBUTTONDOWN and event.button in (4, 5):
                 wheel_delta = 1 if event.button == 4 else -1
 
             if wheel_delta != 0:
@@ -1002,11 +1027,12 @@ class SdrGui:
             self.screen.blit(rl, (self.hero_rect.right - 18 - rl.get_width(), self.hero_rect.y + 12))
 
         # 周波数文字列のフォーマットと桁単位の当たり判定構築
+        # カンマ区切りは1GHz超で桁インデックスを狂わせ、同調ステップが10倍ずれるため使わない
         if self.center_freq >= 1000000:
-            freq_str = f"{self.center_freq / 1e6:,.4f}"
+            freq_str = f"{self.center_freq / 1e6:.4f}"
             unit = "MHz"
         else:
-            freq_str = f"{self.center_freq / 1e3:,.1f}"
+            freq_str = f"{self.center_freq / 1e3:.1f}"
             unit = "kHz"
 
         # 周波数各桁の当たり判定とアンダーライン描画

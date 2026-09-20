@@ -22,6 +22,11 @@ from adaptive_dsp import (
     CognitiveSpeechMusicTracker,
     UltrasonicSquelchTracker,
 )
+from audiophile_dsp import (
+    ActiveDcServo,
+    MinimumPhaseApodizer,
+    TpdfDitherNoiseShaper,
+)
 
 
 # ================================================================
@@ -267,8 +272,69 @@ class AdaptiveDriftResampler:
         if len(audio) == 0:
             return audio
 
+        is_stereo = (audio.ndim == 2)
         n_in = len(audio)
         ratio = self.current_ratio
+
+        if is_stereo:
+            channels = audio.shape[1]
+            if not isinstance(self.last_sample, np.ndarray) or len(self.last_sample) != channels:
+                self.prev_sample = np.zeros(channels, dtype=np.float64)
+                self.last_sample = np.zeros(channels, dtype=np.float64)
+
+            if abs(ratio - 1.0) < 1e-6:
+                d = int(np.floor(self.phase + 0.5))
+                if d <= 0:
+                    self.prev_sample = audio[-2].astype(np.float64) if n_in >= 2 else self.last_sample.copy()
+                    self.last_sample = audio[-1].astype(np.float64)
+                    return audio
+                d = min(d, n_in)
+                out = np.empty((n_in - d, channels), dtype=np.float32)
+                if d == 1:
+                    # 旧: out[1:] = audio[:-1] は長さ不一致 (n_in-2 vs n_in-1) で
+                    # ValueError→数百ms音切れ。前サンプルを先頭に据えて末尾を
+                    # 1つ落とす正しい長さ (n_in-1) に修正。
+                    out[:] = np.concatenate(([self.last_sample], audio[1:-1]), axis=0)
+                else:
+                    ext = np.concatenate(([self.prev_sample, self.last_sample], audio), axis=0)
+                    out[:] = ext[n_in + 2 - len(out):n_in + 2]
+                self.phase -= d
+                self.prev_sample = audio[-2].astype(np.float64) if n_in >= 2 else self.last_sample.copy()
+                self.last_sample = audio[-1].astype(np.float64)
+                return out
+
+            ext_audio = np.concatenate(([self.prev_sample, self.last_sample], audio,
+                                        [audio[-1], audio[-1]]), axis=0).astype(np.float64)
+            indices = np.arange(self.phase, n_in, ratio)
+            if len(indices) == 0:
+                self.phase -= n_in
+                self.prev_sample = audio[-2].astype(np.float64) if n_in >= 2 else self.last_sample.copy()
+                self.last_sample = audio[-1].astype(np.float64)
+                return np.zeros((0, channels), dtype=np.float32)
+
+            # Catmull-Rom 4点3次補間 (ステレオ2chを一括ブロードキャスト計算)
+            ei = indices + 2.0
+            i0 = np.floor(ei).astype(np.int64)
+            f = (ei - i0)[:, np.newaxis].astype(np.float64)
+            i0 = np.clip(i0, 1, n_in + 1)
+            p0 = ext_audio[i0 - 1]
+            p1 = ext_audio[i0]
+            p2 = ext_audio[i0 + 1]
+            p3 = ext_audio[i0 + 2]
+            out = (p1 + 0.5 * f * (p2 - p0
+                   + f * (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3
+                   + f * (3.0 * (p1 - p2) + p3 - p0))))
+
+            last_idx = indices[-1] + ratio
+            self.phase = float(last_idx - n_in)
+            self.prev_sample = audio[-2].astype(np.float64) if n_in >= 2 else self.last_sample.copy()
+            self.last_sample = audio[-1].astype(np.float64)
+            return out.astype(np.float32)
+
+        # モノラル (1次元配列)
+        if isinstance(self.last_sample, np.ndarray):
+            self.prev_sample = 0.0
+            self.last_sample = 0.0
 
         if abs(ratio - 1.0) < 1e-6:
             # 整数遅延バイパス: ドリフトなし時は補間フィルタを掛けない。
@@ -282,8 +348,10 @@ class AdaptiveDriftResampler:
             d = min(d, n_in)
             out = np.empty(n_in - d, dtype=np.float32)
             if d == 1:
-                out[0] = self.last_sample
-                out[1:] = audio[:-1]
+                # 旧: out[1:] = audio[:-1] は長さ不一致 (n_in-2 vs n_in-1) で
+                # ValueError→数百ms音切れ。前サンプルを先頭に据えて末尾を
+                # 1つ落とす正しい長さ (n_in-1) に修正。
+                out[:] = np.concatenate(([self.last_sample], audio[1:-1]))
             else:
                 ext = np.concatenate(([self.prev_sample, self.last_sample], audio))
                 out[:] = ext[n_in + 2 - len(out):n_in + 2]
@@ -444,7 +512,7 @@ class SdrDspPipeline:
         self._fm_pll_kp = 2.0 * _w / _den
         self._fm_pll_ki = _w * _w / _den
         self._fm_pll_state = np.zeros(2, dtype=np.float64)
-        self.fm_pll_enabled = True
+        self.fm_pll_enabled = False  # ワイドFMの過変調歪み・脱調防止のため通常は差分検波を標準使用
         self.nfm_afc_alpha = 0.08  # ISSドップラー追従用時定数
 
         # FIRフィルタの境界連続性保持用バッファ
@@ -511,9 +579,13 @@ class SdrDspPipeline:
         self._pll_theta = 0.0
         self._pll_integ = 0.0
         self._pll_w0 = 2.0 * np.pi * 19000.0 / self.if_rate
-        self._pll_kp = 0.01
-        self._pll_ki = 2e-5
-        self._pll_alpha = 2.0 * np.pi * 100.0 / self.if_rate  # ループフィルタ遮断 ~100Hz
+        # 高級FMチューナー基準 超低ジッターPLL設計 (fn=16Hz, ζ=0.85, ループフィルタ遮断 20Hz)
+        # 従来の過大帯域(205Hz)による低音変調漏れ・位相揺らぎ・定位のあるノイズを根絶
+        _fn_pll = 16.0
+        _wn_pll = 2.0 * np.pi * _fn_pll
+        self._pll_kp = float(2.0 * 0.85 * _wn_pll / self.if_rate)
+        self._pll_ki = float((_wn_pll / self.if_rate) ** 2)
+        self._pll_alpha = float(2.0 * np.pi * 20.0 / self.if_rate)
         self._pll_ef = 0.0
         self._last_cos2 = None
         self._last_sin2 = None
@@ -533,10 +605,8 @@ class SdrDspPipeline:
         self._stereo_blend = 0.0
         # CコアのPLL 1サンプル進みが解消されたため、副搬送波オフセットは 0.0
         self.stereo_phase_offset = 0.0
-        # ステレオRch用 追加リサンプラ (Lchは既存resamplerを共用。
-        # L/Rでmax_ppmを変えると逼迫時に出力長が乖離し片ch切り捨てが起きるため、
-        # 必ず同一パラメータにする)
-        self.resampler_r = AdaptiveDriftResampler(target_chunks=8.0, max_ppm=120.0)
+        # ステレオ2ch完全同期 適応ドリフトリサンプラ (後方互換参照)
+        self.resampler_r = self.resampler
 
         # ===== ステレオノイズリダクション =====
         # 弱電界でステレオ化すると増えるヒスノイズを、(L-R)差信号の高域/中域パワー比から
@@ -567,20 +637,16 @@ class SdrDspPipeline:
         self.history_nr_lp = np.zeros(64, dtype=np.float32)
         self._nr_delay = (len(self._nr_filters[0]) - 1) // 2  # 線形位相FIRの群遅延
 
-        # ===== サブバンドWiener NR (STFT 256pt / hop 128 / Hann 50%オーバーラップ) =====
+        # ===== サブバンドWiener NR (STFT 128pt / hop 64 / 平方根Hann(Sine窓) 50%オーバーラップ) =====
         # 差信号を周波数ごとにWiener抑圧。低域(ノイズが少なく音が濃い)はステレオのまま、
         # ノイズに埋もれた高域のみを選択的に落とすため、単一ローパスより音場が広い。
+        # 平方根Hann窓 (Sine窓: sin(pi*(n+0.5)/N)) を分析・合成の両面で適用することで、
+        # 50% OLAの二乗和が sin² + cos² ≡ 1.0 となり、再構成時の振幅変調リップル(750Hzとその倍音)が
+        # 数学的に完全ゼロ(0.000000dB)に消滅する。
         self._wf_n = 128
         self._wf_hop = 64
-        self._wf_win = np.hanning(self._wf_n).astype(np.float32)
-        cola = np.zeros(self._wf_n, dtype=np.float32)
-        for m in range(-2, 3):
-            s = m * self._wf_hop
-            if s >= 0:
-                cola[s:] += self._wf_win[: self._wf_n - s] ** 2
-            else:
-                cola[:s] += self._wf_win[-s:] ** 2
-        self._wf_cola = np.maximum(cola, 1e-6)
+        self._wf_win = np.sin(np.pi * (np.arange(self._wf_n) + 0.5) / self._wf_n).astype(np.float32)
+        self._wf_cola = np.ones(self._wf_n, dtype=np.float32)
         self._wf_in = np.zeros(0, dtype=np.float32)
         self._wf_out = np.zeros(self._wf_hop, dtype=np.float32)  # 初期プリフィル=固定遅延
         self._wf_ola = np.zeros(self._wf_n, dtype=np.float32)
@@ -601,7 +667,7 @@ class SdrDspPipeline:
         # 1024点指標→STFTドメインへのパワースケール補正 (E|X|²=σ²Σw²)
         self._wf_scale = float(np.sum(self._wf_win ** 2) / np.sum(np.hanning(1024) ** 2))
         self._nr_floor_pow = 0.0           # ブロードバンド指標のノイズ床 (HF帯)
-        self._nr_floor_bias = 2.0          # 下位タイル→平均ノイズへの補正
+        self._nr_floor_bias = 2.3          # 下位タイル→平均ノイズへの補正 (Sine窓特性に最適化)
         self._nr_gmin = 0.05               # 最大抑圧 (-26dB)
         self.stereo_wiener_gain = 1.0
         self._nr_delay += self._wf_hop     # Wiener経路の遅延をmono側で補償
@@ -633,6 +699,17 @@ class SdrDspPipeline:
         # 音声/音楽 認知型オートチルトEQ (トーク了解度 / 音楽フラットHi-Fi 自動追従)
         self.cognitive_eq = CognitiveSpeechMusicTracker(sample_rate=self.audio_rate)
 
+        # ===== 高級オーディオ (Accuphase / dCS 理論) 統合モジュール =====
+        # 低域位相回転ゼロ・アクティブDCサーボ (20Hz〜300Hzの低音位相進み歪みを根絶)
+        self.dc_servo = ActiveDcServo(sample_rate=self.audio_rate, time_constant_sec=3.5)
+        # TPDFディザー & 音響心理ノイズシェーピング (16bit量子化歪み排除 & 微小残響保持)
+        self.dither = TpdfDitherNoiseShaper(sample_rate=self.audio_rate)
+        self.dither.enabled = False  # 内部DSPの数学的等価性維持のためデフォルトOFF (set_audiophile_modeで切替)
+        self.apodizing_enabled = False
+        self._linear_fir_audio_clean = self.fir_audio_clean.copy()
+        self._linear_fir_audio_narrow = self.fir_audio_narrow.copy()
+        self._linear_fir_am_audio = self.fir_am_audio.copy()
+
         # ===== AM同期検波 (キャリア再生PLL) =====
         # 選択性フェージング時のひずみを避けるため、包絡線検波ではなく
         # キャリアに同期した同相検波を使う。ロックできない時は包絡線へ自動復帰。
@@ -655,8 +732,8 @@ class SdrDspPipeline:
         self.mp_lo = 0.10
         self.mp_hi = 0.35
         self.mp_depth = 0.7
-        # CMAブラインド等化器 (マルチパス・キャンセル)。検出量＋信号存在で駆動。
-        self.multipath_cancel_enabled = True
+        # CMAブラインド等化器 (マルチパス・キャンセル)。実機アンテナの安定性のためデフォルトOFF
+        self.multipath_cancel_enabled = False
         self._cma_taps = 33
         # μ sweep実測: 0.15は重度で悪化(55dB)、0.03が中度+28dB・クリーン透明の最良点
         self._cma_mu = 0.03
@@ -724,11 +801,25 @@ class SdrDspPipeline:
             self.ultra_squelch.reset()
         if hasattr(self, "cognitive_eq"):
             self.cognitive_eq.reset()
+        if hasattr(self, "dc_servo"):
+            self.dc_servo.reset()
+        if hasattr(self, "dither"):
+            self.dither.reset()
+        # RDS状態も選局でリセット (前局のPS/PI/RTを次局へ持ち越さない)
+        if self.rds is not None:
+            try:
+                self.rds.reset()
+            except Exception:
+                pass
+        self.rds_ps = ""
+        self.rds_rt = ""
+        self.rds_pi = 0
+        self.rds_pty = None
+        self.rds_groups = 0
 
     def update_resampler_feedback(self, current_chunks: float, dt: float = 0.05):
         """オーディオバッファの残存チャンク数をリサンプラにフィードバック (クロック自動同期)"""
         self.resampler.update_feedback(current_chunks, dt=dt)
-        self.resampler_r.update_feedback(current_chunks, dt=dt)
 
     def set_stereo_enabled(self, enabled: bool):
         """FMステレオMPXデコードの有効/無効 (モノラル強制)"""
@@ -777,6 +868,37 @@ class SdrDspPipeline:
         self.squelch_threshold = threshold_db
         if hasattr(self, "ultra_squelch"):
             self.ultra_squelch.enabled = enabled
+
+    def set_audiophile_mode(
+        self,
+        apodizing: bool = None,
+        dc_servo: bool = None,
+        dither: bool = None,
+    ):
+        """
+        高級オーディオ処理 (Accuphase / dCS / Esoteric 理論) の動的設定。
+        :param apodizing: 最小位相アポダイジングフィルタ (インパルス応答のプリリンギング完全ゼロ化)
+        :param dc_servo: 超低域位相回転ゼロ・アクティブDCサーボ (20Hz〜300Hzの低域位相歪み根絶)
+        :param dither: TPDFディザー & 音響心理ノイズシェーピング (16bit量子化歪み・階段歪み排除)
+        """
+        if dc_servo is not None:
+            self.dc_servo.enabled = bool(dc_servo)
+        if dither is not None:
+            self.dither.enabled = bool(dither)
+        if apodizing is not None and bool(apodizing) != self.apodizing_enabled:
+            self.apodizing_enabled = bool(apodizing)
+            self._update_apodizing_filters()
+
+    def _update_apodizing_filters(self):
+        """アポダイジング (最小位相) と直線位相フィルタの動的切り替え"""
+        if self.apodizing_enabled:
+            self.fir_audio_clean = MinimumPhaseApodizer.convert_fir_to_minimum_phase(self._linear_fir_audio_clean)
+            self.fir_audio_narrow = MinimumPhaseApodizer.convert_fir_to_minimum_phase(self._linear_fir_audio_narrow)
+            self.fir_am_audio = MinimumPhaseApodizer.convert_fir_to_minimum_phase(self._linear_fir_am_audio)
+        else:
+            self.fir_audio_clean = self._linear_fir_audio_clean.copy()
+            self.fir_audio_narrow = self._linear_fir_audio_narrow.copy()
+            self.fir_am_audio = self._linear_fir_am_audio.copy()
 
     def set_cognitive_parameters(
         self,
@@ -929,21 +1051,32 @@ class SdrDspPipeline:
 
     def _apply_cma(self, iq_if: np.ndarray) -> np.ndarray:
         """CMAブラインド等化器 (history前置でブロック連続性を保つ)。"""
-        taps = self._cma_taps
-        x_ext = np.concatenate((self._cma_hist, np.ascontiguousarray(iq_if)))
-        self._cma_hist = x_ext[-(taps - 1):].copy()
         n_out = len(iq_if)
         if n_out == 0:
             return iq_if
+        taps = self._cma_taps
+        if len(self._cma_hist) != taps - 1:
+            self._cma_hist = np.zeros(taps - 1, dtype=np.complex64)
+        x_ext = np.concatenate((self._cma_hist, np.ascontiguousarray(iq_if)))
+        self._cma_hist = x_ext[-(taps - 1):].copy()
+
         xa = np.ascontiguousarray(x_ext, dtype=np.complex64)
         y = np.empty(n_out, dtype=np.complex64)
         _NATIVE.sdr_cma_equalize(_fptr(xa), _fptr(y), n_out,
                                  _fptr(self._cma_w), taps, float(self._cma_mu))
+        # フェイルセーフ: 万一 NaN/Inf が出力されたら重みを即座にリセットし原信号をサニタイズして通過
+        if not np.all(np.isfinite(y)):
+            self._cma_w[:] = 0.0
+            self._cma_w[2 * (taps // 2)] = 1.0
+            return np.nan_to_num(iq_if, nan=0.0, posinf=1.0, neginf=-1.0)
         return y
 
     def _apply_hard_limiter(self, iq_if: np.ndarray) -> np.ndarray:
-        mag = np.abs(iq_if) + 1e-12
-        return iq_if / mag
+        mag = np.abs(iq_if)
+        mask = (mag > 1e-12) & np.isfinite(mag)
+        out = np.zeros_like(iq_if)
+        out[mask] = iq_if[mask] / mag[mask]
+        return out
 
     def _apply_dc_highpass(self, audio: np.ndarray, ch: str = "") -> np.ndarray:
         """30Hz以下の不要な直流・ボコボコ音を完全カット (Cコア: GIL解放で並行実行)"""
@@ -1176,9 +1309,8 @@ class SdrDspPipeline:
 
         self.is_stereo = False
         self.stereo_status = "MONO"
-        # モノラル経路は×2.0でステレオ(L+R=2mono)と等音量にする
-        # (切替時の+6dB段差・過変調クリップの解消。±1.0クリップ済み)
-        out_mono = self._post_process_wfm(mono * 2.0, "")
+        # モノラル信号はステレオのセンター定位 (L=mono, R=mono) と完全に同一レベル (0dB差) で出力
+        out_mono = self._post_process_wfm(mono, "")
         if ultra_gain < 0.999:
             out_mono = out_mono * ultra_gain
         return np.clip(out_mono, -1.0, 1.0)
@@ -1417,6 +1549,11 @@ class SdrDspPipeline:
                 self.stereo_blend = self._stereo_blend
                 self.stereo_pilot_lock = 0.0
                 self.stereo_pilot_ratio = 0.0
+                # 旧局の搬送波を使い回さない (ブレンド残存中のガラスノイズ防止)
+                self._last_cos2 = None
+                self._last_sin2 = None
+                self._last_cos3 = None
+                self._last_sin3 = None
                 return
             sig = np.ascontiguousarray(np.asarray(mpx, dtype=np.float32) / pilot_rms, dtype=np.float32)
             cos2 = np.empty(n, dtype=np.float32)
@@ -1918,13 +2055,7 @@ class SdrDspPipeline:
             pass
 
         # 適応型分数リサンプラ (独立クロック間のドリフトを微小補正し完全連続再生)
-        if audio.ndim == 2:
-            left = self.resampler.process(audio[:, 0])
-            right = self.resampler_r.process(audio[:, 1])
-            m = min(len(left), len(right))
-            audio_synced = np.stack([left[:m], right[:m]], axis=1)
-        else:
-            audio_synced = self.resampler.process(audio)
+        audio_synced = self.resampler.process(audio)
 
         # 過渡クリックサプレッサーは選局直後300msのみ実行する。
         # クリック源はFIR履歴・PLL状態の不連続＝選局時のみであり、常時ONは
@@ -1945,5 +2076,14 @@ class SdrDspPipeline:
         if self.cognitive_enabled and getattr(self, "cognitive_eq", None) is not None and self.cognitive_eq.enabled:
             self.cognitive_eq.analyze(audio_clean)
             audio_clean = self.cognitive_eq.process(audio_clean)
+
+        # ===== 高級オーディオ (Accuphase / dCS 理論) 最終段 =====
+        # 超低域位相回転ゼロ・アクティブDCサーボ (20Hz〜20kHzの位相を一切回転させず直流オフセットを相殺)
+        if getattr(self, "dc_servo", None) is not None and self.dc_servo.enabled:
+            audio_clean = self.dc_servo.process(audio_clean)
+
+        # TPDFディザー & 音響心理ノイズシェーピング (微小信号の量子化高調波歪みを根絶)
+        if getattr(self, "dither", None) is not None and self.dither.enabled:
+            audio_clean = self.dither.process_float(audio_clean)
 
         return audio_clean, spectrum_db

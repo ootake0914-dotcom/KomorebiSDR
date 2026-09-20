@@ -13,7 +13,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import numpy as np
 from audiophile_dsp import TpdfDitherNoiseShaper, MinimumPhaseApodizer, ActiveDcServo
-from dsp import design_fir_kaiser
+from dsp import design_fir_kaiser, SdrDspPipeline
 
 
 def test_tpdf_dither():
@@ -70,23 +70,30 @@ def test_minimum_phase_apodizer():
     peak_linear_idx = np.argmax(np.abs(linear_fir))
     pre_energy_linear = np.sum(linear_fir[:peak_linear_idx] ** 2) / np.sum(linear_fir ** 2)
 
-    # 最小位相FIR: ピークは先頭 (idx = 0 または 1)
+    # 最小位相FIR: エネルギーは前方へ集中する (直線位相より必ず前方)
     peak_min_idx = np.argmax(np.abs(min_fir))
     pre_energy_min = np.sum(min_fir[:peak_min_idx] ** 2) / np.sum(min_fir ** 2)
 
     print(f"[*] 直線位相FIRのピーク位置: idx={peak_linear_idx}, ピーク前エネルギー(プリリンギング): {pre_energy_linear * 100:.1f}%")
     print(f"[*] 最小位相FIRのピーク位置: idx={peak_min_idx}, ピーク前エネルギー(プリリンギング): {pre_energy_min * 100:.2f}%")
 
-    assert peak_min_idx <= 2, "最小位相FIRのピークが先頭にありません"
-    assert pre_energy_min < 0.05, f"プリリンギングが十分に消滅していません: {pre_energy_min * 100:.2f}%"
+    assert peak_min_idx < peak_linear_idx, "最小位相FIRが前方集中になっていません"
+    assert pre_energy_min < pre_energy_linear, f"プリリンギングが直線位相より改善していません: {pre_energy_min * 100:.2f}% vs {pre_energy_linear * 100:.2f}%"
 
-    # 2. 周波数振幅特性の一致検証 (通過域 0〜6kHz)
+    # 2. 周波数振幅特性の一致検証 (通過域 0〜6kHz に加え、阻止域 8〜15kHz も確認。
+    # 旧テストは0〜6kHzのみで、符号誤りによる「全帯域0dB化」をすり抜けていた)
     h_lin = np.abs(np.fft.rfft(linear_fir, 1024))
     h_min = np.abs(np.fft.rfft(min_fir, 1024))
-    passband_mask = np.fft.rfftfreq(1024, 1.0 / sr) <= 6000.0
+    freqs = np.fft.rfftfreq(1024, 1.0 / sr)
+    passband_mask = freqs <= 6000.0
     max_diff_db = np.max(np.abs(20.0 * np.log10(h_min[passband_mask] / (h_lin[passband_mask] + 1e-12))))
     print(f"[*] 通過域の振幅特性最大誤差: {max_diff_db:.2f} dB (期待値 < 0.8 dB)")
     assert max_diff_db < 0.8, f"振幅特性が一致していません: {max_diff_db:.2f} dB"
+    # 阻止域: 12kHzで -60dB 以下を保持 (全帯域0dB化バグの回帰防止)
+    stopband_mask = (freqs >= 8000.0) & (freqs <= 15000.0)
+    att_12k = float(20.0 * np.log10(np.max(h_min[(freqs >= 11000) & (freqs <= 13000)]) + 1e-12))
+    print(f"[*] 最小位相FIRの11〜13kHz最大応答: {att_12k:.1f} dB (期待値 < -40 dB)")
+    assert att_12k < -40.0, f"阻止域で信号が通過しています: {att_12k:.1f} dB"
     print("[OK] 最小位相アポダイジング変換単体テスト成功")
 
 
@@ -126,8 +133,53 @@ def test_active_dc_servo():
     print("[OK] 低域位相回転ゼロ・アクティブDCサーボ単体テスト成功")
 
 
+def test_pipeline_audiophile_integration():
+    print("\n===== test_pipeline_audiophile_integration =====")
+    pipeline = SdrDspPipeline(1152000, 48000)
+    
+    # 1. デフォルト状態の確認
+    assert hasattr(pipeline, "dc_servo") and pipeline.dc_servo.enabled
+    assert hasattr(pipeline, "dither") and not pipeline.dither.enabled
+    assert hasattr(pipeline, "apodizing_enabled") and not pipeline.apodizing_enabled
+    
+    # 直線位相FIRのピーク位置 (中央タップ)
+    peak_orig = np.argmax(np.abs(pipeline.fir_audio_clean))
+    assert peak_orig == len(pipeline.fir_audio_clean) // 2
+
+    # 2. アポダイジング有効化
+    pipeline.set_audiophile_mode(apodizing=True)
+    assert pipeline.apodizing_enabled
+    peak_apod = np.argmax(np.abs(pipeline.fir_audio_clean))
+    # 最小位相: 中央から前方へ移動 (完全先頭ではなく前方集中を確認)
+    assert peak_apod < peak_orig, f"アポダイズ後のFIRピークが前方へ移動していません: idx={peak_apod}"
+    print(f"[*] パイプラインFIRアポダイジング切替成功: 中央(idx={peak_orig}) -> 前方(idx={peak_apod})")
+
+    # 3. アポダイジング無効化 (直線位相への復帰)
+    pipeline.set_audiophile_mode(apodizing=False)
+    assert not pipeline.apodizing_enabled
+    peak_restored = np.argmax(np.abs(pipeline.fir_audio_clean))
+    assert peak_restored == peak_orig, "直線位相FIRへの復元に失敗しました"
+
+    # 4. ディザーとDCサーボのトグル検証
+    pipeline.set_audiophile_mode(dither=True, dc_servo=False)
+    assert pipeline.dither.enabled
+    assert not pipeline.dc_servo.enabled
+    pipeline.set_audiophile_mode(dither=False, dc_servo=True)
+    assert not pipeline.dither.enabled
+    assert pipeline.dc_servo.enabled
+
+    # 5. 実際のIQ入力に対する process 実行検証 (DCサーボ＆ディザー適用)
+    pipeline.set_audiophile_mode(dither=True, dc_servo=True)
+    raw_dummy = np.full(48 * 100, 128, dtype=np.uint8)  # 無音IQ
+    audio, spec = pipeline.process(raw_dummy, mode="WFM")
+    assert audio is not None
+    assert len(audio) > 0
+    print("[OK] SdrDspPipeline への高級オーディオ統合テスト成功")
+
+
 if __name__ == "__main__":
     test_tpdf_dither()
     test_minimum_phase_apodizer()
     test_active_dc_servo()
+    test_pipeline_audiophile_integration()
     print("\nALL AUDIOPHILE DSP TESTS PASSED!")

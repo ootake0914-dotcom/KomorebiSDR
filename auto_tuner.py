@@ -125,12 +125,15 @@ class AutoTuner:
             # ノイズフロア算出 (下位30パーセンタイル)
             noise_floor = float(np.percentile(spec_db, 30))
 
-            # 周波数軸
-            freq_axis = np.linspace(fc - scan_rate / 2, fc + scan_rate / 2, fft_size)
+            # 周波数軸 (FFTビン中心: bin i は fc-half + i*binwidth。
+            # linspace(endpoint=True) は末尾が fc+half になり半ビン〜2ビンずれる)
+            binw = scan_rate / fft_size
+            freq_axis = fc - scan_rate / 2 + np.arange(fft_size) * binw
 
-            # DC中心スパイク領域 (±25kHz) は除外
+            # DC中心スパイク領域 (±5kHzのみ。±25kHzだと100kHzグリッド局が
+            # 掃引中心近傍に来るたびマスクされ、18ch毎に1局見逃す構造だった)
             dc_center_idx = fft_size // 2
-            dc_guard = int(25000 / (scan_rate / fft_size))
+            dc_guard = max(1, int(5000 / binw))
             spec_db[dc_center_idx - dc_guard : dc_center_idx + dc_guard + 1] = noise_floor
 
             # ピーク検出 (帯域幅チェック付き)
@@ -264,11 +267,12 @@ class AutoTuner:
             spec_db = 10.0 * np.log10(avg_power)
 
             noise_floor = float(np.percentile(spec_db, 40))
-            freq_axis = np.linspace(fc - rate_hz / 2, fc + rate_hz / 2, fft_size)
+            binw2 = rate_hz / fft_size
+            freq_axis = fc - rate_hz / 2 + np.arange(fft_size) * binw2
 
-            # DCスパイクとその裾 (±30kHz) を除去
+            # DCスパイク除去 (±5kHz。±30kHzは短波5kHzグリッド局を多数マスクする)
             dc = fft_size // 2
-            guard = int(30000 / (rate_hz / fft_size))
+            guard = max(1, int(5000 / binw2))
             spec_db[dc - guard: dc + guard + 1] = noise_floor
 
             peaks = self._find_spectral_peaks(
@@ -352,26 +356,33 @@ class AutoTuner:
 
         return peaks
 
-    def seek_next(self, current_freq_hz: int, direction: int = 1) -> dict | None:
+    def seek_next(self, current_freq_hz: int, direction: int = 1, use_sw: bool = False) -> dict | None:
         """
-        現在周波数から次の局へ自動ジャンプ (direction: +1 で上へ、-1 で下へ)
+        現在周波数から次の局へ自動ジャンプ (direction: +1 で上へ、-1 で下へ)。
+        use_sw=True のときは短波(HF)スキャン結果から探す (AM/短波モード用)。
         """
-        if not self.discovered_stations:
-            self.scan_band()
-        if not self.discovered_stations:
+        stations = self.discovered_sw if use_sw else self.discovered_stations
+        if not stations:
+            if use_sw:
+                self.scan_band_hf()
+                stations = self.discovered_sw
+            else:
+                self.scan_band()
+                stations = self.discovered_stations
+        if not stations:
             return None
 
-        freqs = [s["freq_hz"] for s in self.discovered_stations]
+        freqs = [s["freq_hz"] for s in stations]
         if direction > 0:
-            for s in self.discovered_stations:
+            for s in stations:
                 if s["freq_hz"] > current_freq_hz + 50000:
                     return s
-            return self.discovered_stations[0]  # 先頭へループ
+            return stations[0]  # 先頭へループ
         else:
-            for s in reversed(self.discovered_stations):
+            for s in reversed(stations):
                 if s["freq_hz"] < current_freq_hz - 50000:
                     return s
-            return self.discovered_stations[-1]  # 末尾へループ
+            return stations[-1]  # 末尾へループ
 
     def get_dx_stations(self) -> list[dict]:
         """通常聞こえない微弱なDX局のみを抽出"""

@@ -98,18 +98,27 @@ static inline float sdr_sin(double x)
     if (!g_sin_lut_ready) {
         sdr_lut_init_once();
     }
-    /* while減算ではなくfmodで正規化: PLL発散等の異常入力でも
-     * 1e6 rad級で数十万回ループ→復帰不能になる事故を根絶する */
+    /* NaN / Inf 入力に対するフェイルセーフ (メモリ保護違反・未定義動作を根絶) */
+    if (x != x || x > 1e15 || x < -1e15) {
+        return 0.0f;
+    }
     x = fmod(x, SDR_TWO_PI_F);
     if (x < 0.0) {
         x += SDR_TWO_PI_F;
     }
     double f = x * ((double)SDR_LUT_SIZE / SDR_TWO_PI_F);
     int i = (int)f;
-    if (i >= SDR_LUT_SIZE) {
+    if (i < 0) {
+        i = 0;
+    } else if (i >= SDR_LUT_SIZE) {
         i = SDR_LUT_SIZE - 1;
     }
     float fr = (float)(f - (double)i);
+    if (fr < 0.0f) {
+        fr = 0.0f;
+    } else if (fr > 1.0f) {
+        fr = 1.0f;
+    }
     float a = g_sin_lut[i];
     return a + fr * (g_sin_lut[i + 1] - a);
 }
@@ -354,6 +363,9 @@ SDR_EXPORT void sdr_fm_demod(const float *iq, float *demod, int n, float *last)
 SDR_EXPORT void sdr_cma_equalize(const float *x, float *y, int n_out,
                                  float *w, int taps, float mu)
 {
+    float leak = 0.99995f;
+    int center = taps / 2;
+
     for (int j = 0; j < n_out; ++j) {
         const float *xp = x + 2 * j;
         float yr = 0.0f, yi = 0.0f, pwr = 0.0f;
@@ -366,18 +378,49 @@ SDR_EXPORT void sdr_cma_equalize(const float *x, float *y, int n_out,
             yi += xr * wi + xi * wr;
             pwr += xr * xr + xi * xi;
         }
+
+        /* 出力の有限性チェック (NaN/Infなら中央タップデルタへ即座に緊急リセット) */
         float m2 = yr * yr + yi * yi;
+        if (m2 != m2 || m2 > 64.0f) {
+            for (int k = 0; k < taps; ++k) {
+                w[2 * k] = 0.0f;
+                w[2 * k + 1] = 0.0f;
+            }
+            w[2 * center] = 1.0f;
+            yr = xp[2 * center];
+            yi = xp[2 * center + 1];
+            m2 = yr * yr + yi * yi;
+        }
+
+        /* 誤差クリッピング: 大入力時の3次多項式爆発・発散を数学的に完全抑圧 */
         float g = 1.0f - m2;
+        if (g < -2.0f) {
+            g = -2.0f;
+        } else if (g > 2.0f) {
+            g = 2.0f;
+        }
+
         float er = g * yr;
         float ei = g * yi;
-        float step = mu / (pwr + 1e-6f);
+        float step = mu / (pwr + 1e-4f);
+        if (step > 0.05f) {
+            step = 0.05f;
+        }
+
+        /* Normalized Leaky-CMA更新 */
         for (int k = 0; k < taps; ++k) {
             float xr = xp[2 * k];
             float xi = xp[2 * k + 1];
-            w[2 * k]     += step * (er * xr + ei * xi);
-            w[2 * k + 1] += step * (ei * xr - er * xi);
+            float nwr = leak * w[2 * k]     + step * (er * xr + ei * xi);
+            float nwi = leak * w[2 * k + 1] + step * (ei * xr - er * xi);
+            /* 個別タップクリッピング */
+            if (nwr > 3.0f) nwr = 3.0f; else if (nwr < -3.0f) nwr = -3.0f;
+            if (nwi > 3.0f) nwi = 3.0f; else if (nwi < -3.0f) nwi = -3.0f;
+            w[2 * k]     = nwr;
+            w[2 * k + 1] = nwi;
         }
-        y[2 * j] = yr;
+
+        y[2 * j]     = yr;
         y[2 * j + 1] = yi;
     }
 }

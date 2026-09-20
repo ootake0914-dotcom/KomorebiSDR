@@ -22,9 +22,13 @@ TESTS = [
     "test_native_equiv.py",
     "test_stereo.py",
     "test_adaptive_dsp.py",
+    "test_audiophile_dsp.py",
+    "test_cma_robustness.py",
     "test_gui.py",
     "test_live_peaks.py",
     "test_station_list.py",
+    "test_server.py",
+    "test_resampler.py",
     "test_mock_worker.py",
 ]
 

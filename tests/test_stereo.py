@@ -111,11 +111,43 @@ def main() -> int:
           f"(L-R) 10-14kHz {reduction:+.1f} dB)")
     ok &= nr_ok
 
-    dsp_mono, _ = decode(make_raw(stereo=False))
+    dsp_mono, pcm_mono = decode(make_raw(stereo=False))
     mono_ok = (not dsp_mono.is_stereo) and dsp_mono.stereo_blend < 0.1
     print(f"[{'OK' if mono_ok else 'FAIL'}] mono station stays mono (blend={dsp_mono.stereo_blend:.2f})")
 
-    ok &= mono_ok
+    # ステレオ/モノラル等音量テスト: 同一放送波でのモノラル切替時に旧実装の+6.7dB爆音段差を根絶
+    dsp_m_forced = SdrDspPipeline(RF, 48000)
+    dsp_m_forced.set_offset_freq(0.0)
+    dsp_m_forced.afc_enabled = False
+    dsp_m_forced.cognitive_enabled = False
+    dsp_m_forced.set_stereo_enabled(False)
+    chunks_m = []
+    raw_s = make_raw(stereo=True)
+    for k in range(NBLK):
+        a_m, _ = dsp_m_forced.process(raw_s[k * BLOCK:(k + 1) * BLOCK], mode="WFM")
+        chunks_m.append(a_m)
+    pcm_m_forced = np.concatenate(chunks_m, axis=0)
+    rms_m_forced = float(np.sqrt(np.mean(pcm_m_forced[len(pcm_m_forced)//2:]**2)))
+    rms_s_total = float(np.sqrt(0.5 * (np.mean(pcm[len(pcm)//2:, 0]**2) + np.mean(pcm[len(pcm)//2:, 1]**2))))
+    diff_loudness = abs(20 * np.log10((rms_m_forced + 1e-12) / (rms_s_total + 1e-12)))
+    # 理論ダウンミックス電力差 (-3.0dB) 付近で整合 (旧実装は+3.7dB以上の爆音・クリッピング)
+    level_ok = abs(diff_loudness - 3.01) < 1.0
+    print(f"[{'OK' if level_ok else 'FAIL'}] stereo/mono loudness match "
+          f"(downmix diff={diff_loudness:.2f} dB, expect ~3.01 dB, no clipping)")
+
+    # ステレオ適応リサンプラ 位相同期テスト: 左右分数遅延差による定位ボケを根絶
+    from dsp import AdaptiveDriftResampler
+    res = AdaptiveDriftResampler()
+    res.current_ratio = 1.0 + 500e-6
+    t_test = np.arange(4800) / 48000.0
+    st_in = np.stack([np.sin(2 * np.pi * 1000 * t_test), np.cos(2 * np.pi * 1000 * t_test)], axis=1).astype(np.float32)
+    st_out = res.process(st_in)
+    env = st_out[:, 0]**2 + st_out[:, 1]**2
+    env_diff = float(np.max(np.abs(env[50:-50] - 1.0)))
+    resamp_ok = env_diff < 1e-4 and st_out.shape[1] == 2
+    print(f"[{'OK' if resamp_ok else 'FAIL'}] stereo resampler phase coherence (envelope diff={env_diff:.6f})")
+
+    ok &= mono_ok and level_ok and resamp_ok
     print("OK" if ok else "FAILED")
     return 0 if ok else 1
 

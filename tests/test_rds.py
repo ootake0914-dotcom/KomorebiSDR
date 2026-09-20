@@ -105,9 +105,50 @@ def test_full_path() -> bool:
     return ok
 
 
+def test_ct_and_rt_cr() -> bool:
+    """4A時計デコード (EN 50067レイアウト) とCR終端RTの検証 (デコーダ直接)。"""
+    import rds as rds_mod
+
+    # --- 4A時計: MJD=59945 (2023-01-01), 12:34 ---
+    mjd = 59945
+    hour, minute = 12, 34
+    b2 = (4 << 12) | (0 << 11) | (1 << 10) | ((10 & 0x1F) << 5) | ((mjd >> 15) & 3)
+    b3 = ((mjd & 0x7FFF) << 1) | ((hour >> 4) & 1)
+    b4 = ((hour & 0xF) << 12) | (minute << 6)
+    bits = (rds_mod.make_block(PI, "A") + rds_mod.make_block(b2, "B")
+            + rds_mod.make_block(b3, "C") + rds_mod.make_block(b4, "D"))
+    dec = RdsDecoder(12000.0)
+    dec._sync = True  # 同期済み扱い
+    dec._pending = list(bits)
+    dec._decode_groups()
+    ok = dec.clock == (2023, 1, 1, hour, minute)
+    print(f"[{'OK' if ok else 'FAIL'}] 4A clock: {dec.clock} (want (2023,1,1,12,34))")
+    # 全グループCRC OK (同期維持) であること
+    ok2 = dec.groups >= 1 and dec._sync
+    print(f"[{'OK' if ok2 else 'FAIL'}] 4A group CRC valid & sync kept")
+    ok &= ok2
+
+    # --- CR終端RT (短い文 "NEW" + CR、1グループ内) ---
+    # 2A: type(0010) 0 TP PTY(5) AB(0) addr(0)
+    seg = b"NEW\r"
+    b2 = (2 << 12) | (0 << 11) | (1 << 10) | ((10 & 0x1F) << 5) | (0 << 4) | 0
+    b3 = (seg[0] << 8) | seg[1]
+    b4 = (seg[2] << 8) | seg[3]
+    bits = (rds_mod.make_block(PI, "A") + rds_mod.make_block(b2, "B")
+            + rds_mod.make_block(b3, "C") + rds_mod.make_block(b4, "D"))
+    dec2 = RdsDecoder(12000.0)
+    dec2._sync = True
+    dec2._pending = list(bits)
+    dec2._decode_groups()
+    ok = dec2.radio_text == "NEW"
+    print(f"[{'OK' if ok else 'FAIL'}] CR-terminated RT: {dec2.radio_text!r} (want 'NEW')")
+    return ok
+
+
 def main() -> int:
     ok = test_decoder()
     ok &= test_full_path()
+    ok &= test_ct_and_rt_cr()
     print("OK" if ok else "FAILED")
     return 0 if ok else 1
 

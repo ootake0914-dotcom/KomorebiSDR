@@ -124,6 +124,8 @@ class RtlSdrDriver:
         if res != 0 or not self.dev:
             raise RuntimeError(f"RTL-SDRデバイス (index {index}) のオープンに失敗しました (code: {res})")
         self.is_open = True
+        # 前デバイス/close時の設定キャッシュを無効化 (新デバイスには未設定状態から適用する)
+        self._direct_sampling_mode = None
         self.reset_buffer()
 
     def close(self):
@@ -138,6 +140,7 @@ class RtlSdrDriver:
             self._dll.rtlsdr_close(self.dev)
             self.dev = c_void_p(0)
             self.is_open = False
+            self._direct_sampling_mode = None
 
     def reset_buffer(self):
         if self.is_open:
@@ -203,7 +206,14 @@ class RtlSdrDriver:
         """
         if not self.is_open:
             return
+        # 同一モードの重複呼び出しをスキップ (チューナーの不要な再起動・PLLロック外れ防止)
+        if getattr(self, "_direct_sampling_mode", None) == mode:
+            return
+        self._direct_sampling_mode = mode
         self._dll.rtlsdr_set_direct_sampling(self.dev, mode)
+        # 通常モード(0)への復帰時はチューナーPLLのセトリング時間を確保
+        if mode == 0:
+            time.sleep(0.02)
 
     def read_sync(self, num_bytes: int = 131072) -> np.ndarray:
         """
@@ -247,6 +257,12 @@ class RtlSdrDriver:
 
         # C関数ポインタの生成（GC回収防止のためインスタンスに保持）
         self._c_callback = self.ASYNC_CB_TYPE(_internal_cb)
+        # cancel_asyncとの競合: _async_active.set() 後に cancel が来た場合、
+        # _async_stop を再確認して C ループを開始しない (開始後のcancel漏れを防ぐ)
+        with self._async_lock:
+            if self._async_stop.is_set():
+                self._async_active.clear()
+                return
         try:
             self._dll.rtlsdr_read_async(
                 self.dev,
