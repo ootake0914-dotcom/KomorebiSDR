@@ -9,6 +9,7 @@ Audio Output Module using sounddevice - Hi-Fi Edition.
 import threading
 import time
 import queue
+import sys
 import numpy as np
 import sounddevice as sd
 
@@ -38,19 +39,28 @@ class AudioOutput:
         self._scratch = np.zeros((max(int(blocksize), 8192), 2), dtype=np.float32)
         self._absbuf = np.empty_like(self._scratch)
         self._mask = np.empty(self._scratch.shape, dtype=bool)
+        # フェード曲線 (最大32) とソフトリミッタ作業域も事前確保
+        self._fade = (0.5 * (1.0 + np.cos(np.linspace(0.0, np.pi, 32, dtype=np.float32)))).astype(np.float32)
+        self._signbuf = np.empty_like(self._scratch)
+        self._compbuf = np.empty_like(self._scratch)
 
         # 長時間安定稼働モニタリング統計
         self.underrun_count = 0
         self.overflow_count = 0
+        self.callback_errors = 0
+        self.status_underflows = 0
         self.total_callbacks = 0
         self.total_frames_played = 0
         self.callback_us_max = 0.0
 
-    def _audio_callback(self, outdata, frames, time_info, status):
+    def _callback_core(self, outdata, frames, time_info, status):
         """深層ジッターバッファによる完全安定オーディオ再生コールバック。
 
         リアルタイムパスでは新規メモリ確保を行わず、事前確保した _scratch へ
         キュー内容を直接コピーする (uac2 の pre-allocated pool / single-copy 方式)。
+        フェード曲線・リミッタ作業域も事前確保済み。Queue操作の内部ロックは
+        sounddevice/PortAudio環境では避けられないため、例外防壁(外側)と
+        状態スナップショットで影響を最小化する。
         """
         t0 = time.perf_counter()
         frames = int(frames)
@@ -59,6 +69,8 @@ class AudioOutput:
             self._scratch = np.zeros((frames, 2), dtype=np.float32)
             self._absbuf = np.empty_like(self._scratch)
             self._mask = np.empty(self._scratch.shape, dtype=bool)
+            self._signbuf = np.empty_like(self._scratch)
+            self._compbuf = np.empty_like(self._scratch)
 
         # プレロール判定: バッファが深層クッション(約400ms)まで蓄積されるまで待機
         if not self.is_prerolled:
@@ -104,7 +116,7 @@ class AudioOutput:
             else:
                 last = self.last_out_samples
             if fade_len > 0 and np.any(np.abs(last) > 1e-4):
-                fade = 0.5 * (1.0 + np.cos(np.linspace(0.0, np.pi, fade_len, dtype=np.float32)))
+                fade = self._fade[:fade_len]
                 scratch[n:n + fade_len] = last[None, :] * fade[:, None]
                 scratch[n + fade_len:frames] = 0.0
             else:
@@ -117,8 +129,12 @@ class AudioOutput:
 
         data = scratch[:frames]
 
+        # GUIスレッドと共有する状態は先頭でスナップショット (途中の書き換えを遮断)
+        vol = self.volume
+        muted = self.is_muted
+
         # ミュート処理
-        if self.is_muted:
+        if muted:
             outdata[:, 0] = 0.0
             outdata[:, 1] = 0.0
             us = (time.perf_counter() - t0) * 1e6
@@ -127,19 +143,27 @@ class AudioOutput:
             return
 
         # 音量スケーリング (in-place、確保なし)
-        np.multiply(data, self.volume, out=data)
+        np.multiply(data, vol, out=data)
 
-        # ソフトリミッター (0.85超のみ圧縮。通常はmaskが全てFalseで何もしない)
+        # ソフトリミッター (0.85超のみ圧縮。全て事前確保域＋out=で確保なし。
+        # fancy-indexは確保を伴うため全フレーム演算＋where書戻し方式)
         threshold = 0.85
-        np.absolute(data, out=self._absbuf[:frames])
-        over = np.greater(self._absbuf[:frames], threshold, out=self._mask[:frames])
-        if over.any():
-            idx = over
-            sign = np.sign(data[idx])
-            mag = self._absbuf[:frames][idx]
-            compressed = threshold + (1.0 - threshold) * np.tanh(
-                (mag - threshold) / (1.0 - threshold))
-            data[idx] = sign * compressed
+        absf = self._absbuf[:frames]
+        maskf = self._mask[:frames]
+        np.absolute(data, out=absf)
+        np.greater(absf, threshold, out=maskf)
+        if maskf.any():
+            signf = self._signbuf[:frames]
+            compf = self._compbuf[:frames]
+            inv = 1.0 - threshold
+            np.sign(data, out=signf)
+            np.subtract(absf, threshold, out=compf)
+            np.divide(compf, inv, out=compf)
+            np.tanh(compf, out=compf)
+            compf *= inv
+            compf += threshold
+            np.multiply(signf, compf, out=compf)
+            np.copyto(data, compf, where=maskf)
 
         # ステレオ出力 (outdata は C-contiguous な (frames,2))
         outdata[:, 0] = data[:, 0]
@@ -150,6 +174,26 @@ class AudioOutput:
         us = (time.perf_counter() - t0) * 1e6
         if us > self.callback_us_max:
             self.callback_us_max = us
+
+    def _audio_callback(self, outdata, frames, time_info, status):
+        """PortAudio実コールバック。例外1発でのストリーム死を防ぐ最終防壁。
+        statusのoutput_underflowも検出してカウントする。"""
+        try:
+            try:
+                if status is not None and bool(getattr(status, "output_underflow", False)):
+                    self.status_underflows += 1
+            except Exception:
+                pass
+            self._callback_core(outdata, frames, time_info, status)
+        except Exception as e:
+            self.callback_errors += 1
+            if self.callback_errors % 50 == 1:
+                print(f"[WARN] audio callback error x{self.callback_errors}: {e}",
+                      file=sys.stderr)
+            try:
+                outdata.fill(0.0)
+            except Exception:
+                pass
 
     def start(self):
         if self.is_running:

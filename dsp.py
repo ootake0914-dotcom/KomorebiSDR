@@ -5,7 +5,9 @@ Digital Signal Processing (DSP) Module for SDR - Ultra-Clear Hi-Fi Edition.
 速度が要求される処理 (IIRフィルタ / FM復調 / 複素ミキサー / クリック除去) は
 ネイティブCコア (sdr_core.dll) で実行する。ctypes呼び出し中はGILが解放されるため、
 GUI描画やオーディオコールバックと競合せず、音飛び (バッファ枯渇) を防ぐ。
-DLLが見つからない場合は純Python実装へ自動フォールバックする。
+DLLが見つからない場合、純Python代替のある処理 (AM同期検波・FIR畳み込み等) は
+自動フォールバックする。ステレオMPX-PLLとRDS-57kHz搬送波生成はCコア必須の
+ため、DLL不在時はモノラル受信となる (ブレンドは0へ減衰)。
 """
 
 import ctypes
@@ -443,8 +445,10 @@ class SdrDspPipeline:
         # 38kHz副搬送波の位相補正 (DSP経路の遅延を実測校正した値。DSBの180°曖昧性は
         # パイロットとの2:1位相関係に基づきL/Rが正しくなる側を採用)
         self.stereo_phase_offset = np.deg2rad(-47.0)
-        # ステレオRch用 追加リサンプラ (Lchは既存resamplerを共用)
-        self.resampler_r = AdaptiveDriftResampler(target_chunks=8.0, max_ppm=2000.0)
+        # ステレオRch用 追加リサンプラ (Lchは既存resamplerを共用。
+        # L/Rでmax_ppmを変えると逼迫時に出力長が乖離し片ch切り捨てが起きるため、
+        # 必ず同一パラメータにする)
+        self.resampler_r = AdaptiveDriftResampler(target_chunks=8.0, max_ppm=120.0)
 
         # ===== ステレオノイズリダクション =====
         # 弱電界でステレオ化すると増えるヒスノイズを、(L-R)差信号の高域/中域パワー比から
@@ -578,6 +582,18 @@ class SdrDspPipeline:
         self._am_ig = 0.0
         self._am_ef = 0.0
         self._am_sync_mix = 0.0
+        # history_* はWFM/NFM/AM/SSBで共有しているため、選局・モード切替で
+        # 全FIR履歴をゼロ化 (前局の残響・タップ数違いの過渡ポップを防止)。
+        # AGCレベルは維持し音量ポンピングを避ける。
+        for k, v in list(self.__dict__.items()):
+            if k.startswith("history_") and isinstance(v, np.ndarray):
+                v.fill(0)
+        self._pll_theta = 0.0
+        self._pll_integ = 0.0
+        self._pll_ef = 0.0
+        self.fm_last_sample = 0.0 + 0.0j
+        self.nfm_last_sample = 0.0 + 0.0j
+        self.reset_stereo_nr()
         self.am_sync_lock = 0.0
 
     def update_resampler_feedback(self, current_chunks: float, dt: float = 0.05):
@@ -893,15 +909,20 @@ class SdrDspPipeline:
                 if self.stereo_nr_enabled:
                     cut = self.stereo_cut_hz
                     blend = self._stereo_blend * self.stereo_nr_gain
+                    blend *= self.multipath_gain
+                    diff = self._diff_lowpass(diff_raw, cut)
+                    diff = self._wiener_diff(diff)
+                    stereo_diff = diff * blend
+                    # 差信号FIRの群遅延を補償 (mono/diffの位相ズレによる分離度劣化を防止)
+                    mono = self._delay_mono(mono)
                 else:
-                    cut = self._nr_cut_max_hz
-                    blend = self._stereo_blend
-                blend *= self.multipath_gain
-                diff = self._diff_lowpass(diff_raw, cut)
-                diff = self._wiener_diff(diff)
-                stereo_diff = diff * blend
-                # 差信号FIRの群遅延を補償 (mono/diffの位相ズレによる分離度劣化を防止)
-                mono = self._delay_mono(mono)
+                    # NR無効時はLPF/STFT往復をせず生差信号へブレンドのみ
+                    # (15kHz LPF＋COLAリップルが可聴域を変える問題とCPU浪費を回避)。
+                    # mono遅延履歴だけは更新し、再有効時の継ぎ目を無くす。
+                    stereo_diff = (diff_raw
+                                   * (self._stereo_blend * self.multipath_gain)).astype(np.float32)
+                    self._delay_mono(mono)
+                    self.stereo_wiener_gain = 1.0
 
         # 6. チャンネル別ポスト処理 (ディエンファシス・ハイカット・DCカット・シェルフ)
         if stereo_diff is not None:
@@ -918,11 +939,13 @@ class SdrDspPipeline:
                 self.stereo_status = "BLEND"
             else:
                 self.stereo_status = "MONO"
-            return np.stack([left, right], axis=1).astype(np.float32)
+            # WFM経路も±1.0へクリップ (AM/SSBと統一。過偏移・弱電界ノイズで
+            # ±1.82超→後段int16変換でのラップ歪みを防止)
+            return np.clip(np.stack([left, right], axis=1), -1.0, 1.0).astype(np.float32)
 
         self.is_stereo = False
         self.stereo_status = "MONO"
-        return self._post_process_wfm(mono, "")
+        return np.clip(self._post_process_wfm(mono, ""), -1.0, 1.0)
 
     def _delay_mono(self, mono: np.ndarray) -> np.ndarray:
         """monoを群遅延分だけ遅延させ、NRフィルタ通過後の差信号と時間整合を取る"""
@@ -1011,9 +1034,10 @@ class SdrDspPipeline:
 
         levels = self._nr_cut_levels
         cut = float(np.clip(cutoff_hz, levels[0], levels[-1]))
-        pos = (cut - levels[0]) / (levels[-1] - levels[0]) * (len(levels) - 1)
-        i0 = int(np.clip(np.floor(pos), 0, len(levels) - 2))
-        w = float(np.clip(pos - i0, 0.0, 1.0))
+        # 非等間隔レベル間の区分線形補間 (等間隔仮定の線形posでは中間cutがずれる)
+        i0 = int(np.clip(np.searchsorted(levels, cut, side="right") - 1, 0, len(levels) - 2))
+        span = float(levels[i0 + 1] - levels[i0])
+        w = float(np.clip((cut - levels[i0]) / (span if span > 0 else 1.0), 0.0, 1.0))
         y = np.convolve(x_ext, self._nr_filters[i0], mode="valid")
         if w > 1e-3:
             y2 = np.convolve(x_ext, self._nr_filters[i0 + 1], mode="valid")
@@ -1125,6 +1149,18 @@ class SdrDspPipeline:
             # パイロット振幅で正規化した生MPXをPLLへ入力 (帯域制限による群遅延を回避し、
             # 搬送波位相をMPX本来のタイムラインに一致させる)
             pilot_rms = float(np.sqrt(np.mean(pilot.astype(np.float64) ** 2)) + 1e-12)
+            mpx_rms_pre = float(np.sqrt(np.mean(np.asarray(mpx, dtype=np.float64) ** 2)) + 1e-12)
+            if pilot_rms < 1e-4 or pilot_rms < 0.015 * mpx_rms_pre:
+                # パイロット不在ゲート: 19kHz帯が無音・微小のまま正規化PLLへ渡すと
+                # 入力が1e11級に膨張→PLL発散→C側の位相正規化が爆発し復帰不能
+                # (モノラル局・無信号でDSPスレッドがハングする)。ここで打ち切り、
+                # ブレンドを減衰させてモノラルへ落とす。弱電界ステレオの瞬断は
+                # 次ブロックで回復するため実害なし。
+                self._stereo_blend *= 0.9
+                self.stereo_blend = self._stereo_blend
+                self.stereo_pilot_lock = 0.0
+                self.stereo_pilot_ratio = 0.0
+                return
             sig = np.ascontiguousarray(np.asarray(mpx, dtype=np.float32) / pilot_rms, dtype=np.float32)
             cos2 = np.empty(n, dtype=np.float32)
             sin2 = np.empty(n, dtype=np.float32)
@@ -1289,14 +1325,17 @@ class SdrDspPipeline:
 
         # 搬送波レベルAGC: 信号強度やダイレクトサンプリングの低入力でも一定音量にする
         # (時定数 ~0.2sアタック / ~1sリリース。無信号時の過剰増幅は3000倍で制限)
+        # 無信号フロア: レベル極小でAGC=0張り付き→gain3000→AMは-0.6のDC定数出力や
+        # ノイズ爆音になるため、フロア以下では出力を滑らかにミュートする。
         level = float(np.mean(np.abs(sig)))
         if self.am_agc_level <= 0.0:
-            self.am_agc_level = level
+            self.am_agc_level = max(level, 2e-4)
         else:
             alpha = 0.25 if level > self.am_agc_level else 0.05
             self.am_agc_level += alpha * (level - self.am_agc_level)
         gain = min(1.0 / (self.am_agc_level + 1e-9), 3000.0)
-        audio_raw = np.clip((sig * gain - 1.0) * 0.6, -1.0, 1.0)
+        fade = min(1.0, level / 2e-4)
+        audio_raw = np.clip((sig * gain - 1.0) * 0.6, -1.0, 1.0) * fade
         if self.cognitive_enabled:
             fir_final = self._get_dynamic_filter("audio", min(self.applied_cutoff_hz, 8000.0))
         elif self.filter_mode == "wide":
@@ -1386,21 +1425,28 @@ class SdrDspPipeline:
             center, taps, attr = 650.0, self.fir_cw_lp, "history_cw_lp"
 
         n = len(iq_48)
-        ph = self._ssb_bp_phase + 2.0 * np.pi * center * np.arange(n, dtype=np.float64) / self.audio_rate
-        self._ssb_bp_phase = float((ph[-1] + 2.0 * np.pi * center / self.audio_rate) % (2.0 * np.pi))
+        omega = 2.0 * np.pi * center / self.audio_rate
+        ph = self._ssb_bp_phase + omega * np.arange(n, dtype=np.float64)
+        self._ssb_bp_phase = float((ph[-1] + omega) % (2.0 * np.pi))
         shifted = (iq_48 * np.exp(-1j * ph)).astype(np.complex64)
         lp = self.decimate_with_history(shifted, taps, 1, attr)
-        audio = np.real(lp * np.exp(1j * ph)).astype(np.float32)
+        # 再シフト位相はFIR群遅延Dサンプル分だけ遅らせる (線形位相FIRの遅延補償。
+        # 未補償だとUSB 1500Hz×D200で12.5π→0.5πの定数回転が残る。可聴差は
+        # 微小だがコヒーレント復調として正しい位相に戻す)
+        dly = (len(taps) - 1) // 2
+        audio = np.real(lp * np.exp(1j * (ph - omega * dly))).astype(np.float32)
 
         # AGC (SSBは搬送波が無いため平均振幅で正規化。無信号時の過剰増幅は3000倍で制限)
+        # 無信号フロア (AM側と同型): ノイズ2400倍の爆音化を防ぐため滑らかにミュート。
         level = float(np.mean(np.abs(audio)))
         if self.ssb_agc_level <= 0.0:
-            self.ssb_agc_level = level
+            self.ssb_agc_level = max(level, 2e-4)
         else:
             alpha = 0.25 if level > self.ssb_agc_level else 0.05
             self.ssb_agc_level += alpha * (level - self.ssb_agc_level)
         gain = min(1.0 / (self.ssb_agc_level + 1e-9), 3000.0)
-        audio = np.clip(audio * gain * 0.8, -1.0, 1.0)
+        fade = min(1.0, level / 2e-4)
+        audio = np.clip(audio * gain * 0.8, -1.0, 1.0) * fade
 
         # 音声帯域整形 (3kHz LPF + 300Hz HP)
         if self.cognitive_enabled:

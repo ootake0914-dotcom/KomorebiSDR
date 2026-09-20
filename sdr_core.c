@@ -11,6 +11,9 @@
 #include <math.h>
 #include <stdint.h>
 #include <stdlib.h>
+#ifdef _MSC_VER
+#include <intrin.h>
+#endif
 
 #if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
 #include <xmmintrin.h>
@@ -55,7 +58,10 @@ SDR_EXPORT void sdr_fast_fpu(void)
 #define SDR_LUT_SIZE (1 << SDR_LUT_BITS)
 #define SDR_TWO_PI_F 6.283185307179586
 static float g_sin_lut[SDR_LUT_SIZE + 1];
-static int g_sin_lut_ready = 0;
+static volatile int g_sin_lut_ready = 0;
+#ifdef _MSC_VER
+static volatile long g_sin_lut_lock = 0;
+#endif
 
 static void sdr_lut_init(void)
 {
@@ -66,16 +72,37 @@ static void sdr_lut_init(void)
     g_sin_lut_ready = 1;
 }
 
-static inline float sdr_sin(double x)
+/* 1回だけ初期化 (2スレッド同時初回呼の二重書込レースを排除) */
+static void sdr_lut_init_once(void)
 {
+#ifdef _MSC_VER
+    if (g_sin_lut_ready) {
+        return;
+    }
+    if (_InterlockedCompareExchange(&g_sin_lut_lock, 1, 0) == 0) {
+        sdr_lut_init();
+    } else {
+        while (!g_sin_lut_ready) {
+            _mm_pause();
+        }
+    }
+#else
     if (!g_sin_lut_ready) {
         sdr_lut_init();
     }
-    while (x < 0.0) {
-        x += SDR_TWO_PI_F;
+#endif
+}
+
+static inline float sdr_sin(double x)
+{
+    if (!g_sin_lut_ready) {
+        sdr_lut_init_once();
     }
-    while (x >= SDR_TWO_PI_F) {
-        x -= SDR_TWO_PI_F;
+    /* while減算ではなくfmodで正規化: PLL発散等の異常入力でも
+     * 1e6 rad級で数十万回ループ→復帰不能になる事故を根絶する */
+    x = fmod(x, SDR_TWO_PI_F);
+    if (x < 0.0) {
+        x += SDR_TWO_PI_F;
     }
     double f = x * ((double)SDR_LUT_SIZE / SDR_TWO_PI_F);
     int i = (int)f;

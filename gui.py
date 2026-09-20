@@ -6,6 +6,7 @@ Pygame-based SDR GUI Module - Frosted Glass Edition.
 
 import numpy as np
 import pygame
+from collections import OrderedDict
 
 from i18n import t
 
@@ -82,17 +83,23 @@ def show_message_screen(title: str, lines: list, width: int = 760, height: int =
 
 # 文字サーフェスのキャッシュ (dirty update方式)
 # 毎フレームの font.render (ラスタライズ) を排除。内容が変わった時だけ再生成する。
-_TEXT_CACHE = {}
+_TEXT_CACHE = OrderedDict()
+_TEXT_CACHE_MAX = 512
 
 
 def cached_text(font, text, color):
-    key = (id(font), text, color)
+    # fontオブジェクト自体をキーに (id()は解放後の再利用で誤ヒットし得る)。
+    # 実使用フォントはSdrGuiが保持するため参照保持コストは実質ゼロ。
+    # 変動文字列のスラッシング対策にLRU方式 (上限超で全消去スパイクを排除)。
+    key = (font, text, color)
     surf = _TEXT_CACHE.get(key)
     if surf is None:
         surf = font.render(text, True, color)
-        if len(_TEXT_CACHE) > 1500:
-            _TEXT_CACHE.clear()
         _TEXT_CACHE[key] = surf
+        if len(_TEXT_CACHE) > _TEXT_CACHE_MAX:
+            _TEXT_CACHE.popitem(last=False)
+    else:
+        _TEXT_CACHE.move_to_end(key)
     return surf
 
 
@@ -143,9 +150,10 @@ class SdrGui:
     def __init__(self, width=1120, height=720):
         pygame.init()
         pygame.font.init()
-        self.width = width
-        self.height = height
-        self.screen = pygame.display.set_mode((width, height))
+        # ゼロ・極小サイズでのゼロ除算・Surface生成失敗を防止
+        self.width = max(320, int(width))
+        self.height = max(240, int(height))
+        self.screen = pygame.display.set_mode((self.width, self.height))
         pygame.display.set_caption("Antigravity Full-Scratch SDR Radio")
 
         # フォント (日本語対応: Meiryo系を優先)
@@ -303,10 +311,30 @@ class SdrGui:
             self.btn_scan_band.text = t("scan_button")
 
     def set_presets(self, presets_fm: list, presets_am: list):
-        """スキャン結果などからプリセットボタンを再構築する"""
-        self.presets_fm = list(presets_fm or [])[:10]
-        self.presets_am = list(presets_am or [])[:7]
+        """スキャン結果などからプリセットボタンを再構築する。
+        破損エントリ (freq_hz欠落等) は除去してKeyErrorを防止。空呼出しでは
+        既存ボタンを維持する (全消去は明示的な空リスト再構築時のみ)。"""
+        fm = self._clean_presets(presets_fm, "WFM")
+        am = self._clean_presets(presets_am, "AM")
+        if presets_fm is not None:
+            self.presets_fm = fm[:10]
+        if presets_am is not None:
+            self.presets_am = am[:7]
         self._init_controls()
+
+    @staticmethod
+    def _clean_presets(items, default_mode: str) -> list:
+        out = []
+        for p in (items or []):
+            if not isinstance(p, dict):
+                continue
+            f = p.get("freq_hz")
+            if isinstance(f, bool) or not isinstance(f, (int, float)):
+                continue
+            m = p.get("mode", default_mode)
+            out.append({"freq_hz": int(f), "name": str(p.get("name", "?")),
+                        "mode": m if isinstance(m, str) else default_mode})
+        return out
 
     def _init_controls(self):
         btns = []
@@ -507,8 +535,10 @@ class SdrGui:
             if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                 mx, my = event.pos
                 if self.spec_rect.collidepoint(mx, my) or self.wf_rect.collidepoint(mx, my):
-                    ratio = (mx - self.spec_rect.x) / self.spec_rect.width
-                    clicked_freq = (self.center_freq - self.sample_rate / 2) + ratio * self.sample_rate
+                    w = self.spec_rect.width
+                    ratio = (mx - self.spec_rect.x) / w if w > 0 else 0.5
+                    sr = self.sample_rate if self.sample_rate > 0 else 1152000
+                    clicked_freq = (self.center_freq - sr / 2) + ratio * sr
 
                     snapped_station = None
                     min_dist = float("inf")
@@ -680,7 +710,8 @@ class SdrGui:
         # センター同調マーカー + 帯域ハイライト
         cx = r.centerx
         bw_hz = 200000 if self.mode == "WFM" else 16000 if self.mode == "NFM" else 12000
-        bw_px = max(2, int((bw_hz / self.sample_rate) * r.width))
+        sr = self.sample_rate if self.sample_rate > 0 else 1152000
+        bw_px = max(2, int((bw_hz / sr) * r.width))
         shade = pygame.Surface((bw_px, r.height - 12), pygame.SRCALPHA)
         shade.fill((226, 190, 110, 26))
         self.screen.blit(shade, (cx - bw_px // 2, r.y + 6))

@@ -27,21 +27,41 @@ from audio_output import AudioOutput
 from cascade_controller import CascadeController
 from hyper_controller import HyperController
 from auto_tuner import AutoTuner, match_station_name
+from config import detect_country, region_profile
+
+
+def fm_scan_range() -> tuple[int, int]:
+    """地域プロファイルのFM帯域 (JP以外では76〜95MHz直書きをしない)。"""
+    prof = region_profile(detect_country())
+    return int(prof["fm_start_hz"]), int(prof["fm_end_hz"])
 
 
 def parse_freq_str(s: str) -> int:
-    s = s.strip().upper()
-    if s.endswith("M") or s.endswith("MHZ"):
-        val = float(s.rstrip("MHZ"))
-        return int(val * 1e6)
-    elif s.endswith("K") or s.endswith("KHZ"):
-        val = float(s.rstrip("KHZ"))
-        return int(val * 1e3)
-    else:
-        val = float(s)
-        if val < 3000:
-            return int(val * 1e6)
-        return int(val)
+    """'94.6M'/'594K'/'80000K'/'94600000'をHzへ。不正入力はSystemExitで clean 終了。
+    rstrip("MHZ")は文字集合除去(例:'80MM'→'80')のため接尾辞除去に置換。"""
+    t = s.strip().upper()
+    mult = 1.0
+    for suffix, m in (("MHZ", 1e6), ("KHZ", 1e3), ("M", 1e6), ("K", 1e3), ("HZ", 1.0)):
+        if t.endswith(suffix) and len(t) > len(suffix):
+            t = t[: -len(suffix)].strip()
+            mult = m
+            break
+    try:
+        val = float(t)
+    except ValueError:
+        raise SystemExit(f"周波数の形式が不正です: {s!r} (例: 94.6M, 594K)")
+    hz = val * mult
+    if mult == 1.0 and val < 3000:
+        # 後方互換: 単位無しで3000未満はMHz扱い
+        hz = val * 1e6
+    return int(hz)
+
+
+def check_freq_range(f_hz: int) -> int:
+    """RTL-SDRの実用範囲外は clean 終了 (負値・99GHzのHW直行を防止)。"""
+    if not (100000 <= f_hz <= 1750000000):
+        raise SystemExit(f"周波数が範囲外です: {f_hz} Hz (0.1MHz〜1750MHz)")
+    return f_hz
 
 
 def print_scan_table(stations: list[dict]):
@@ -77,8 +97,9 @@ def main():
 
     # モード判定: スキャンのみ
     if cmd_mode == "scan":
-        print("[*] FM全帯域 (76.0〜95.0MHz) の高精度自動スキャンを実行中...")
-        stations = tuner.scan_band(76000000, 95000000, step_hz=1800000, snr_threshold=4.2)
+        lo, hi = fm_scan_range()
+        print(f"[*] FM全帯域 ({lo/1e6:.1f}〜{hi/1e6:.1f}MHz) の高精度自動スキャンを実行中...")
+        stations = tuner.scan_band(lo, hi, step_hz=1800000, snr_threshold=4.2)
         print_scan_table(stations)
         driver.close()
         return
@@ -88,8 +109,9 @@ def main():
     is_dx_mode = args.dx
 
     if cmd_mode in ["auto", "seek"]:
+        lo, hi = fm_scan_range()
         print("[*] 全自動チューニング: 最強局を探査中...")
-        stations = tuner.scan_band(76000000, 95000000, step_hz=1800000, snr_threshold=4.2)
+        stations = tuner.scan_band(lo, hi, step_hz=1800000, snr_threshold=4.2)
         print_scan_table(stations)
         best = tuner.get_strongest_station()
         if best:
@@ -98,8 +120,9 @@ def main():
         else:
             print("[!] 検出局がありません。デフォルト周波数 (94.6MHz) を使用します。")
     elif cmd_mode == "dx":
+        lo, hi = fm_scan_range()
         print("[*] DX超高感度チューニング: 通常聞こえない微弱局を探査中...")
-        stations = tuner.scan_band(76000000, 95000000, step_hz=1800000, snr_threshold=3.8)
+        stations = tuner.scan_band(lo, hi, step_hz=1800000, snr_threshold=3.8)
         print_scan_table(stations)
         dx_stations = tuner.get_dx_stations()
         if dx_stations:
@@ -111,7 +134,7 @@ def main():
         else:
             print("[!] 微弱局が見つかりませんでした。デフォルト周波数を使用します。")
     else:
-        target_freq_hz = parse_freq_str(args.freq)
+        target_freq_hz = check_freq_range(parse_freq_str(args.freq))
 
     sample_rate = 1152000
     audio_rate = 48000
@@ -138,6 +161,8 @@ def main():
         dsp.filter_mode = "narrow"
 
     audio = AudioOutput(audio_rate)
+    if not (0.0 <= args.vol <= 1.0):
+        print(f"[!] --vol は0.0〜1.0に丸めます: {args.vol}")
     audio.set_volume(args.vol)
 
     if args.controller == "cascade" or args.gain.lower() == "cascade":
@@ -152,7 +177,10 @@ def main():
     else:
         controller.enabled = False
         driver.set_gain_mode(True)
-        driver.set_gain(float(args.gain))
+        try:
+            driver.set_gain(float(args.gain))
+        except (ValueError, TypeError):
+            raise SystemExit(f"--gain の数値が不正です: {args.gain!r}")
         dsp.filter_mode = args.filter
 
     st_name = match_station_name(current_freq)

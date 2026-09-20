@@ -165,6 +165,10 @@ def shortwave_scan_centers(rate_hz: float, bands=None, usable_max_hz: int = SW_M
         if hi <= lo:
             continue
         fc = lo + half
+        if fc > hi - half:
+            # 帯域幅が窓幅未満: 下限を外す中心ではなく帯域中央1点でカバー
+            centers.append(int(round((lo + hi) / 2.0)))
+            continue
         while True:
             centers.append(int(round(min(fc, hi - half))))
             if fc + half >= hi:
@@ -188,6 +192,23 @@ DEFAULT_CONFIG = {
 }
 
 
+def _clean_preset_list(v, default_mode: str) -> list:
+    """プリセット配列を検証・正規化 (破損エントリは除去)。"""
+    out = []
+    if not isinstance(v, list):
+        return out
+    for p in v:
+        if not isinstance(p, dict):
+            continue
+        f = p.get("freq_hz")
+        if isinstance(f, bool) or not isinstance(f, (int, float)):
+            continue
+        m = p.get("mode", default_mode)
+        out.append({"name": str(p.get("name", "?")), "freq_hz": int(f),
+                    "mode": m if isinstance(m, str) else default_mode})
+    return out
+
+
 def load_config() -> dict:
     cfg = dict(DEFAULT_CONFIG)
     try:
@@ -195,7 +216,23 @@ def load_config() -> dict:
             loaded = json.load(f)
         if isinstance(loaded, dict):
             for k, v in loaded.items():
-                cfg[k] = v
+                if k not in DEFAULT_CONFIG:
+                    continue  # 未知キーは残留させない
+                if k in ("presets_fm", "presets_am"):
+                    cfg[k] = _clean_preset_list(
+                        v, "WFM" if k == "presets_fm" else "AM")
+                elif k == "volume":
+                    if isinstance(v, bool):
+                        continue
+                    if isinstance(v, (int, float)):
+                        cfg[k] = max(0.0, min(1.0, float(v)))
+                elif k in ("stereo", "stereo_nr"):
+                    if isinstance(v, bool):
+                        cfg[k] = v
+                elif k in ("country", "language", "presets_region"):
+                    if v is None or isinstance(v, str):
+                        cfg[k] = v
+                # 型不一致は既定値を維持 (破損値でのクラッシュ防止)
     except FileNotFoundError:
         pass
     except Exception:

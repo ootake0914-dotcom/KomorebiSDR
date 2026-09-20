@@ -8,6 +8,7 @@ from ctypes import byref, c_int, c_uint32, c_void_p, POINTER, create_string_buff
 import os
 import sys
 import threading
+import time
 import numpy as np
 
 
@@ -127,7 +128,12 @@ class RtlSdrDriver:
 
     def close(self):
         if self._async_active.is_set():
-            self.cancel_async()
+            if not self.cancel_async():
+                # Cループ残留中のcloseはuse-after-close(crash)のため実行しない。
+                # ハンドルはリークするが、クラッシュより安全。復帰は次回open時。
+                print("[WARN] async loop still active; skip rtlsdr_close "
+                      "(handle kept, will retry on next open)", file=sys.stderr)
+                return
         if self.is_open and self.dev:
             self._dll.rtlsdr_close(self.dev)
             self.dev = c_void_p(0)
@@ -252,10 +258,13 @@ class RtlSdrDriver:
         finally:
             self._async_active.clear()
 
-    def cancel_async(self, timeout: float = 2.0):
+    def cancel_async(self, timeout: float = 2.0) -> bool:
         """
         非同期受信ループを安全に停止し、Cループが実際に抜けるまで待機する。
         これにより、停止直後にread_syncを呼んでも競合・ハングしないことが保証される。
+        戻り値: ループが抜けた(True)/タイムアウトで残留(False)。
+        注意: threading.Event.waitはフラグset時に即復帰するため、
+        クリア待ちには使えない。ポーリングで実際に抜けを確認する。
         """
         active = False
         with self._async_lock:
@@ -264,7 +273,12 @@ class RtlSdrDriver:
                 active = True
                 self._dll.rtlsdr_cancel_async(self.dev)
         if active:
-            self._async_active.wait(timeout=timeout)
+            deadline = time.monotonic() + timeout
+            while self._async_active.is_set():
+                if time.monotonic() >= deadline:
+                    return False
+                time.sleep(0.01)
+        return True
 
     def resume_async(self):
         """cancel_async後、再度read_asyncを受け付ける状態に戻す"""

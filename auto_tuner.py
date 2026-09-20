@@ -74,6 +74,8 @@ class AutoTuner:
         :param snr_threshold: ピーク検知しきい値 (微弱局を拾うため 3.5dB に設定)
         :return: 発見された局のリスト（周波数、SNR、信号強度、局名、AFC補正値）
         """
+        if step_hz <= 0 or end_hz <= start_hz:
+            return []
         was_open = self.driver.is_open
         if not was_open:
             self.driver.open(0)
@@ -92,7 +94,7 @@ class AutoTuner:
 
         freq_centers = list(range(start_hz + scan_rate // 2, end_hz, step_hz))
         if not freq_centers or freq_centers[-1] < end_hz - scan_rate // 2:
-            freq_centers.append(end_hz - scan_rate // 2)
+            freq_centers.append(max(end_hz - scan_rate // 2, start_hz))
 
         for fc in freq_centers:
             self.driver.set_center_freq(fc)

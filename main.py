@@ -52,6 +52,7 @@ class SdrApp:
 
         # RT締切プロファイル (1ブロック=66048IQ@1.152MHz ≒ 57.3ms)
         self.rt_profile = RtProfile(budget_ms=57.3)
+        self._rt_summary_cache = ""
 
         # ハードウェアドライバ
         self.driver = RtlSdrDriver()
@@ -219,6 +220,31 @@ class SdrApp:
         print("[*] Background full-band scan started...")
         self.cmd_queue.put(("SCAN", "auto_best"))
 
+    # 合体可能コマンド: 滞留中の同種は最新のみ適用 (スキャン中のスライダ連打対策)
+    _COALESCE_CMDS = ("FREQ", "MODE", "GAIN", "FILTER", "BFO")
+
+    def _drain_commands(self):
+        """キューを全排出して陳腐化コマンドを合体する。
+        SCAN/SW_SCAN/SEEK/TOGGLE類は回数・順序が意味を持つため全件維持。"""
+        pending = []
+        while True:
+            try:
+                pending.append(self.cmd_queue.get_nowait())
+            except queue.Empty:
+                break
+        if len(pending) < 2:
+            return pending
+        keep = set()
+        out = []
+        for cmd, val in reversed(pending):
+            if cmd in self._COALESCE_CMDS:
+                if cmd in keep:
+                    continue
+                keep.add(cmd)
+            out.append((cmd, val))
+        out.reverse()
+        return out
+
     def _apply_frequency_and_mode(self, freq: int, mode: str):
         """周波数と復調モードをハードウェア・DSPに適用"""
         self.freq = freq
@@ -289,12 +315,30 @@ class SdrApp:
             raw_queue.put(raw_bytes)
 
         # 非同期USB受信スレッド
+        # 抜き差し検出: read_asyncが例外なく即時復帰し続けたらデバイス喪失とみなし、
+        # タイトループ(100%CPU)を避けて待機＋警告する。例外もカウント＋間引きログ。
+        usb_err_count = 0
+
         def async_usb_loop():
+            nonlocal usb_err_count
             while self.running and usb_running.is_set():
                 try:
+                    t0 = time.monotonic()
                     self.driver.read_async(on_async_data, num_buffers=16, buffer_len=132096)
-                except Exception:
-                    time.sleep(0.01)
+                    dt = time.monotonic() - t0
+                    if dt < 0.05 and self.running and usb_running.is_set():
+                        usb_err_count += 1
+                        if usb_err_count == 1 or usb_err_count % 50 == 0:
+                            print(f"[WARN] USB stream returned immediately "
+                                  f"x{usb_err_count} (device unplugged?)", file=sys.stderr)
+                        time.sleep(0.2)
+                    else:
+                        usb_err_count = 0
+                except Exception as e:
+                    usb_err_count += 1
+                    if usb_err_count % 20 == 1:
+                        print(f"[WARN] USB async error x{usb_err_count}: {e}", file=sys.stderr)
+                    time.sleep(0.05)
 
         def start_usb_stream():
             self.driver.resume_async()
@@ -303,11 +347,18 @@ class SdrApp:
             t.start()
             return t
 
-        def stop_usb_stream(t):
-            """Cループが実際に抜けるまで待機してから同期読み込みを行う (競合・ハング根絶)"""
+        def stop_usb_stream(t) -> bool:
+            """Cループが実際に抜けるまで待機してから同期読み込みを行う (競合・ハング根絶)。
+            戻り値: 旧スレッドが抜けた(True)/残留(False)。残留時は二重read_asyncを
+            避けるため呼び出し側はスキャンを中止しなければならない。"""
             usb_running.clear()
-            self.driver.cancel_async()
-            t.join(timeout=2.0)
+            self.driver.cancel_async(timeout=3.0)
+            t.join(timeout=3.0)
+            if t.is_alive():
+                print("[ERROR] USB thread stuck; scan aborted "
+                      "(keep old stream, no double read_async)", file=sys.stderr)
+                return False
+            return True
 
         def restore_after_scan():
             """帯域スキャンで変更された受信パラメータを通常受信状態へ復元"""
@@ -319,7 +370,11 @@ class SdrApp:
             """USBストリームを安全に停止して帯域スキャンを実行 (失敗しても必ず復帰)"""
             nonlocal t_usb
             self.gui.scan_status_text = status_label
-            stop_usb_stream(t_usb)
+            if not stop_usb_stream(t_usb):
+                # 旧ストリーム残留: 新スレッドを立てず、旧スレッドの回復に委ねる
+                usb_running.set()
+                self.gui.scan_status_text = "USB busy - scan skipped"
+                return []
             stations = []
             try:
                 stations = self.tuner.scan_band(
@@ -360,7 +415,10 @@ class SdrApp:
             """短波(HF)放送バンドをスキャンし、AMプリセットを更新する"""
             nonlocal t_usb
             self.gui.scan_status_text = status_label
-            stop_usb_stream(t_usb)
+            if not stop_usb_stream(t_usb):
+                usb_running.set()
+                self.gui.scan_status_text = "USB busy - scan skipped"
+                return []
             stations = []
             try:
                 stations = self.tuner.scan_band_hf(snr_threshold=6.5)
@@ -390,12 +448,8 @@ class SdrApp:
         t_usb = start_usb_stream()
 
         while self.running:
-            # コマンドキューの処理
-            while not self.cmd_queue.empty():
-                try:
-                    cmd, val = self.cmd_queue.get_nowait()
-                except queue.Empty:
-                    break
+            # コマンドキューの処理 (陳腐化合体: 連続FREQ等は最新のみ適用)
+            for cmd, val in self._drain_commands():
                 try:
                     if cmd == "FREQ":
                         self._apply_frequency_and_mode(val, self.mode)
@@ -561,19 +615,21 @@ class SdrApp:
                         txt = (
                             f"C/N {stats.get('channel_snr_db', stats['estimated_snr']):.1f}dB | "
                             f"Aud {stats.get('audio_snr_db', 0.0):.1f}dB | "
-                            f"{s_txt} | {self.rt_profile.summary()} | Ant:{ant_tag} | "
+                            f"{s_txt} | {self._rt_summary_cache} | Ant:{ant_tag} | "
                             f"Sync:{sync_tag} | {afc_str} | {lock_tag}"
                         )
                     else:
                         lock_str = t("lock_fixed") if hard_locked else (t("lock_converged") if stats["converged"] else t("lock_searching"))
                         txt = (
                             f"Cascade SNR {stats['estimated_snr']:.1f}dB | IQ {stats['iq_std']:.0f} | "
-                            f"{self.rt_profile.summary()} | Gain {stats['gain_db']:.1f}dB | {lock_str}"
+                            f"{self._rt_summary_cache} | Gain {stats['gain_db']:.1f}dB | {lock_str}"
                         )
-                    # テレメトリ表示は5Hzに間引き (GUI描画/GIL競合の低減)
+                    # テレメトリ表示は5Hzに間引き (GUI描画/GIL競合の低減)。
+                    # summary()のpartition 4発もここでのみ実行する。
                     now_t = time.time()
                     if now_t - getattr(self, "_last_telemetry_time", 0.0) >= 0.2:
                         self._last_telemetry_time = now_t
+                        self._rt_summary_cache = self.rt_profile.summary()
                         self.gui.telemetry_text = txt
 
                 # 音声キューへ転送
@@ -637,7 +693,17 @@ class SdrApp:
             print("[*] Shutting down...")
             self.running = False
             if self.sdr_thread:
-                self.sdr_thread.join(timeout=1.0)
+                self.sdr_thread.join(timeout=5.0)
+                if self.sdr_thread.is_alive():
+                    # スキャン中のread_sync等で残留: 生存ワーカーがあるまま
+                    # audio/driverを破棄すると競合するため警告して待機を1回延長
+                    print("[WARN] SDR worker still alive; waiting once more...",
+                          file=sys.stderr)
+                    self.sdr_thread.join(timeout=5.0)
+                    if self.sdr_thread.is_alive():
+                        print("[WARN] SDR worker did not exit; tearing down anyway "
+                              "(device handle kept safe by driver.close guard)",
+                              file=sys.stderr)
             self.audio.stop()
             self.driver.close()
             self.gui.close()
