@@ -147,8 +147,10 @@ def main():
     def apply_frequency(f_hz):
         if f_hz < 24000000:
             driver.set_direct_sampling(2)
-            driver.set_center_freq(f_hz)
-            offset = 0.0
+            # ダイレクトサンプリングはDC付近に巨大スパイクがあるため+150kHzずらす
+            # (main.py/ai_sdr.pyと同一方式。旧実装はoffset=0でスパイクが乗っていた)
+            offset = 150000.0
+            driver.set_center_freq(int(f_hz + offset))
         else:
             driver.set_direct_sampling(0)
             offset = 150000.0  # +150kHz DCスパイク回避
@@ -297,6 +299,10 @@ def main():
                     driver.set_gain_mode(True)
                     driver.set_gain(float(args.gain))
             finally:
+                # cancel_asyncで_setした_async_stopを必ず解除する。
+                # 解除しないとread_asyncが即returnを繰り返し、以降USB受信が
+                # 永久停止する (main.pyのstart_usb_streamと同じ理由)。
+                driver.resume_async()
                 usb_enabled.set()
         st = tuner.seek_next(current_freq, direction=direction)
         if st:

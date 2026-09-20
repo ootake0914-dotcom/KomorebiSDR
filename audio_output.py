@@ -221,7 +221,27 @@ class AudioOutput:
         if device_idx is not None:
             kwargs["device"] = int(device_idx)
         s = sd.OutputStream(**kwargs)
-        s.start()
+        try:
+            s.start()
+        except Exception:
+            # start失敗時に開いたストリームを必ず閉じる (リーク防止)
+            try:
+                s.close(ignore_errors=True)
+            except Exception:
+                try:
+                    s.close()
+                except Exception:
+                    pass
+            raise
+        if not self._want_running:
+            # 再オープン中にstop()された場合は開いたストリームを閉じて終了
+            # (停止後にストリームが残りキューを消費し続けるのを防ぐ)
+            try:
+                s.stop()
+                s.close()
+            except Exception:
+                pass
+            return False
         self.stream = s
         try:
             # 実際に開いたデバイス番号を保持 (device指定なしの場合は解決値)
@@ -230,6 +250,7 @@ class AudioOutput:
             self.current_device = device_idx
         self.is_running = True
         self.is_prerolled = False
+        return True
 
     @staticmethod
     def _default_output_index(devices=None) -> int | None:
@@ -318,8 +339,10 @@ class AudioOutput:
 
         for c in uniq:
             try:
-                self._open_stream(c)
-                return True
+                if self._open_stream(c):
+                    return True
+                # _want_running=False (stop済み) の場合は開かず終了
+                return False
             except Exception:
                 self.stream = None
                 continue
@@ -328,12 +351,13 @@ class AudioOutput:
         try:
             sd._terminate()
             sd._initialize()
-            self._open_stream(None)
-            return True
+            if self._open_stream(None):
+                return True
         except Exception:
-            self.stream = None
-            self.is_running = False
-            return False
+            pass
+        self.stream = None
+        self.is_running = False
+        return False
 
     def _start_device_watch(self):
         """Windows既定再生デバイスを監視し、変更時にストリームを再オープンする。
@@ -341,6 +365,10 @@ class AudioOutput:
         - 抜き差し後のPortAudioデバイス再列挙による番号ずれ
         - ストリーム死 (再オープン失敗)
         のいずれかを0.5秒間隔で検出し、複数候補へフォールバックしながら復帰する。"""
+        # 既存の監視スレッドが生きていれば停止 (start多重呼び出しでの増殖防止)
+        if self._device_watch_thread is not None and self._device_watch_thread.is_alive():
+            self._device_watch_stop.set()
+            self._device_watch_thread.join(timeout=1.0)
         self._device_watch_stop.clear()
         try:
             from win_audio import _win_default_output_name
@@ -402,7 +430,8 @@ class AudioOutput:
         self._lim_env = 0.0
         dev = self._default_output_index()
         try:
-            self._open_stream(dev)
+            if not self._open_stream(dev):
+                self.is_running = False
         except Exception:
             # オーディオデバイスが無い環境でも受信自体は継続する (無音)
             self.stream = None
@@ -415,15 +444,17 @@ class AudioOutput:
         if self._device_watch_thread is not None:
             self._device_watch_thread.join(timeout=1.5)
             self._device_watch_thread = None
-        if not self.is_running:
-            return
         self.is_running = False
         self.is_prerolled = False
         self.remainder = np.empty((0, 2), dtype=np.float32)
         self.last_out_samples = np.zeros(2, dtype=np.float32)
-        if self.stream:
-            self.stream.stop()
-            self.stream.close()
+        # is_runningがFalseでもstreamが残っていれば必ず閉じる (リーク防止)
+        if self.stream is not None:
+            try:
+                self.stream.stop()
+                self.stream.close()
+            except Exception:
+                pass
             self.stream = None
         while not self.audio_queue.empty():
             try:

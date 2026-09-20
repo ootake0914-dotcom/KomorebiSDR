@@ -291,10 +291,10 @@ class AdaptiveDriftResampler:
                 d = min(d, n_in)
                 out = np.empty((n_in - d, channels), dtype=np.float32)
                 if d == 1:
-                    # 旧: out[1:] = audio[:-1] は長さ不一致 (n_in-2 vs n_in-1) で
-                    # ValueError→数百ms音切れ。前サンプルを先頭に据えて末尾を
-                    # 1つ落とす正しい長さ (n_in-1) に修正。
-                    out[:] = np.concatenate(([self.last_sample], audio[1:-1]), axis=0)
+                    # d==1は先頭1サンプルを捨てるだけ (d>1の一般経路 out=audio[d:] と
+                    # 同じ意味)。旧実装は last_sample を先頭に重複挿入し末尾を1つ
+                    # 落としていたため、サンプル重複＋欠落 (クリック) が生じていた。
+                    out[:] = audio[1:]
                 else:
                     ext = np.concatenate(([self.prev_sample, self.last_sample], audio), axis=0)
                     out[:] = ext[n_in + 2 - len(out):n_in + 2]
@@ -348,10 +348,9 @@ class AdaptiveDriftResampler:
             d = min(d, n_in)
             out = np.empty(n_in - d, dtype=np.float32)
             if d == 1:
-                # 旧: out[1:] = audio[:-1] は長さ不一致 (n_in-2 vs n_in-1) で
-                # ValueError→数百ms音切れ。前サンプルを先頭に据えて末尾を
-                # 1つ落とす正しい長さ (n_in-1) に修正。
-                out[:] = np.concatenate(([self.last_sample], audio[1:-1]))
+                # d==1は先頭1サンプルを捨てるだけ (d>1の一般経路 out=audio[d:] と
+                # 同じ意味)。旧実装は last_sample を重複挿入しサンプル欠落を生んでいた。
+                out[:] = audio[1:]
             else:
                 ext = np.concatenate(([self.prev_sample, self.last_sample], audio))
                 out[:] = ext[n_in + 2 - len(out):n_in + 2]
@@ -1137,17 +1136,18 @@ class SdrDspPipeline:
         limited = self._apply_hard_limiter(iq_if)
 
         # 2. FM復調: デュアルモード。
-        # - クリーン (blend高) : 瞬時位相差分法 (分離度-42dBの忠実度)
-        # - 弱信号 (blend低) : PLL (しきい値拡張、低CNRで約+18dBを実測)
-        # 狭帯域PLLは38k副搬送波域を歪ませるため常時使用は不可。
-        # 弱信号域は既にモノラル化しているためPLLの狭帯域性は無害。
-        # 切替は平滑化済みblendのヒステリシス相当 (0.5) で行い、PLLは
-        # 約12サンプルで収束するため切替過渡は非可聴。
+        # - 通常 (強信号) : 瞬時位相差分法 (分離度-42dB・高変調域も歪まない)
+        # - 弱信号のみ : PLL (しきい値拡張、低CNRで約+18dBを実測)
+        # 狭帯域PLLは高変調域 (10-15kHz偏移) で追従が破綻しHFが-10〜-15dB歪むため、
+        # 強信号では絶対に使わない。判定はブレンド(ステレオ有無)ではなく信号強度
+        # (Sメーター) で行う。強モノラル局はblend=0になるためblend判定は誤りだった。
         # 出力は同単位 [rad/sample] のため後段は無変更。
+        use_pll = (self.fm_pll_enabled and NATIVE_PLLFM
+                   and self.s_meter_dbfs < -40.0)  # S7相当以下 = 弱信号
         if _NATIVE is not None:
             work = np.ascontiguousarray(limited, dtype=np.complex64)
             demod = np.empty(len(work), dtype=np.float32)
-            if self.fm_pll_enabled and NATIVE_PLLFM and self._stereo_blend < 0.5:
+            if use_pll:
                 _NATIVE.sdr_pll_fm_demod(
                     _fptr(work), _fptr(demod), len(work),
                     self._fm_pll_state.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
@@ -1161,9 +1161,8 @@ class SdrDspPipeline:
         else:
             s = np.concatenate(([self.fm_last_sample], limited))
             self.fm_last_sample = limited[-1]
-            if self.fm_pll_enabled:
-                # 純Python PLLフォールバック (DLL不在時のみ。低速だが機能等価。
-                # C側LUTとlibmの差で長時間は微乖離し得るが追従は一致する)
+            if use_pll:
+                # 純Python PLLフォールバック (DLL不在時のみ。C経路と同じ強度ゲート)
                 th = float(self._fm_pll_state[0])
                 fr = float(self._fm_pll_state[1])
                 kp = float(self._fm_pll_kp)
@@ -1481,6 +1480,9 @@ class SdrDspPipeline:
             self._wf_in = buf[nframes * hop:]
             self._wf_out = np.concatenate(
                 (self._wf_out, out_hops.astype(np.float32)))
+        else:
+            # フレーム未満の入力は破棄せず持ち越す (旧実装はここで入力を消していた)
+            self._wf_in = buf
         if len(self._wf_out) >= n:
             y = self._wf_out[:n].copy()
             self._wf_out = self._wf_out[n:]
@@ -1522,8 +1524,12 @@ class SdrDspPipeline:
 
     def _update_stereo_pilot(self, mpx: np.ndarray):
         """19kHzパイロットPLLを更新し、ステレオブレンド係数とRDS用57kHz搬送波を生成する"""
+        # 4本すべてクリアしてから生成する。sin2/sin3を残すと、早期return・例外時に
+        # L-R復調が前ブロックの古い38kHz搬送波長で掛かり ValueError/ゴミ音になる。
         self._last_cos2 = None
+        self._last_sin2 = None
         self._last_cos3 = None
+        self._last_sin3 = None
         if not (self.stereo_enabled or self.rds_enabled) or _NATIVE is None or len(mpx) < 64:
             self._stereo_blend *= 0.9
             self.stereo_blend = self._stereo_blend
@@ -1630,7 +1636,9 @@ class SdrDspPipeline:
             self._last_cos2 = None
             self._last_sin2 = None
             self._last_cos3 = None
+            self._last_sin3 = None
             self._stereo_blend *= 0.9
+            self.stereo_blend = self._stereo_blend
 
     def _apply_voice_highpass(self, audio: np.ndarray) -> np.ndarray:
         """通信音声用の300Hzハイパスフィルタ (Cコア: GIL解放で並行実行)"""

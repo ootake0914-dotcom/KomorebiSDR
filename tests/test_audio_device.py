@@ -69,6 +69,7 @@ def test_reopen_fallback_and_retry():
     """再オープン失敗時に候補を順に試し、全滅しても監視が再試行することを検証"""
     a = AudioOutput(48000, 1024)
     a.is_prerolled = False
+    a._want_running = True  # 動作中アプリと同じ状態 (stopされていない)
 
     opened = []
 

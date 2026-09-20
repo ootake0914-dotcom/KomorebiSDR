@@ -268,8 +268,10 @@ class RdsDecoder:
         elif gtype in (2,) and not version_b:  # RadioText (2A: 64 chars)
             ab = (b2 >> 4) & 1
             if self._rt_ab is not None and ab != self._rt_ab:
-                # A/Bフラグ切替: 新しい文が始まるためバッファをリセット
+                # A/Bフラグ切替: 新しい文が始まるためバッファと表示をリセット
+                # (古い曲名が新文の表示条件成立まで残るのを防ぐ)
                 self._rt = [None] * 64
+                self.radio_text = ""
             self._rt_ab = ab
             addr = b2 & 0xF
             raw3 = [(b3 >> 8) & 0xFF, b3 & 0xFF,

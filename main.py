@@ -456,8 +456,10 @@ class SdrApp:
                 self.gui.scan_status_text = t("auto_tuned", freq=f"{best_station['freq_mhz']:.2f}", snr=f"{best_station['snr_db']:+.1f}")
             return stations
 
-        def safe_hf_scan(status_label: str):
-            """短波(HF)放送バンドをスキャンし、AMプリセットを更新する"""
+        def safe_hf_scan(status_label: str, auto_tune_best: bool = True):
+            """短波(HF)放送バンドをスキャンし、AMプリセットを更新する。
+            auto_tune_best=False はシーク用 (最良局への自動同調・AM強制をせず、
+            呼び出し元の周波数/モードを保つ)。"""
             nonlocal t_usb
             self.gui.scan_status_text = status_label
             if not stop_usb_stream(t_usb):
@@ -479,6 +481,11 @@ class SdrApp:
                     print(f"[ERROR] Failed to restore receiver after scan: {e}", file=sys.stderr)
                 t_usb = start_usb_stream()
 
+            if not auto_tune_best:
+                # シーク用: 最良局へ同調せず件数だけ通知 (起点/モードを保つ)
+                self.gui.scan_status_text = (t("scan_done", n=len(stations))
+                                             if stations else t("sw_scan_none"))
+                return stations
             if stations:
                 best = max(stations, key=lambda s: s["snr_db"])
                 self._apply_frequency_and_mode(best["freq_hz"], "AM")
@@ -509,6 +516,7 @@ class SdrApp:
                             # 古い観測値ではなく新たにベイズ的スウィートスポットから再探索
                             self.controller.reset_tracking()
                             self.gui.is_auto_gain = True
+                            self.gui.manual_gain_db = None
                             self.gui.scan_status_text = t("auto_gain_resumed")
                         elif hasattr(self.controller, "set_hard_lock"):
                             current_locked = getattr(self.controller, "hard_lock", False)
@@ -528,6 +536,7 @@ class SdrApp:
                             if hasattr(self.controller, "set_hard_lock"):
                                 self.controller.set_hard_lock(False)
                             self.gui.is_auto_gain = True
+                            self.gui.manual_gain_db = None
                             self.gui.scan_status_text = t("auto_gain_resumed")
                         else:
                             self.use_controller = False
@@ -537,10 +546,12 @@ class SdrApp:
                             self.driver.set_gain(gain_val)
                             self.gui.is_auto_gain = False
                             self.gui.is_hard_locked = True
+                            self.gui.manual_gain_db = float(gain_val)
                             self.gui.btn_gain_auto.text = t("gain_manual", db=f"{gain_val:.1f}")
                             self.gui.btn_gain_auto.bg_color = (206, 236, 224)
                             self.gui.scan_status_text = t("manual_gain_set", db=f"{gain_val:.1f}")
                     elif cmd == "FILTER":
+                        self.gui.filter_mode = val
                         if val == "auto":
                             # 適応制御へ復帰 (Hyperはoverride解除、dspは既定モードへ)
                             self.dsp.filter_mode = "clean"
@@ -561,7 +572,8 @@ class SdrApp:
                         # (USBストリームを安全に停止しないとread_syncが競合・ハングする)
                         if not (self.tuner.discovered_sw if use_sw else self.tuner.discovered_stations):
                             if use_sw:
-                                safe_hf_scan(t("first_seek_scan"))
+                                # シーク用スキャン: 同調/モード変更をしない
+                                safe_hf_scan(t("first_seek_scan"), auto_tune_best=False)
                             else:
                                 safe_band_scan(t("first_seek_scan"))
                         st = self.tuner.seek_next(self.freq, direction=direction, use_sw=use_sw)

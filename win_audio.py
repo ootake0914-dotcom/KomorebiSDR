@@ -38,7 +38,7 @@ def _guid(data1, data2, data3, b4):
 CLSID_MMDeviceEnumerator = _guid(0xBCDE0395, 0xE52F, 0x467C, [0x8E, 0x3D, 0xC4, 0x57, 0x92, 0x91, 0x69, 0x2E])
 IID_IMMDeviceEnumerator = _guid(0xA95664D2, 0x9614, 0x4F35, [0xA7, 0x46, 0xDE, 0x8D, 0xB6, 0x36, 0x17, 0xE6])
 IID_IMMDevice = _guid(0xD666063F, 0x1587, 0x4E43, [0x81, 0xF1, 0xB9, 0x48, 0xE8, 0x07, 0x36, 0x3F])
-IID_IPropertyStore = _guid(0x886D8EEB, 0x8CF2, 0x4446, [0x8D, 0x02, 0xCD, 0xBA, 0x1D, 0xBD, 0xC9, 0x9C])
+IID_IPropertyStore = _guid(0x886D8EEB, 0x8CF2, 0x4446, [0x8D, 0x02, 0xCD, 0xBA, 0x1D, 0xBD, 0xCF, 0x99])
 class PROPERTYKEY(ctypes.Structure):
     _fields_ = [
         ("fmtid", GUID),
@@ -58,6 +58,15 @@ ERender, eMultimedia = 0, 1
 CLSCTX_ALL = 0x17
 VT_LPWSTR = 31
 COINIT_APARTMENTTHREADED = 0x2
+
+
+def _co_init(ole32) -> int:
+    """COM初期化。戻り値が0以上 (S_OK/S_FALSE) のときのみ CoUninitialize が必要。
+    RPC_E_CHANGED_MODE (0x80010106) 等のエラーでは呼んではならない。"""
+    try:
+        return int(ole32.CoInitializeEx(None, COINIT_APARTMENTTHREADED))
+    except Exception:
+        return -1
 S_OK = 0
 _HRESULT = ctypes.c_long
 
@@ -94,7 +103,7 @@ def _win_enumerate_render_endpoints():
     ole32.CoTaskMemFree.restype = None
     out = []
     try:
-        ole32.CoInitializeEx(None, COINIT_APARTMENTTHREADED)
+        _co_hr = _co_init(ole32)
         pdev = c_void_p()
         hr = ole32.CoCreateInstance(byref(CLSID_MMDeviceEnumerator), None,
                                     CLSCTX_ALL, byref(IID_IMMDeviceEnumerator),
@@ -154,10 +163,11 @@ def _win_enumerate_render_endpoints():
     except Exception:
         return out
     finally:
-        try:
-            ole32.CoUninitialize()
-        except Exception:
-            pass
+        if _co_hr >= 0:
+            try:
+                ole32.CoUninitialize()
+            except Exception:
+                pass
     return out
 
 
@@ -190,7 +200,11 @@ def _device_friendly_name(hdev) -> str | None:
                 try:
                     return ctypes.wstring_at(pv.p)
                 finally:
-                    ctypes.windll.ole32.CoTaskMemFree(pv.p)
+                    ole32 = ctypes.windll.ole32
+                    # argtypes未設定だと64bitポインタがc_int扱いでOverflowError
+                    ole32.CoTaskMemFree.argtypes = [c_void_p]
+                    ole32.CoTaskMemFree.restype = None
+                    ole32.CoTaskMemFree(pv.p)
             return None
         finally:
             _release(store)
@@ -212,7 +226,7 @@ def _win_default_output_peak():
     ole32.CoUninitialize.argtypes = []
     peak = None
     try:
-        ole32.CoInitializeEx(None, COINIT_APARTMENTTHREADED)
+        _co_hr = _co_init(ole32)
         pdev = c_void_p()
         if ole32.CoCreateInstance(byref(CLSID_MMDeviceEnumerator), None, CLSCTX_ALL,
                                   byref(IID_IMMDeviceEnumerator), byref(pdev)) != S_OK or not pdev:
@@ -251,10 +265,11 @@ def _win_default_output_peak():
     except Exception:
         return None
     finally:
-        try:
-            ole32.CoUninitialize()
-        except Exception:
-            pass
+        if _co_hr >= 0:
+            try:
+                ole32.CoUninitialize()
+            except Exception:
+                pass
     return peak
 
 
@@ -274,7 +289,7 @@ def _win_session_volumes():
     enum = None
     hdev = None
     try:
-        ole32.CoInitializeEx(None, COINIT_APARTMENTTHREADED)
+        _co_hr = _co_init(ole32)
         pdev = c_void_p()
         if ole32.CoCreateInstance(byref(CLSID_MMDeviceEnumerator), None, CLSCTX_ALL,
                                   byref(IID_IMMDeviceEnumerator), byref(pdev)) != S_OK or not pdev:
@@ -337,10 +352,11 @@ def _win_session_volumes():
                 _release(hdev)
         except Exception:
             pass
-        try:
-            ole32.CoUninitialize()
-        except Exception:
-            pass
+        if _co_hr >= 0:
+            try:
+                ole32.CoUninitialize()
+            except Exception:
+                pass
     return out
 
 
@@ -413,7 +429,7 @@ def _win_default_output_mute_volume():
     muted = None
     volume = None
     try:
-        ole32.CoInitializeEx(None, COINIT_APARTMENTTHREADED)
+        _co_hr = _co_init(ole32)
         pdev = c_void_p()
         hr = ole32.CoCreateInstance(
             byref(CLSID_MMDeviceEnumerator), None, CLSCTX_ALL,
@@ -463,10 +479,11 @@ def _win_default_output_mute_volume():
     except Exception:
         return (None, None)
     finally:
-        try:
-            ole32.CoUninitialize()
-        except Exception:
-            pass
+        if _co_hr >= 0:
+            try:
+                ole32.CoUninitialize()
+            except Exception:
+                pass
     return (muted, volume)
 
 
@@ -486,7 +503,7 @@ def _win_default_output_name() -> str | None:
     ole32.CoTaskMemFree.restype = None
     result = None
     try:
-        ole32.CoInitializeEx(None, COINIT_APARTMENTTHREADED)
+        _co_hr = _co_init(ole32)
         pdev = ctypes.c_void_p()
         hr = ole32.CoCreateInstance(
             byref(CLSID_MMDeviceEnumerator), None, CLSCTX_ALL,
@@ -545,8 +562,9 @@ def _win_default_output_name() -> str | None:
     except Exception:
         return None
     finally:
-        try:
-            ole32.CoUninitialize()
-        except Exception:
-            pass
+        if _co_hr >= 0:
+            try:
+                ole32.CoUninitialize()
+            except Exception:
+                pass
     return result

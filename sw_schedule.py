@@ -59,10 +59,11 @@ def find_current_csv(timeout: float = 15.0) -> str | None:
         m = re.findall(r"dx/sked-([ab])(\d+)\.csv", html)
         if m:
             # 文字列ソートでは a26 と b25 を誤順序にする (b>a でb25が勝ち)。
-            # 季節を数値化: bN=2N, aN=2N+1 (b25< a26< b26 の時系列順) で最大を選ぶ
+            # 季節の時系列は b25 < a26 < b26 < a27 なので、
+            # aN = 2N, bN = 2N+1 で数値化して最大を選ぶ。
             def key(pr):
                 letter, num = pr
-                return 2 * int(num) + (1 if letter == "a" else 0)
+                return 2 * int(num) + (1 if letter == "b" else 0)
             best = max(m, key=key)
             return SCHEDULE_PAGE + f"sked-{best[0]}{best[1]}.csv"
     except Exception:

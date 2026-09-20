@@ -272,6 +272,8 @@ class SdrGui:
         self.is_hard_locked = False     # 収束決め打ち中フラグ
         self.gain_auto_label = "Hyper: ON"
         self.gain_val = 30.0
+        self.manual_gain_db = None      # 手動ゲイン値 (表示再同期用)
+        self.filter_mode = "clean"      # フィルタ表示再同期用
         self.gains_list = []
         self.current_rssi = -50.0
         self.is_dx_mode = False
@@ -455,6 +457,20 @@ class SdrGui:
         if hasattr(self, "btn_dx_mode"):
             self.btn_dx_mode.text = "DX Boost: ON" if self.is_dx_mode else "DX: OFF"
             self.btn_dx_mode.bg_color = (234, 224, 246) if self.is_dx_mode else (240, 243, 248)
+        # ゲイン/フィルタ表示も再構築で既定へ戻るため再同期する
+        # (手動ゲイン中にスキャンすると「Hyper: ON」表示に戻る問題の修正)
+        if hasattr(self, "btn_gain_auto") and hasattr(self, "is_auto_gain"):
+            if self.is_auto_gain:
+                self.btn_gain_auto.text = getattr(self, "gain_auto_label", "Hyper: ON")
+                self.btn_gain_auto.bg_color = (230, 240, 250)
+            else:
+                db = getattr(self, "manual_gain_db", None)
+                if db is not None:
+                    self.btn_gain_auto.text = t("gain_manual", db=f"{db:.1f}")
+                self.btn_gain_auto.bg_color = (206, 236, 224)
+        if hasattr(self, "btn_filter") and hasattr(self, "filter_mode"):
+            label = "Auto" if self.filter_mode == "auto" else self.filter_mode.capitalize()
+            self.btn_filter.text = f"Filter: {label}"
 
     @staticmethod
     def _clean_presets(items, default_mode: str) -> list:
@@ -502,12 +518,15 @@ class SdrGui:
         mw = (tw - 5 * gap) // 6
         mode_defs = [("WFM", (212, 236, 248)), ("AM", (212, 236, 248)), ("NFM", (212, 236, 248)),
                      ("USB", (226, 236, 250)), ("LSB", (226, 236, 250)), ("CW", (226, 236, 250))]
-        self.mode_buttons = {}
+        # ローカルで組んで最後に一括差し替え (描画スレッドのitems()反復中の
+        # dictサイズ変更によるRuntimeErrorを防止)
+        mode_buttons = {}
         for i, (name, col) in enumerate(mode_defs):
             b = Button((tx + i * (mw + gap), 382, mw, 27), name,
                        (lambda m=name: self._set_mode(m)), bg_color=col)
-            self.mode_buttons[name] = b
+            mode_buttons[name] = b
             btns.append(b)
+        self.mode_buttons = mode_buttons
         self.btn_wfm = self.mode_buttons["WFM"]
         self.btn_am = self.mode_buttons["AM"]
         self.btn_nfm = self.mode_buttons["NFM"]

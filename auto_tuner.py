@@ -303,8 +303,11 @@ class AutoTuner:
         if not was_open and self.owns_driver:
             self.driver.close()
 
-        stations.sort(key=lambda s: s["freq_hz"])
+        # 上位をSNR順で選んでから周波数順に並べ直す
+        # (周波数順で切ると低帯域の弱局で枠が埋まり、22m等の強局が漏れる)
+        stations.sort(key=lambda s: s["snr_db"], reverse=True)
         stations = stations[:max_results]
+        stations.sort(key=lambda s: s["freq_hz"])
         self.discovered_sw = stations
         self.last_scan_time = time.time()
         return stations

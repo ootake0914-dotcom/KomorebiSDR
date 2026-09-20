@@ -403,6 +403,12 @@ SDR_EXPORT void sdr_cma_equalize(const float *x, float *y, int n_out,
         float er = g * yr;
         float ei = g * yi;
         float step = mu / (pwr + 1e-4f);
+        if (!(step > 0.0f)) {
+            /* pwrがNaN/非正: 重み更新を停止 (NaN伝播防止)。出力のみ返す */
+            y[2 * j]     = yr;
+            y[2 * j + 1] = yi;
+            continue;
+        }
         if (step > 0.05f) {
             step = 0.05f;
         }
@@ -413,7 +419,11 @@ SDR_EXPORT void sdr_cma_equalize(const float *x, float *y, int n_out,
             float xi = xp[2 * k + 1];
             float nwr = leak * w[2 * k]     + step * (er * xr + ei * xi);
             float nwi = leak * w[2 * k + 1] + step * (ei * xr - er * xi);
-            /* 個別タップクリッピング */
+            /* NaNは書き込まない (比較が常にfalseになるのを利用) */
+            if (nwr != nwr || nwi != nwi) {
+                continue;
+            }
+            /* 個別タップクリッピング (±Infもここで飽和) */
             if (nwr > 3.0f) nwr = 3.0f; else if (nwr < -3.0f) nwr = -3.0f;
             if (nwi > 3.0f) nwi = 3.0f; else if (nwi < -3.0f) nwi = -3.0f;
             w[2 * k]     = nwr;
