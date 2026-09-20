@@ -46,7 +46,7 @@ def _load_native_core():
                                        ctypes.c_double, ctypes.c_double, ctypes.POINTER(ctypes.c_double),
                                        ctypes.POINTER(ctypes.c_double), ctypes.c_double, pf, pf, pf]
         # 追加関数は無くてもネイティブコア全体を無効化しない (旧DLLとの後方互換)
-        global NATIVE_AM_SYNC, NATIVE_PLL3, NATIVE_FIR, NATIVE_POLY, NATIVE_PLLFM
+        global NATIVE_AM_SYNC, NATIVE_PLL3, NATIVE_FIR, NATIVE_POLY, NATIVE_PLLFM, NATIVE_CMA
         if hasattr(lib, "sdr_stereo_pll3"):
             lib.sdr_stereo_pll3.argtypes = [pf, ctypes.c_int, ctypes.POINTER(ctypes.c_double),
                                             ctypes.c_double, ctypes.c_double, ctypes.c_double,
@@ -71,6 +71,11 @@ def _load_native_core():
                                              ctypes.POINTER(ctypes.c_double),
                                              ctypes.c_double, ctypes.c_double]
             NATIVE_PLLFM = True
+        global NATIVE_CMA
+        if hasattr(lib, "sdr_cma_equalize"):
+            lib.sdr_cma_equalize.argtypes = [pf, pf, ctypes.c_int, pf,
+                                             ctypes.c_int, ctypes.c_float]
+            NATIVE_CMA = True
         if hasattr(lib, "sdr_fast_fpu"):
             try:
                 lib.sdr_fast_fpu()  # FTZ/DAZ有効化 (denormalジッタ対策)
@@ -88,6 +93,7 @@ NATIVE_PLL3 = False
 NATIVE_FIR = False
 NATIVE_POLY = False
 NATIVE_PLLFM = False
+NATIVE_CMA = False
 _NATIVE = _load_native_core()
 NATIVE_CORE_ENABLED = _NATIVE is not None
 
@@ -649,6 +655,14 @@ class SdrDspPipeline:
         self.mp_lo = 0.10
         self.mp_hi = 0.35
         self.mp_depth = 0.7
+        # CMAブラインド等化器 (マルチパス・キャンセル)。検出量＋信号存在で駆動。
+        self.multipath_cancel_enabled = True
+        self._cma_taps = 33
+        self._cma_mu = 0.15
+        self._cma_w = np.zeros(2 * self._cma_taps, dtype=np.float32)
+        self._cma_w[2 * (self._cma_taps // 2)] = 1.0  # 中央タップ=デルタ初期化
+        self._cma_hist = np.zeros(self._cma_taps - 1, dtype=np.complex64)
+        self.cma_active = False
 
         # ===== AM/SSB 適応音声帯域 =====
         # ヒスが多い時は音声帯域を狭めて了解度を上げる (自動トーンコントロール)
@@ -698,6 +712,11 @@ class SdrDspPipeline:
         self.fm_last_sample = 0.0 + 0.0j
         self.nfm_last_sample = 0.0 + 0.0j
         self._fm_pll_state[:] = 0.0
+        # CMA等化器も再初期化 (前局のチャネル推定を持ち越さない)
+        self._cma_w[:] = 0.0
+        self._cma_w[2 * (self._cma_taps // 2)] = 1.0
+        self._cma_hist[:] = 0.0
+        self.cma_active = False
         self.reset_stereo_nr()
         self.am_sync_lock = 0.0
         if hasattr(self, "ultra_squelch"):
@@ -907,6 +926,20 @@ class SdrDspPipeline:
     def decimate(self, x: np.ndarray, fir_taps: np.ndarray, factor: int) -> np.ndarray:
         return self.decimate_with_history(x, fir_taps, factor, "history_if")
 
+    def _apply_cma(self, iq_if: np.ndarray) -> np.ndarray:
+        """CMAブラインド等化器 (history前置でブロック連続性を保つ)。"""
+        taps = self._cma_taps
+        x_ext = np.concatenate((self._cma_hist, np.ascontiguousarray(iq_if)))
+        self._cma_hist = x_ext[-(taps - 1):].copy()
+        n_out = len(iq_if)
+        if n_out == 0:
+            return iq_if
+        xa = np.ascontiguousarray(x_ext, dtype=np.complex64)
+        y = np.empty(n_out, dtype=np.complex64)
+        _NATIVE.sdr_cma_equalize(_fptr(xa), _fptr(y), n_out,
+                                 _fptr(self._cma_w), taps, float(self._cma_mu))
+        return y
+
     def _apply_hard_limiter(self, iq_if: np.ndarray) -> np.ndarray:
         mag = np.abs(iq_if) + 1e-12
         return iq_if / mag
@@ -957,7 +990,16 @@ class SdrDspPipeline:
             self.multipath_amount += (1.0 - np.exp(-dt_mp / tau)) * (s - self.multipath_amount)
             self.multipath_gain = 1.0 - self.mp_depth * self.multipath_amount
 
-        # 1. ハードリミッター適用
+        # 1. CMA等化 (マルチパス・キャンセル) + ハードリミッター適用
+        if (self.multipath_cancel_enabled and _NATIVE is not None and NATIVE_CMA
+                and self.multipath_amount > 0.15
+                and (abs(self.stereo_pilot_lock) > 0.2 or self.s_meter_dbfs > -45.0)):
+            # CMA等化 (ハードリミット前。リミット後は包絡線一定で誤差が出ない)。
+            # 信号存在ゲート: ノイズ上での無意味な適応・発散を防ぐ。
+            iq_if = self._apply_cma(iq_if)
+            self.cma_active = True
+        else:
+            self.cma_active = False
         limited = self._apply_hard_limiter(iq_if)
 
         # 2. FM復調: デュアルモード。

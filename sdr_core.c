@@ -342,6 +342,46 @@ SDR_EXPORT void sdr_fm_demod(const float *iq, float *demod, int n, float *last)
     last[1] = lq;
 }
 
+/* CMAブラインド等化器 (マルチパス・キャンセル用)。
+ * 定包絡線(FM)信号の周波数選択性フェージングをパイロット不要で等化する。
+ * - x: 入力複素IF (floatインタリーブ re,im,...)。history前置済み。
+ * - y: 出力 (n_out)。y[j] は x[j..j+taps-1] からのフィルタ出力。
+ * - w: タップ重み (complex64インタリーブ、呼出側で保持・継続適応)。
+ * - mu: ステップ幅係数 (電力正規化NLMS型: 実効μ = mu/(電力+eps))。
+ * 各サンプルで CMA誤差 e = y*(1-|y|^2) により w をLMS更新する。
+ * 位相回転の不定性はFM復調 (差分/PLL) が吸収するため無害。
+ */
+SDR_EXPORT void sdr_cma_equalize(const float *x, float *y, int n_out,
+                                 float *w, int taps, float mu)
+{
+    for (int j = 0; j < n_out; ++j) {
+        const float *xp = x + 2 * j;
+        float yr = 0.0f, yi = 0.0f, pwr = 0.0f;
+        for (int k = 0; k < taps; ++k) {
+            float xr = xp[2 * k];
+            float xi = xp[2 * k + 1];
+            float wr = w[2 * k];
+            float wi = w[2 * k + 1];
+            yr += xr * wr - xi * wi;
+            yi += xr * wi + xi * wr;
+            pwr += xr * xr + xi * xi;
+        }
+        float m2 = yr * yr + yi * yi;
+        float g = 1.0f - m2;
+        float er = g * yr;
+        float ei = g * yi;
+        float step = mu / (pwr + 1e-6f);
+        for (int k = 0; k < taps; ++k) {
+            float xr = xp[2 * k];
+            float xi = xp[2 * k + 1];
+            w[2 * k]     += step * (er * xr + ei * xi);
+            w[2 * k + 1] += step * (ei * xr - er * xi);
+        }
+        y[2 * j] = yr;
+        y[2 * j + 1] = yi;
+    }
+}
+
 /* PLL周波数復調 (しきい値拡張型)。
  * 2次ループ+VCOで搬送波位相を追従し、瞬時角周波数 [rad/sample] を出力する。
  * angle差分法と同単位のためそのまま置換可能。入力はハードリミット済み (|x|=1)。
