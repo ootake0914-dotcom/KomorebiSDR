@@ -1063,10 +1063,12 @@ class SdrDspPipeline:
         y = np.empty(n_out, dtype=np.complex64)
         _NATIVE.sdr_cma_equalize(_fptr(xa), _fptr(y), n_out,
                                  _fptr(self._cma_w), taps, float(self._cma_mu))
-        # フェイルセーフ: 万一 NaN/Inf が出力されたら重みを即座にリセットし原信号をサニタイズして通過
+        # フェイルセーフ: 万一 NaN/Inf が出力されたら重みと履歴を即座にリセットし
+        # 原信号をサニタイズして通過 (NaN履歴が数ブロック再発するのを防ぐ)
         if not np.all(np.isfinite(y)):
             self._cma_w[:] = 0.0
             self._cma_w[2 * (taps // 2)] = 1.0
+            self._cma_hist[:] = 0.0
             return np.nan_to_num(iq_if, nan=0.0, posinf=1.0, neginf=-1.0)
         return y
 

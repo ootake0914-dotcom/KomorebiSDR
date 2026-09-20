@@ -33,6 +33,7 @@ class AudioOutput:
         self.is_prerolled = False
         self.current_device = None
         self._last_default_name = None
+        self._reopened_for_name = None
         self._want_running = False
         self._device_watch_thread = None
         self._device_watch_stop = threading.Event()
@@ -392,14 +393,18 @@ class AudioOutput:
                             last = name
                             self._last_default_name = name
                             need = True
-                        if not self.is_running:
-                            # ストリーム死 (再オープン失敗等) も回復対象
+                        # PortAudio内部エラー等でコールバックが止まった場合の死検出
+                        if (not need and self.is_running and self.stream is not None
+                                and not getattr(self.stream, "active", True)):
                             need = True
-                        elif name:
+                        if not self.is_running:
+                            need = True
+                        elif name and name != self._reopened_for_name:
                             # 抜き差しでWindowsがデバイスを再列挙するとPortAudioの
-                            # 番号がずれる (例: Headphones 4→3, 5は入力に変化)。
-                            # 名前が同じでも現在のストリーム実デバイスが既定名と
-                            # 一致しなくなったら再オープンする。
+                            # 番号がずれる (例: Headphones 4→3)。名前が同じでも現在の
+                            # ストリーム実デバイスが既定名と不一致なら一度だけ再オープン。
+                            # (毎周期リトライするとフォールバック後に0.5秒毎の音切れループに
+                            #  なるため、同一名では1回に制限する)
                             matched = self._match_output_index(name, self.current_device)
                             if (matched is not None
                                     and self.current_device is not None
@@ -410,6 +415,7 @@ class AudioOutput:
                                 self._match_output_index(name, self.current_device)
                                 if name else None)
                             self._reopen_for_device(idx)
+                            self._reopened_for_name = name
                 except Exception:
                     pass
                 # 0.5秒間隔 (Core Audioクエリ約10ms。抜き差し検出の遅延を最小化)
