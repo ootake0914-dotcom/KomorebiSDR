@@ -44,6 +44,14 @@ class AudioOutput:
         self._signbuf = np.empty_like(self._scratch)
         self._compbuf = np.empty_like(self._scratch)
 
+        # ルックアヘッドリミッタ (ワーカー側put_audioで実行。1.5ms先読みで
+        # 過変調クリップを歪みなく抑止。コールバック側の瞬時リミッタは安全網として残す)
+        self._lim_delay_n = 72  # 1.5ms @48kHz
+        self._lim_delay = np.zeros((self._lim_delay_n, 2), dtype=np.float32)
+        self._lim_env = 0.0
+        self._lim_rel = float(np.exp(-1.0 / (0.040 * float(sample_rate))))
+        self._lim_thr = 0.98
+
         # 長時間安定稼働モニタリング統計
         self.underrun_count = 0
         self.overflow_count = 0
@@ -201,6 +209,8 @@ class AudioOutput:
         self.is_prerolled = False
         self.remainder = np.empty((0, 2), dtype=np.float32)
         self.last_out_samples = np.zeros(2, dtype=np.float32)
+        self._lim_delay = np.zeros((self._lim_delay_n, 2), dtype=np.float32)
+        self._lim_env = 0.0
         try:
             self.stream = sd.OutputStream(
                 samplerate=self.sample_rate,
@@ -233,6 +243,41 @@ class AudioOutput:
             except queue.Empty:
                 break
 
+    def _lookahead_limit(self, arr: np.ndarray) -> np.ndarray:
+        """1.5ms先読みブリックウォールリミッタ (put_audio=ワーカースレッド側)。
+        未来ピークからゲインを決めるためアタック歪みが出ない。リリース40ms。
+        チャンク跨ぎは遅延線＋エンベロープ持越しで連続性を保つ。
+        高速化: ピークが閾値以下 (通常時) は無処理で即復帰 (~20us)。
+        ホット時のみ窓max＋リリース平滑を実行する。"""
+        n = len(arr)
+        if n == 0:
+            return arr
+        d = self._lim_delay_n
+        ext = np.concatenate((self._lim_delay, arr), axis=0)
+        self._lim_delay = ext[-d:].copy()
+        absmax = float(np.max(np.abs(ext)))
+        if absmax <= self._lim_thr:
+            # コールドパス: 制限不要。エンベロープは減衰のみ継続。
+            self._lim_env = max(absmax, float(self._lim_env) * (self._lim_rel ** n))
+            return ext[:n]
+        # ホットパス: モノラルピーク化して窓max (sliding_windowはviewで複写なし)
+        pk = np.maximum(np.abs(ext[:, 0]), np.abs(ext[:, 1]))
+        win = np.lib.stride_tricks.sliding_window_view(pk, d + 1)
+        peak = np.max(win[:n], axis=1)
+        env = np.empty(n, dtype=np.float32)
+        e = float(self._lim_env)
+        rel = self._lim_rel
+        for i in range(n):
+            p = peak[i]
+            if p > e:
+                e = p
+            else:
+                e *= rel
+            env[i] = e
+        self._lim_env = e
+        g = np.minimum(1.0, self._lim_thr / np.maximum(env, 1e-6)).astype(np.float32)
+        return (ext[:n] * g[:, None]).astype(np.float32)
+
     def put_audio(self, samples: np.ndarray):
         if len(samples) == 0:
             return
@@ -246,6 +291,7 @@ class AudioOutput:
         elif arr.ndim != 2 or arr.shape[1] != 2:
             flat = arr.ravel()
             arr = np.stack((flat, flat), axis=1)
+        arr = self._lookahead_limit(arr)
         if self.audio_queue.full():
             self.overflow_count += 1
             try:

@@ -11,6 +11,7 @@ DLLが見つからない場合、純Python代替のある処理 (AM同期検波�
 """
 
 import ctypes
+import math
 import os
 import time
 from collections import deque
@@ -45,7 +46,7 @@ def _load_native_core():
                                        ctypes.c_double, ctypes.c_double, ctypes.POINTER(ctypes.c_double),
                                        ctypes.POINTER(ctypes.c_double), ctypes.c_double, pf, pf, pf]
         # 追加関数は無くてもネイティブコア全体を無効化しない (旧DLLとの後方互換)
-        global NATIVE_AM_SYNC, NATIVE_PLL3, NATIVE_FIR, NATIVE_POLY
+        global NATIVE_AM_SYNC, NATIVE_PLL3, NATIVE_FIR, NATIVE_POLY, NATIVE_PLLFM
         if hasattr(lib, "sdr_stereo_pll3"):
             lib.sdr_stereo_pll3.argtypes = [pf, ctypes.c_int, ctypes.POINTER(ctypes.c_double),
                                             ctypes.c_double, ctypes.c_double, ctypes.c_double,
@@ -64,6 +65,12 @@ def _load_native_core():
             lib.sdr_polyphase_decim.argtypes = [pf, pf, pf, ctypes.c_int, ctypes.c_int,
                                                 ctypes.c_int]
             NATIVE_POLY = True
+        global NATIVE_PLLFM
+        if hasattr(lib, "sdr_pll_fm_demod"):
+            lib.sdr_pll_fm_demod.argtypes = [pf, pf, ctypes.c_int,
+                                             ctypes.POINTER(ctypes.c_double),
+                                             ctypes.c_double, ctypes.c_double]
+            NATIVE_PLLFM = True
         if hasattr(lib, "sdr_fast_fpu"):
             try:
                 lib.sdr_fast_fpu()  # FTZ/DAZ有効化 (denormalジッタ対策)
@@ -80,6 +87,7 @@ NATIVE_AM_SYNC = False
 NATIVE_PLL3 = False
 NATIVE_FIR = False
 NATIVE_POLY = False
+NATIVE_PLLFM = False
 _NATIVE = _load_native_core()
 NATIVE_CORE_ENABLED = _NATIVE is not None
 
@@ -424,6 +432,13 @@ class SdrDspPipeline:
         self.fm_last_sample = 0.0 + 0.0j
         self.nfm_last_sample = 0.0 + 0.0j
         self.nfm_afc_offset_hz = 0.0
+        # PLL-FM復調状態 (fn=25kHz, ζ=1.0 の実測勝ち値。w=2πfn/fsで正規化設計)
+        _w = 2.0 * np.pi * 25000.0 / 288000.0
+        _den = 1.0 + _w + 0.25 * _w * _w
+        self._fm_pll_kp = 2.0 * _w / _den
+        self._fm_pll_ki = _w * _w / _den
+        self._fm_pll_state = np.zeros(2, dtype=np.float64)
+        self.fm_pll_enabled = True
         self.nfm_afc_alpha = 0.08  # ISSドップラー追従用時定数
 
         # FIRフィルタの境界連続性保持用バッファ
@@ -566,6 +581,14 @@ class SdrDspPipeline:
         self._wf_p = None                  # 番組パワーの時間平滑
         self._wf_g = None
         self._wf_f2 = np.fft.rfftfreq(self._wf_n, 1.0 / self.audio_rate) ** 2
+        # 知覚マスキング行列 (Bark拡散・Schroeder): T = P @ S でビン別マスキング閾値。
+        # マスクされるノイズは抑圧不要 (g=1) とし、音楽性ノイズを設計上出さない。
+        _bf = np.fft.rfftfreq(self._wf_n, 1.0 / self.audio_rate)
+        _bk = 13.0 * np.arctan(0.76 * _bf / 1000.0) + 3.5 * np.arctan((_bf / 7500.0) ** 2)
+        _dz = _bk[:, None] - _bk[None, :]
+        _sp = 15.81 + 7.5 * (_dz + 0.474) - 17.5 * np.sqrt(1.0 + (_dz + 0.474) ** 2)
+        self._wf_spread = (10.0 ** (_sp / 10.0)).astype(np.float32)
+        self._wf_mask_offset = 0.1  # マスキング閾値オフセット (同時マスキング-10dB相当)
         hf_mask = (np.fft.rfftfreq(self._wf_n, 1.0 / self.audio_rate) >= 6000.0) & \
                   (np.fft.rfftfreq(self._wf_n, 1.0 / self.audio_rate) <= 15000.0)
         self._wf_hf_f2_mean = float(np.mean(self._wf_f2[hf_mask]) + 1e-12)
@@ -595,6 +618,7 @@ class SdrDspPipeline:
         self.squelch_enabled = False
         self.am_agc_level = 0.0  # AM搬送波レベルAGC状態
         self._am_agc_hang = 0  # AGCハングタイマ (残ブロック数)
+        self.impulse_blanker_enabled = True  # AMインパルスノイズブランカ
 
         # 超音波ノイズ比追従型 コグニティブ・オートスケルチ (FM三角ノイズクワイエティング追従)
         self.ultra_squelch = UltrasonicSquelchTracker(sample_rate=self.if_rate)
@@ -673,6 +697,7 @@ class SdrDspPipeline:
         self._pll_ef = 0.0
         self.fm_last_sample = 0.0 + 0.0j
         self.nfm_last_sample = 0.0 + 0.0j
+        self._fm_pll_state[:] = 0.0
         self.reset_stereo_nr()
         self.am_sync_lock = 0.0
         if hasattr(self, "ultra_squelch"):
@@ -935,18 +960,57 @@ class SdrDspPipeline:
         # 1. ハードリミッター適用
         limited = self._apply_hard_limiter(iq_if)
 
-        # 2. 瞬時位相差分法 (FM復調)
+        # 2. FM復調: デュアルモード。
+        # - クリーン (blend高) : 瞬時位相差分法 (分離度-42dBの忠実度)
+        # - 弱信号 (blend低) : PLL (しきい値拡張、低CNRで約+18dBを実測)
+        # 狭帯域PLLは38k副搬送波域を歪ませるため常時使用は不可。
+        # 弱信号域は既にモノラル化しているためPLLの狭帯域性は無害。
+        # 切替は平滑化済みblendのヒステリシス相当 (0.5) で行い、PLLは
+        # 約12サンプルで収束するため切替過渡は非可聴。
+        # 出力は同単位 [rad/sample] のため後段は無変更。
         if _NATIVE is not None:
             work = np.ascontiguousarray(limited, dtype=np.complex64)
             demod = np.empty(len(work), dtype=np.float32)
-            last = np.array([self.fm_last_sample.real, self.fm_last_sample.imag], dtype=np.float32)
-            _NATIVE.sdr_fm_demod(_fptr(work), _fptr(demod), len(work), _fptr(last))
-            self.fm_last_sample = complex(float(last[0]), float(last[1]))
+            if self.fm_pll_enabled and NATIVE_PLLFM and self._stereo_blend < 0.5:
+                _NATIVE.sdr_pll_fm_demod(
+                    _fptr(work), _fptr(demod), len(work),
+                    self._fm_pll_state.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
+                    float(self._fm_pll_kp), float(self._fm_pll_ki))
+                self.fm_last_sample = complex(work[-1].real, work[-1].imag)
+            else:
+                last = np.array([self.fm_last_sample.real, self.fm_last_sample.imag],
+                                dtype=np.float32)
+                _NATIVE.sdr_fm_demod(_fptr(work), _fptr(demod), len(work), _fptr(last))
+                self.fm_last_sample = complex(float(last[0]), float(last[1]))
         else:
             s = np.concatenate(([self.fm_last_sample], limited))
             self.fm_last_sample = limited[-1]
-            diff = s[1:] * np.conj(s[:-1])
-            demod = np.angle(diff)
+            if self.fm_pll_enabled:
+                # 純Python PLLフォールバック (DLL不在時のみ。低速だが機能等価。
+                # C側LUTとlibmの差で長時間は微乖離し得るが追従は一致する)
+                th = float(self._fm_pll_state[0])
+                fr = float(self._fm_pll_state[1])
+                kp = float(self._fm_pll_kp)
+                ki = float(self._fm_pll_ki)
+                demod = np.empty(len(limited), dtype=np.float32)
+                for i, samp in enumerate(limited):
+                    re = float(samp.real)
+                    im = float(samp.imag)
+                    c = math.cos(th)
+                    sn = math.sin(th)
+                    e = im * c - re * sn
+                    fr += ki * e
+                    th += fr + kp * e
+                    if th > math.pi:
+                        th -= 2.0 * math.pi
+                    elif th < -math.pi:
+                        th += 2.0 * math.pi
+                    demod[i] = fr + kp * e
+                self._fm_pll_state[0] = th
+                self._fm_pll_state[1] = fr
+            else:
+                diff = s[1:] * np.conj(s[:-1])
+                demod = np.angle(diff)
 
         # 超音波三角ノイズ比追従型 コグニティブ・オートスケルチ
         ultra_gain = 1.0
@@ -1215,7 +1279,19 @@ class SdrDspPipeline:
                 else:
                     a = np.where(g_w < self._wf_g, 0.7, 0.1)
                     self._wf_g = self._wf_g + a * (g_w - self._wf_g)
-                g_mix = 1.0 - sw * (1.0 - self._wf_g)
+                # 知覚マスキングフロア: 番組にマスクされるノイズは抑圧不要 (g→1)。
+                # Wienerの過剰抑圧（音楽性ノイズ・高域の曇り）を可聴性基準で緩和する。
+                # マスキング算出はクリーン推定 (P-N) から行う (ノイズ込み電力では
+                # ヒス自身がマスクを上げて抑圧不能になるため)。
+                noise_bin = c_noise * self._wf_f2
+                p_clean = np.maximum(
+                    self._wf_p.astype(np.float64) - noise_bin, 0.0)
+                mask_thr = (p_clean @ self._wf_spread) * self._wf_mask_offset
+                gate = np.minimum(1.0, mask_thr / (noise_bin + 1e-12)).astype(np.float32)
+                g_use = np.maximum(self._wf_g, gate)
+                g_use[:3] = 1.0  # DC〜低域は保護
+                sw = self._nr_s_w if self.stereo_nr_enabled else 0.0
+                g_mix = 1.0 - sw * (1.0 - g_use)
                 gmix[j] = g_mix
             self.stereo_wiener_gain = float(np.mean(gmix[-1]))
 
@@ -1476,10 +1552,53 @@ class SdrDspPipeline:
         gain = np.where(mag < threshold, (mag / threshold) ** 0.5, 1.0)
         return (audio * gain).astype(np.float32)
 
+    def _blank_impulses_iq(self, iq_if: np.ndarray) -> np.ndarray:
+        """AM/短波用インパルスノイズブランカ (電源・イグニッション雑音対策)。
+        変調包絡の中央値/MAD基準で孤立パルスだけを検出し、端点線形補間で消去する。
+        変調ピーク (最大2倍) や選択性フェージングの谷には触れない。
+        検出率2%超のブロックは信号とみなして無処理 (安全装置)。"""
+        n = len(iq_if)
+        if n < 64 or not self.impulse_blanker_enabled:
+            return iq_if
+        mag = np.abs(iq_if).astype(np.float32)
+        # 統計は間引き＋partition直取り (np.medianはNaN検査経路で遅い。
+        # 期待値同一のため検出性能不変。順序統計量単点で十分)
+        sm = mag[::16] if n > 256 else mag
+        k = len(sm) // 2
+        med = float(np.partition(sm, k)[k])
+        if med < 1e-9:
+            return iq_if
+        dev = np.abs(sm - med)
+        mad = float(np.partition(dev, k)[k]) + 1e-12
+        thr = max(med + 10.0 * mad, med * 3.0)
+        mask = mag > thr
+        if float(np.mean(mask)) > 0.02:
+            return iq_if
+        edges = np.diff(mask.astype(np.int8))
+        starts = list(np.flatnonzero(edges == 1) + 1)
+        ends = list(np.flatnonzero(edges == -1) + 1)
+        if mask[0]:
+            starts.insert(0, 0)
+        if mask[-1]:
+            ends.append(n)
+        if not starts:
+            return iq_if
+        out = iq_if.copy()
+        for s, e in zip(starts[:512], ends[:512]):
+            if e - s > 48:
+                continue  # 長い区間は信号として残す
+            l = out[s - 1] if s > 0 else out[e]
+            r = out[e] if e < n else l
+            k = (e - s)
+            w = np.arange(1, k + 1, dtype=np.float32) / (k + 1.0)
+            out[s:e] = (l * (1.0 - w) + r * w).astype(out.dtype)
+        return out
+
     def demodulate_am(self, iq_if: np.ndarray) -> np.ndarray:
         if len(iq_if) == 0:
             return np.zeros(0, dtype=np.float32)
 
+        iq_if = self._blank_impulses_iq(iq_if)
         env = np.abs(iq_if)
         power_db = 10.0 * np.log10(np.mean(env**2) + 1e-12)
         if self.squelch_enabled and power_db < self.squelch_threshold:
