@@ -658,7 +658,8 @@ class SdrDspPipeline:
         # CMAブラインド等化器 (マルチパス・キャンセル)。検出量＋信号存在で駆動。
         self.multipath_cancel_enabled = True
         self._cma_taps = 33
-        self._cma_mu = 0.15
+        # μ sweep実測: 0.15は重度で悪化(55dB)、0.03が中度+28dB・クリーン透明の最良点
+        self._cma_mu = 0.03
         self._cma_w = np.zeros(2 * self._cma_taps, dtype=np.float32)
         self._cma_w[2 * (self._cma_taps // 2)] = 1.0  # 中央タップ=デルタ初期化
         self._cma_hist = np.zeros(self._cma_taps - 1, dtype=np.complex64)
