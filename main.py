@@ -270,13 +270,19 @@ class SdrApp:
 
         # 短波(HF)は番組表DBから実局名を引く
         st_name = ""
+        sw_info = ""
         if freq < 24000000:
             try:
                 hit = sw_schedule.lookup(freq, tolerance_hz=2500)
                 if hit:
                     st_name = hit["name"]
+                    target = hit.get("target") or ""
+                    tm = hit.get("time") or ""
+                    extra = f" [{target}] {tm}UTC" if (target or tm) else ""
+                    sw_info = f"{hit['name']}{extra}"
             except Exception:
                 pass
+        self.gui.sw_info = sw_info
         if not st_name:
             st_name = match_station_name(freq)
         if st_name == "Unknown FM Station":
@@ -565,14 +571,21 @@ class SdrApp:
                 t_dsp = time.perf_counter()
                 audio_pcm, spectrum_db = self.dsp.process(raw_bytes, mode=self.mode)
                 self.rt_profile.add((time.perf_counter() - t_dsp) * 1000.0)
-                # ステレオ/モノラル状態をGUIへ反映
+                # ステレオ/モノラル状態とSメーターをGUIへ反映
                 self.gui.is_stereo = bool(getattr(self.dsp, "is_stereo", False))
                 self.gui.stereo_status = getattr(self.dsp, "stereo_status", "MONO")
-                # RDS PS名が取れたら局名として優先表示 (FM海外局)
+                self.gui.s_units = float(getattr(self.dsp, "s_units", 0.0))
+
+                # RDS PS名・RadioText(楽曲名/番組名)が取れたらGUIへ反映
                 if self.mode == "WFM":
                     rds_ps = getattr(self.dsp, "rds_ps", "")
                     if rds_ps and rds_ps != self.gui.station_name:
                         self.gui.station_name = rds_ps
+                    rds_rt = getattr(self.dsp, "rds_rt", "")
+                    if rds_rt != self.gui.rds_text:
+                        self.gui.rds_text = rds_rt
+                else:
+                    self.gui.rds_text = ""
 
                 # 自律最適化ループ (Hyperは復調音声そのものを聴感評価に使用)
                 if self.use_controller:
@@ -604,25 +617,33 @@ class SdrApp:
                         self.gui.btn_gain_auto.bg_color = (250, 234, 206)  # アプリコット (探索中)
 
                     if self.controller_type == "hyper":
-                        lock_tag = t("lock_fixed") if hard_locked else (t("lock_converged") if stats["converged"] else stats.get("search_phase", "..."))
                         ant_tag = stats.get("antenna_profile", "BALANCED").replace("LOW_GAIN_", "LOW:").replace("HIGH_GAIN_", "HI:").replace("SATELLITE_", "SAT:")
                         drift = self.dsp.resampler.drift_ppm
                         sync_tag = "LOCK" if abs(drift) < 0.5 else f"{drift:+.0f}ppm"
                         afc_val = self.dsp.nfm_afc_offset_hz if self.mode == "NFM" else self.dsp.afc_offset_hz
                         afc_str = f"AFC:{afc_val:+.0f}Hz" if abs(afc_val) >= 1.0 else "AFC:0Hz"
-                        su = self.dsp.s_units
-                        s_txt = f"S9+{su - 9:.0f}dB" if su >= 9.0 else f"S{max(0.0, su):.0f}"
+                        cn_val = stats.get('channel_snr_db', stats['estimated_snr'])
+                        aud_val = stats.get('audio_snr_db', 0.0)
+                        dsp_tag = self._rt_summary_cache
+                        if dsp_tag.startswith("DSP "):
+                            dsp_parts = dsp_tag[4:].split()
+                            dsp_tag = f"DSP: {dsp_parts[0]}" if dsp_parts else "DSP: OK"
                         txt = (
-                            f"C/N {stats.get('channel_snr_db', stats['estimated_snr']):.1f}dB | "
-                            f"Aud {stats.get('audio_snr_db', 0.0):.1f}dB | "
-                            f"{s_txt} | {self._rt_summary_cache} | Ant:{ant_tag} | "
-                            f"Sync:{sync_tag} | {afc_str} | {lock_tag}"
+                            f"C/N: {cn_val:+.1f}dB | "
+                            f"Aud: {aud_val:+.1f}dB | "
+                            f"{dsp_tag} | "
+                            f"Ant: {ant_tag} | "
+                            f"Sync: {sync_tag} | "
+                            f"{afc_str}"
                         )
                     else:
                         lock_str = t("lock_fixed") if hard_locked else (t("lock_converged") if stats["converged"] else t("lock_searching"))
                         txt = (
-                            f"Cascade SNR {stats['estimated_snr']:.1f}dB | IQ {stats['iq_std']:.0f} | "
-                            f"{self._rt_summary_cache} | Gain {stats['gain_db']:.1f}dB | {lock_str}"
+                            f"SNR: {stats['estimated_snr']:.1f}dB | "
+                            f"IQ: {stats['iq_std']:.0f} | "
+                            f"DSP: {self._rt_summary_cache} | "
+                            f"Gain: {stats['gain_db']:.1f}dB | "
+                            f"Lock: {lock_str}"
                         )
                     # テレメトリ表示は5Hzに間引き (GUI描画/GIL競合の低減)。
                     # summary()のpartition 4発もここでのみ実行する。

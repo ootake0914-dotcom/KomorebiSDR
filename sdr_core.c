@@ -172,6 +172,14 @@ SDR_EXPORT void sdr_stereo_pll3(const float *sig, int n, double *theta, double w
     for (int i = 0; i < n; ++i) {
         double s = (double)sdr_sin(th);
         double c = (double)sdr_cos(th);
+        /* 搬送波は更新前位相から生成する。更新後から作ると1サンプル進み
+         * (19kHz@288kHzで23.76°、38kHzで47.5°) の系統誤差になる。*/
+        double c2 = (double)sdr_cos(2.0 * th);
+        double s2 = (double)sdr_sin(2.0 * th);
+        cos2[i] = (float)c2;
+        sin2[i] = (float)s2;
+        cos3[i] = (float)(c * c2 - s * s2);
+        sin3[i] = (float)(s * c2 + c * s2);
         double e = -(double)sig[i] * s;
         ef += alpha * (e - ef);
         ig += ki * ef;
@@ -181,12 +189,6 @@ SDR_EXPORT void sdr_stereo_pll3(const float *sig, int n, double *theta, double w
         } else if (th < -3.141592653589793) {
             th += 6.283185307179586;
         }
-        double c2 = (double)sdr_cos(2.0 * th);
-        double s2 = (double)sdr_sin(2.0 * th);
-        cos2[i] = (float)c2;
-        sin2[i] = (float)s2;
-        cos3[i] = (float)(c * c2 - s * s2);
-        sin3[i] = (float)(s * c2 + c * s2);
         qsum += (double)sig[i] * c;
     }
     *theta = th;
@@ -344,6 +346,9 @@ SDR_EXPORT void sdr_stereo_pll(const float *sig, int n, double *theta, double w0
     for (int i = 0; i < n; ++i) {
         double s = (double)sdr_sin(th);
         double c = (double)sdr_cos(th);
+        /* 搬送波は更新前位相から生成 (1サンプル進み防止。pll3と同一理由) */
+        cos2[i] = sdr_cos(2.0 * th);
+        sin2[i] = sdr_sin(2.0 * th);
         /* 位相検波 (符号反転で負帰還) */
         double e = -(double)sig[i] * s;
         /* ループフィルタ: 音声成分(可聴帯域)を除去しパイロットのみで追従 */
@@ -355,8 +360,6 @@ SDR_EXPORT void sdr_stereo_pll(const float *sig, int n, double *theta, double w0
         } else if (th < -3.141592653589793) {
             th += 6.283185307179586;
         }
-        cos2[i] = sdr_cos(2.0 * th);
-        sin2[i] = sdr_sin(2.0 * th);
         qsum += (double)sig[i] * c;
     }
     *theta = th;
@@ -395,7 +398,9 @@ SDR_EXPORT int sdr_suppress_clicks(float *x, int n, float threshold)
             ri = n - 1;
         }
         float local_span = fabsf(x[ri] - x[li]);
-        if (diff > local_span * 1.5f || diff > 0.65f) {
+        /* 孤立条件を厳格化: 前後接続が戻っている突起のみ修復する。
+         * 旧 `|| diff > 0.65` は打楽器アタック等の正規過渡を誤って削るため撤去。*/
+        if (diff > local_span * 1.5f) {
             int s0 = b - 1;
             if (s0 < 0) {
                 s0 = 0;

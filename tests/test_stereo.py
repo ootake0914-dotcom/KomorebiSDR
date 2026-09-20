@@ -1,10 +1,11 @@
 """Synthetic FM stereo test (no hardware required).
 
-Generates a standard stereo MPX (L=1kHz, R=5kHz, 9% pilot), FM-modulates it,
-runs it through the DSP pipeline and checks that the decoded channels are
-correctly separated (crosstalk <= -18 dB), that a mono signal stays mono and
-that the stereo noise reduction cuts the (L-R) hiss on noisy signals while
-staying inactive on clean ones.
+Generates a BS.450-compliant stereo MPX (L=1kHz, R=5kHz, 9% pilot;
+pilot and 38kHz subcarrier both sine-phase with aligned zero crossings),
+FM-modulates it, runs it through the DSP pipeline and checks that the
+decoded channels are correctly separated (crosstalk <= -18 dB), that a
+mono signal stays mono and that the stereo noise reduction cuts the
+(L-R) hiss on noisy signals while staying inactive on clean ones.
 """
 
 import os
@@ -26,9 +27,10 @@ def make_raw(stereo: bool, snr_db: float = None, seed: int = 7) -> np.ndarray:
     left = np.sin(2 * np.pi * 1000.0 * t)
     right = np.sin(2 * np.pi * 5000.0 * t)
     if stereo:
+        # BS.450: 副搬送波・パイロットともsin系 (cos系は非標準で分離度0dBになる)
         mpx = (0.45 * (left + right)
-               + 0.45 * (left - right) * np.cos(2 * np.pi * 38000.0 * t)
-               + 0.09 * np.cos(2 * np.pi * 19000.0 * t))
+               + 0.45 * (left - right) * np.sin(2 * np.pi * 38000.0 * t)
+               + 0.09 * np.sin(2 * np.pi * 19000.0 * t))
     else:
         mpx = left + right
     mpx = mpx / (np.max(np.abs(mpx)) + 1e-9)

@@ -84,8 +84,9 @@ def test_full_path() -> bool:
     wave12 = biphase_waveform(enc)
     t12 = np.arange(len(wave12)) / 12000.0
     rds_bb = np.interp(t, t12, wave12, right=0.0)
-    mpx = (0.09 * np.cos(2 * np.pi * 19000.0 * t)
-           + 0.06 * rds_bb * np.cos(2 * np.pi * 57000.0 * t))
+    # BS.450/EN 50067準拠: パイロット・RDS副搬送波ともsin系 (ゼロクロス同相)
+    mpx = (0.09 * np.sin(2 * np.pi * 19000.0 * t)
+           + 0.06 * rds_bb * np.sin(2 * np.pi * 57000.0 * t))
     phase = 2 * np.pi * 30000.0 * np.cumsum(mpx) / RF
     iq = 0.6 * np.exp(1j * phase)
     raw = np.empty(2 * total, dtype=np.uint8)

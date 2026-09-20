@@ -70,20 +70,40 @@ def main() -> int:
     print(f"[{'OK' if good else 'FAIL'}] weak USB tone recovered through noise")
     ok &= good
 
-    # BFO: mix_frequency で +300Hz シフトすること (USBモードのみ)
-    dsp = SdrDspPipeline(1152000, 48000)
-    dsp.offset_freq = 0.0
-    dsp.bfo_offset_hz = 0.0
-    rf = dsp.rf_rate
-    tr = np.arange(65536) / rf
-    iq0 = np.exp(1j * 2 * np.pi * 1000.0 * tr).astype(np.complex64)
-    f0 = np.argmax(np.abs(np.fft.fft(dsp.mix_frequency(iq0, mode="USB"))))
-    dsp.bfo_offset_hz = 300.0
-    iq1 = np.exp(1j * 2 * np.pi * 1000.0 * tr).astype(np.complex64)
-    f1 = np.argmax(np.abs(np.fft.fft(dsp.mix_frequency(iq1, mode="USB"))))
-    shift = (f1 - f0) * rf / 65536.0
-    good = abs(shift - 300.0) < 10.0
-    print(f"[{'OK' if good else 'FAIL'}] BFO shifts USB audio by {shift:+.0f} Hz (expect +300)")
+    # BFO: 音声ドメインでUSB/LSBとも正方向にピッチ移動し、帯域外無音化しない
+    # (旧RF方式はLSB逆転＋CW無音化のため廃止)
+    for m, tone in (("USB", np.exp(1j * 2 * np.pi * 1000.0 * t)),
+                    ("LSB", np.exp(-1j * 2 * np.pi * 1000.0 * t))):
+        dsp = SdrDspPipeline(1152000, 48000)
+        dsp.bfo_offset_hz = 0.0
+        ref = decode(tone, m)
+        dsp2 = SdrDspPipeline(1152000, 48000)
+        dsp2.bfo_offset_hz = 300.0
+        chunks = []
+        blk = 2752
+        for k in range(0, len(tone) - blk + 1, blk):
+            chunks.append(dsp2.demodulate_ssb(tone[k:k + blk].astype(np.complex64), m))
+        shifted = np.concatenate(chunks)
+        p_ref = tone_power(ref, 1000.0)
+        p_up = tone_power(shifted, 1300.0)
+        p_dn = tone_power(shifted, 700.0)
+        good = p_up > p_ref * 0.25 and p_up > p_dn * 4.0
+        print(f"[{'OK' if good else 'FAIL'}] BFO +300 moves {m} audio 1000->1300 Hz "
+              f"(up={p_up:.2e}, ref={p_ref:.2e}, down={p_dn:.2e})")
+        ok &= good
+
+    # CW: BFO+1500でも帯域外無音化しない (旧RF方式は650±350Hz外で消音)
+    dsp3 = SdrDspPipeline(1152000, 48000)
+    dsp3.bfo_offset_hz = 1500.0
+    cw = np.exp(1j * 2 * np.pi * 850.0 * t)
+    chunks = []
+    blk = 2752
+    for k in range(0, len(cw) - blk + 1, blk):
+        chunks.append(dsp3.demodulate_ssb(cw[k:k + blk].astype(np.complex64), "CW"))
+    out_cw = np.concatenate(chunks)
+    p_cw = tone_power(out_cw, 2350.0)
+    good = p_cw > 1e-6
+    print(f"[{'OK' if good else 'FAIL'}] CW survives BFO+1500 (2350Hz power={p_cw:.2e})")
     ok &= good
 
     print("OK" if ok else "FAILED")

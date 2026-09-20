@@ -15,6 +15,12 @@ import os
 from collections import deque
 import numpy as np
 
+from adaptive_dsp import (
+    AdaptiveIqCorrector,
+    CognitiveSpeechMusicTracker,
+    UltrasonicSquelchTracker,
+)
+
 
 # ================================================================
 # ネイティブCコア (sdr_core.dll) ロード
@@ -268,6 +274,9 @@ class SdrDspPipeline:
         self.offset_freq = 0.0
         self.mixer_phase = 0.0
 
+        # グラム・シュミット直交化によるリアルタイム適応IQインバランス補正器 (鏡像ゴースト自動消去)
+        self.iq_corrector = AdaptiveIqCorrector(sample_rate=self.rf_rate, time_constant_sec=3.0)
+
         # IF用ローパス (±95kHz Carson標準帯域幅)
         cutoff_if = 95000.0 / self.rf_rate
         self.fir_if = design_fir_kaiser(num_taps=65, cutoff_norm=cutoff_if, beta=6.0)
@@ -438,13 +447,11 @@ class SdrDspPipeline:
         self.rds_pi = 0
         self.rds_pty = None
         self.rds_groups = 0
-        # パイロットPLLは90°進んだ位相でロックするため、3逓倍(57kHz)は直交になる。
-        # -90°回転で搬送波を同相へ戻す (差動復号なので±符号は不問)。
-        self.rds_phase_offset = np.deg2rad(-90.0)
+        # BS.450/EN 50067準拠キャリア生成のため追加回転は不要 (0.0)
+        self.rds_phase_offset = 0.0
         self._stereo_blend = 0.0
-        # 38kHz副搬送波の位相補正 (DSP経路の遅延を実測校正した値。DSBの180°曖昧性は
-        # パイロットとの2:1位相関係に基づきL/Rが正しくなる側を採用)
-        self.stereo_phase_offset = np.deg2rad(-47.0)
+        # CコアのPLL 1サンプル進みが解消されたため、副搬送波オフセットは 0.0
+        self.stereo_phase_offset = 0.0
         # ステレオRch用 追加リサンプラ (Lchは既存resamplerを共用。
         # L/Rでmax_ppmを変えると逼迫時に出力長が乖離し片ch切り捨てが起きるため、
         # 必ず同一パラメータにする)
@@ -528,6 +535,13 @@ class SdrDspPipeline:
         self.squelch_enabled = False
         self.am_agc_level = 0.0  # AM搬送波レベルAGC状態
 
+        # 超音波ノイズ比追従型 コグニティブ・オートスケルチ (FM三角ノイズクワイエティング追従)
+        self.ultra_squelch = UltrasonicSquelchTracker(sample_rate=self.if_rate)
+        self.ultra_squelch.enabled = False  # squelch_enabled と連動
+
+        # 音声/音楽 認知型オートチルトEQ (トーク了解度 / 音楽フラットHi-Fi 自動追従)
+        self.cognitive_eq = CognitiveSpeechMusicTracker(sample_rate=self.audio_rate)
+
         # ===== AM同期検波 (キャリア再生PLL) =====
         # 選択性フェージング時のひずみを避けるため、包絡線検波ではなく
         # キャリアに同期した同相検波を使う。ロックできない時は包絡線へ自動復帰。
@@ -537,6 +551,7 @@ class SdrDspPipeline:
         self.bfo_offset_hz = 0.0     # BFO微調整 (SSB/CWのみ)
         self.ssb_agc_level = 0.0
         self._ssb_bp_phase = 0.0
+        self._ssb_bfo_phase = 0.0
 
         # ===== FMマルチパス検出 =====
         # 反射波(マルチパス)はFM波に振幅変動(PM→AM変換)を与える。IF信号の包絡線変動を
@@ -595,6 +610,10 @@ class SdrDspPipeline:
         self.nfm_last_sample = 0.0 + 0.0j
         self.reset_stereo_nr()
         self.am_sync_lock = 0.0
+        if hasattr(self, "ultra_squelch"):
+            self.ultra_squelch.reset()
+        if hasattr(self, "cognitive_eq"):
+            self.cognitive_eq.reset()
 
     def update_resampler_feedback(self, current_chunks: float, dt: float = 0.05):
         """オーディオバッファの残存チャンク数をリサンプラにフィードバック (クロック自動同期)"""
@@ -647,6 +666,8 @@ class SdrDspPipeline:
     def set_squelch(self, enabled: bool, threshold_db: float = -68.0):
         self.squelch_enabled = enabled
         self.squelch_threshold = threshold_db
+        if hasattr(self, "ultra_squelch"):
+            self.ultra_squelch.enabled = enabled
 
     def set_cognitive_parameters(
         self,
@@ -716,9 +737,6 @@ class SdrDspPipeline:
     def mix_frequency(self, iq: np.ndarray, mode: str = "WFM") -> np.ndarray:
         afc = self.nfm_afc_offset_hz if mode == "NFM" else (self.afc_offset_hz if self.afc_enabled else 0.0)
         effective_offset = self.offset_freq + afc
-        if mode in ("USB", "LSB", "CW"):
-            # BFO: 復調音声を微調整 (正で音声が高くなる方向)
-            effective_offset += self.bfo_offset_hz
         if abs(effective_offset) < 1.0 or len(iq) == 0:
             return iq
         n = len(iq)
@@ -844,6 +862,11 @@ class SdrDspPipeline:
             diff = s[1:] * np.conj(s[:-1])
             demod = np.angle(diff)
 
+        # 超音波三角ノイズ比追従型 コグニティブ・オートスケルチ
+        ultra_gain = 1.0
+        if getattr(self, "ultra_squelch", None) is not None and self.ultra_squelch.enabled:
+            ultra_gain, _ = self.ultra_squelch.process(demod)
+
         # AFC (Automatic Frequency Control): 復調信号のDCバイアスから周波数偏差を推定してフィードバック
         if self.afc_enabled and len(demod) > 0:
             mean_dc = float(np.mean(demod))
@@ -877,11 +900,14 @@ class SdrDspPipeline:
                 if self.rds is None:
                     import rds as rds_mod
                     self.rds = rds_mod.RdsDecoder(12000.0)
-                carrier57 = self._last_cos3
+                # BS.450/EN 50067準拠: パイロットsin(wt)に対して57kHz副搬送波はsin(3wt)。
+                # PLLがth = wt - pi/2でロックしているため、cos(3*th) = cos(3wt - 3pi/2) = -sin(3wt)。
+                # したがって、同相復調キャリアは -self._last_cos3。
+                carrier57 = -self._last_cos3
                 if abs(self.rds_phase_offset) > 1e-6 and self._last_sin3 is not None:
                     co = np.cos(self.rds_phase_offset)
                     si = np.sin(self.rds_phase_offset)
-                    carrier57 = self._last_cos3 * co - self._last_sin3 * si
+                    carrier57 = carrier57 * co - self._last_sin3 * si
                 rds_mix = demod_scaled * carrier57
                 rds_base = self.decimate_with_history(rds_mix, self.fir_am_narrow, 24, "history_rds")
                 self.rds.feed(rds_base)
@@ -894,12 +920,15 @@ class SdrDspPipeline:
                 pass
 
         stereo_diff = None
-        if self._last_cos2 is not None and self._stereo_blend > 0.02:
-            carrier = self._last_cos2
-            if abs(self.stereo_phase_offset) > 1e-6 and self._last_sin2 is not None:
+        if self._last_sin2 is not None and self._stereo_blend > 0.02:
+            # BS.450準拠: 38kHz副搬送波はsin(2wt)。
+            # PLLがth = wt - pi/2でロックしているため、sin(2*th) = sin(2wt - pi) = -sin(2wt)。
+            # したがって同相復調キャリアは -self._last_sin2。
+            carrier = -self._last_sin2
+            if abs(self.stereo_phase_offset) > 1e-6 and self._last_cos2 is not None:
                 co = np.cos(self.stereo_phase_offset)
                 si = np.sin(self.stereo_phase_offset)
-                carrier = self._last_cos2 * co - self._last_sin2 * si
+                carrier = carrier * co - self._last_cos2 * si
             lpr = demod_scaled * carrier
             diff_raw = self.decimate_with_history(lpr, self.fir_if_audio,
                                                   self.audio_decim, "history_lpr") * 2.0
@@ -921,7 +950,7 @@ class SdrDspPipeline:
                     # mono遅延履歴だけは更新し、再有効時の継ぎ目を無くす。
                     stereo_diff = (diff_raw
                                    * (self._stereo_blend * self.multipath_gain)).astype(np.float32)
-                    self._delay_mono(mono)
+                    mono = self._delay_mono(mono)
                     self.stereo_wiener_gain = 1.0
 
         # 6. チャンネル別ポスト処理 (ディエンファシス・ハイカット・DCカット・シェルフ)
@@ -930,6 +959,9 @@ class SdrDspPipeline:
             # オーバーヘッドが上回る)。逐次実行が最速。
             left = self._post_process_wfm(mono + stereo_diff, "_l")
             right = self._post_process_wfm(mono - stereo_diff, "_r")
+            if ultra_gain < 0.999:
+                left = left * ultra_gain
+                right = right * ultra_gain
             blend = self._stereo_blend * (self.stereo_nr_gain if self.stereo_nr_enabled else 1.0) \
                 * self.multipath_gain
             self.is_stereo = blend > 0.5
@@ -945,7 +977,10 @@ class SdrDspPipeline:
 
         self.is_stereo = False
         self.stereo_status = "MONO"
-        return np.clip(self._post_process_wfm(mono, ""), -1.0, 1.0)
+        out_mono = self._post_process_wfm(mono, "")
+        if ultra_gain < 0.999:
+            out_mono = out_mono * ultra_gain
+        return np.clip(out_mono, -1.0, 1.0)
 
     def _delay_mono(self, mono: np.ndarray) -> np.ndarray:
         """monoを群遅延分だけ遅延させ、NRフィルタ通過後の差信号と時間整合を取る"""
@@ -1193,8 +1228,10 @@ class SdrDspPipeline:
             self.stereo_pilot_ratio = ratio
 
             target = 0.0
-            if lock > 0.25 and 0.02 < ratio < 0.8:
-                target = min(1.0, (ratio - 0.02) / 0.05)
+            if lock > 0.5 and pilot_rms > 1e-3:
+                target = 1.0
+            elif lock > 0.25 and 0.02 < ratio < 0.8:
+                target = min(1.0, (ratio - 0.02) / 0.04)
 
             if target > self._stereo_blend:
                 self._stereo_blend = min(target, self._stereo_blend + 0.25)
@@ -1271,6 +1308,11 @@ class SdrDspPipeline:
             diff = s[1:] * np.conj(s[:-1])
             demod = np.angle(diff)
 
+        # 超音波三角ノイズ比追従型 コグニティブ・オートスケルチ
+        ultra_gain = 1.0
+        if getattr(self, "ultra_squelch", None) is not None and self.ultra_squelch.enabled:
+            ultra_gain, _ = self.ultra_squelch.process(demod)
+
         # 3. NFMドップラー自動周波数追従 (ISSが飛翔する際の ±3.5kHz 移動に自動ロック)
         if self.afc_enabled and len(demod) > 0:
             mean_dc = float(np.mean(demod))
@@ -1295,6 +1337,9 @@ class SdrDspPipeline:
 
         # 7. 通信用300Hz音声ハイパスフィルタ
         audio = self._apply_voice_highpass(audio)
+
+        if ultra_gain < 0.999:
+            audio = audio * ultra_gain
 
         return audio.astype(np.float32)
 
@@ -1428,13 +1473,16 @@ class SdrDspPipeline:
         omega = 2.0 * np.pi * center / self.audio_rate
         ph = self._ssb_bp_phase + omega * np.arange(n, dtype=np.float64)
         self._ssb_bp_phase = float((ph[-1] + omega) % (2.0 * np.pi))
+        # BFO位相 (音声ドメインで再シフト位相へ加算。USB/LSB/CW共通で正=ピッチ上昇)
+        wb = 2.0 * np.pi * float(self.bfo_offset_hz) / self.audio_rate
+        if mode == "LSB":
+            wb = -wb
+        phb = self._ssb_bfo_phase + wb * np.arange(n, dtype=np.float64)
+        self._ssb_bfo_phase = float((phb[-1] + wb) % (2.0 * np.pi))
         shifted = (iq_48 * np.exp(-1j * ph)).astype(np.complex64)
         lp = self.decimate_with_history(shifted, taps, 1, attr)
-        # 再シフト位相はFIR群遅延Dサンプル分だけ遅らせる (線形位相FIRの遅延補償。
-        # 未補償だとUSB 1500Hz×D200で12.5π→0.5πの定数回転が残る。可聴差は
-        # 微小だがコヒーレント復調として正しい位相に戻す)
         dly = (len(taps) - 1) // 2
-        audio = np.real(lp * np.exp(1j * (ph - omega * dly))).astype(np.float32)
+        audio = np.real(lp * np.exp(1j * (ph - omega * dly + phb))).astype(np.float32)
 
         # AGC (SSBは搬送波が無いため平均振幅で正規化。無信号時の過剰増幅は3000倍で制限)
         # 無信号フロア (AM側と同型): ノイズ2400倍の爆音化を防ぐため滑らかにミュート。
@@ -1514,6 +1562,8 @@ class SdrDspPipeline:
             return np.zeros(0, dtype=np.float32), np.zeros(self.fft_size, dtype=np.float32)
 
         iq = self.raw_to_iq(raw_work)
+        if getattr(self, "iq_corrector", None) is not None:
+            iq = self.iq_corrector.process(iq)
         iq_shifted = self.mix_frequency(iq, mode=mode)
         spectrum_db = self.compute_spectrum(iq_shifted)
 
@@ -1571,5 +1621,10 @@ class SdrDspPipeline:
             audio_synced = self.resampler.process(audio)
             # 過渡クリックサプレッサー (チューナー切替過渡ノイズを完全消滅)
             audio_clean = suppress_click_transients(audio_synced)
+
+        # 音声/音楽 認知型オートチルトEQ (トーク了解度 / 音楽フラットHi-Fi 自動追従)
+        if self.cognitive_enabled and getattr(self, "cognitive_eq", None) is not None and self.cognitive_eq.enabled:
+            self.cognitive_eq.analyze(audio_clean)
+            audio_clean = self.cognitive_eq.process(audio_clean)
 
         return audio_clean, spectrum_db

@@ -64,14 +64,14 @@ class AutoTuner:
         start_hz: int = 76000000,
         end_hz: int = 95000000,
         step_hz: int = 1500000,
-        snr_threshold: float = 4.2,
+        snr_threshold: float = 7.5,
     ) -> list[dict]:
         """
-        帯域全体を高速スイープし、微弱局(SNR >= 3.5dB)から強力局までを全て抽出。
+        帯域全体を高速スイープし、本物のFM放送局のみを確実に抽出 (偽局・ノイズスプリアス完全排除)。
         :param start_hz: スキャン開始周波数 (デフォルト 76.0MHz)
         :param end_hz: スキャン終了周波数 (デフォルト 95.0MHz)
         :param step_hz: チューナーステップ幅 (デフォルト 1.5MHz)
-        :param snr_threshold: ピーク検知しきい値 (微弱局を拾うため 3.5dB に設定)
+        :param snr_threshold: ピーク検知しきい値 (ノイズフロアの微細な山を排除するため 7.5dB に設定)
         :return: 発見された局のリスト（周波数、SNR、信号強度、局名、AFC補正値）
         """
         if step_hz <= 0 or end_hz <= start_hz:
@@ -133,7 +133,7 @@ class AutoTuner:
             dc_guard = int(25000 / (scan_rate / fft_size))
             spec_db[dc_center_idx - dc_guard : dc_center_idx + dc_guard + 1] = noise_floor
 
-            # ピーク検出
+            # ピーク検出 (帯域幅チェック付き)
             peaks = self._find_spectral_peaks(spec_db, freq_axis, noise_floor, snr_threshold)
             for p in peaks:
                 # 日本のFMグリッド (100kHz単位) にスナップ
@@ -144,11 +144,16 @@ class AutoTuner:
                 afc_offset = p["peak_freq"] - snapped_hz  # ドングルや送信機のズレ
                 name = match_station_name(snapped_hz)
 
-                # 日本のFM規格アライメント判定:
-                # 偏差が ±15kHz を超えるものはFMグリッド外のランダムノイズ突起と判定して除外
-                # （既知局名がある場合、またはSNRが12dB以上の強局は保護）
-                if abs(afc_offset) > 15000 and name == "Unknown FM Station" and p["snr_db"] < 12.0:
-                    continue
+                # 本物のFM放送局判定:
+                # 1. 既知局DBにある場合は SNR 5.0dB でも許容
+                # 2. 未知局の場合は SNR >= 8.5dB かつ FMグリッド偏差 ±12kHz 以内であることを要求
+                is_known = (name != "Unknown FM Station")
+                if not is_known:
+                    if p["snr_db"] < 8.5 or abs(afc_offset) > 12000:
+                        continue
+                else:
+                    if p["snr_db"] < 5.0:
+                        continue
 
                 # 重複登録防止（最もSNRが高い観測値を採用）
                 existing = [s for s in stations if s["freq_hz"] == snapped_hz]
@@ -159,7 +164,7 @@ class AutoTuner:
                         existing[0]["afc_offset_hz"] = afc_offset
                 else:
                     quality = (
-                        "STRONG" if p["snr_db"] >= 22.0
+                        "STRONG" if p["snr_db"] >= 20.0
                         else "MEDIUM" if p["snr_db"] >= 10.0
                         else "WEAK (DX)"
                     )
@@ -304,10 +309,10 @@ class AutoTuner:
         self, spec_db: np.ndarray, freq_axis: np.ndarray, noise_floor: float,
         threshold_snr: float, min_width_bins: int = 5,
     ) -> list[dict]:
-        """スペクトラムから凸形状のピークを抽出"""
+        """スペクトラムから凸形状かつFM帯域幅エネルギーを持つ本物の放送ピークを抽出"""
         peaks = []
         n = len(spec_db)
-        margin = 10
+        margin = 15
 
         for i in range(margin, n - margin):
             val = spec_db[i]
@@ -318,9 +323,18 @@ class AutoTuner:
             # 局所極大判定 (±min_width_bins の中で最大か)
             surrounding = spec_db[i - min_width_bins : i + min_width_bins + 1]
             if val == np.max(surrounding):
-                # プロミネンス判定: 周囲の谷に対して少なくとも 1.5dB 以上の盛り上がりがあるか
+                # プロミネンス判定: 周囲の谷に対して少なくとも 2.5dB 以上の明瞭な盛り上がりがあるか
                 prominence = val - np.min(surrounding)
-                if prominence < 1.5:
+                if prominence < 2.5:
+                    continue
+
+                # 占有帯域幅エネルギー検証:
+                # 本物のFM放送は ±30kHz (約15ビン) にわたってエネルギーが台形状に広がる。
+                # 針状の孤立クロックスパイク (幅 < 15kHz) を除外
+                left_shoulder = spec_db[max(0, i - 12)] - noise_floor
+                right_shoulder = spec_db[min(n - 1, i + 12)] - noise_floor
+                # ショルダー部がノイズフロア以下かつプロミネンスが異常に尖っている(針状)場合はスプリアスと判定
+                if left_shoulder < 0.5 and right_shoulder < 0.5 and prominence > 15.0:
                     continue
 
                 # 周波数の重心計算（サブビン精度でピーク中心を算出）

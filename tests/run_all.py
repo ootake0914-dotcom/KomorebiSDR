@@ -21,6 +21,8 @@ TESTS = [
     "test_rt_profile.py",
     "test_native_equiv.py",
     "test_stereo.py",
+    "test_adaptive_dsp.py",
+    "test_gui.py",
     "test_mock_worker.py",
 ]
 
