@@ -1,0 +1,578 @@
+"""
+Antigravity Full-Scratch SDR Radio - Smart Auto-Tuner & DX Edition.
+メイン実行スクリプト。
+RTL-SDR受信スレッド、DSP復調パイプライン、オーディオ出力、Pygame GUI、
+および全自動帯域探査＆DX微弱局発掘エンジン (AutoTuner) を統合。
+"""
+
+import sys
+import time
+import threading
+import queue
+import argparse
+import numpy as np
+
+from rtlsdr_driver import RtlSdrDriver
+from dsp import SdrDspPipeline
+from audio_output import AudioOutput
+from gui import SdrGui, show_message_screen
+from cascade_controller import CascadeController
+from hyper_controller import HyperController
+from auto_tuner import AutoTuner, match_station_name
+from config import load_config, save_config, detect_country, detect_language, region_profile, LOG_PATH
+from i18n import set_language as i18n_set_language, get_language as i18n_language, t
+
+
+class NoDeviceFoundError(RuntimeError):
+    """RTL-SDRデバイスが1台も検出されなかった場合"""
+
+
+class SdrApp:
+    """SDRアプリケーション統合コントローラ (AutoTuner & DX機能搭載)"""
+
+    def __init__(self, initial_freq=None, initial_mode=None, controller_type="hyper",
+                 config=None, country=None):
+        # ---- 設定・地域プロファイル ----
+        self.config = config if config is not None else load_config()
+        self.country = (country or self.config.get("country") or detect_country()).upper()
+        self.profile = region_profile(self.country)
+        if initial_freq is None:
+            initial_freq = int(self.profile["default_freq_hz"])
+        if initial_mode is None:
+            initial_mode = self.profile["default_mode"]
+
+        self.freq = initial_freq
+        self.mode = initial_mode
+        self.sample_rate = 1152000
+        self.audio_rate = 48000
+        self.controller_type = controller_type
+
+        # ハードウェアドライバ
+        self.driver = RtlSdrDriver()
+        # DSPパイプライン
+        self.dsp = SdrDspPipeline(self.sample_rate, self.audio_rate)
+        # 地域規格 (ディエンファシス 50/75μs) とステレオ設定を適用
+        self.dsp.set_deemphasis(self.profile["deemphasis_us"])
+        self.dsp.set_stereo_enabled(self.config.get("stereo", True))
+        # オーディオ出力
+        self.audio = AudioOutput(self.audio_rate)
+        self.audio.set_volume(float(self.config.get("volume", 0.7)))
+        # GUI
+        self.gui = SdrGui()
+        # 初期音量をオーディオ出力と同期 (表示と実音量の食い違い防止)
+        self.gui.volume = self.audio.volume
+        # 地域表示・スキャン帯域・プリセット
+        self.gui.set_region(self.profile["label"], self.profile["fm_start"], self.profile["fm_end"])
+        self.gui.scan_status_text = t("idle")
+        self.gui.set_presets(*self._initial_presets())
+        # 自律最適化コントローラ (hyper: Cascade全超越エンジン / cascade: 従来版)
+        if controller_type == "cascade":
+            self.controller = CascadeController(self.driver, self.dsp, self.audio)
+        else:
+            self.controller = HyperController(self.driver, self.dsp, self.audio)
+        self.use_controller = True
+        # 自動選局・スキャンエンジン
+        self.tuner = AutoTuner(self.driver)
+
+        # スレッド間通信用
+        self.cmd_queue = queue.Queue()
+        self.spectrum_lock = threading.Lock()
+        self.latest_spectrum = np.zeros(self.dsp.fft_size, dtype=np.float32)
+        self.latest_audio = np.zeros(1024, dtype=np.float32)
+        self.running = False
+        self.sdr_thread = None
+
+        # GUIコールバック登録
+        self.gui.on_freq_change = self.set_frequency
+        self.gui.on_mode_change = self.set_mode
+        self.gui.on_gain_change = self.set_gain
+        self.gui.on_gain_lock_toggle = lambda: self.cmd_queue.put(("GAIN_LOCK_TOGGLE", None))
+        self.gui.on_volume_change = self.audio.set_volume
+        self.gui.on_filter_change = lambda m: self.cmd_queue.put(("FILTER", m))
+        self.gui.on_seek_change = lambda d: self.cmd_queue.put(("SEEK", d))
+        self.gui.on_scan_request = lambda: self.cmd_queue.put(("SCAN", None))
+        self.gui.on_dx_toggle = lambda en: self.cmd_queue.put(("DX", en))
+        self.gui.on_afc_toggle = lambda en: self.cmd_queue.put(("AFC", en))
+
+        self.gui.center_freq = self.freq
+        self.gui.mode = self.mode
+        self.gui.sample_rate = self.sample_rate
+
+    def _initial_presets(self):
+        """設定保存されたプリセット、無ければ地域既定 (日本は既知局) を返す"""
+        cached = self.config.get("presets_region") == self.profile["region"]
+        fm = self.config.get("presets_fm") or []
+        am = self.config.get("presets_am") or []
+        if cached and (fm or am):
+            return fm, am
+        if self.profile["region"] == "JP":
+            fm = [
+                {"name": "NHK水戸 83.2", "freq_hz": 83200000, "mode": "WFM"},
+                {"name": "NHK東京 82.5", "freq_hz": 82500000, "mode": "WFM"},
+                {"name": "NHK前橋 86.4", "freq_hz": 86400000, "mode": "WFM"},
+                {"name": "FM GUNMA 92.8", "freq_hz": 92800000, "mode": "WFM"},
+                {"name": "LuckyFM 94.6", "freq_hz": 94600000, "mode": "WFM"},
+                {"name": "TOKYO 80.0", "freq_hz": 80000000, "mode": "WFM"},
+                {"name": "J-WAVE 81.3", "freq_hz": 81300000, "mode": "WFM"},
+                {"name": "TBS 90.5", "freq_hz": 90500000, "mode": "WFM"},
+                {"name": "ニッポン 93.0", "freq_hz": 93000000, "mode": "WFM"},
+                {"name": "ISS 145.8", "freq_hz": 145800000, "mode": "NFM"},
+            ]
+            am = [
+                {"name": "LuckyFM 1197k", "freq_hz": 1197000, "mode": "AM"},
+                {"name": "NHK第1 594k", "freq_hz": 594000, "mode": "AM"},
+                {"name": "NHK第2 693k", "freq_hz": 693000, "mode": "AM"},
+                {"name": "AFN 810k", "freq_hz": 810000, "mode": "AM"},
+                {"name": "TBS 954k", "freq_hz": 954000, "mode": "AM"},
+                {"name": "ニッポン 1242k", "freq_hz": 1242000, "mode": "AM"},
+                {"name": "短波NIKKEI 6.055M", "freq_hz": 6055000, "mode": "AM"},
+            ]
+        return fm, am
+
+    def _update_presets_from_scan(self, stations):
+        """スキャン結果の強力なFM局からプリセットを自動生成し、設定へ保存"""
+        fm = [s for s in stations if s["freq_hz"] >= 24000000]
+        fm = sorted(fm, key=lambda s: s["snr_db"], reverse=True)[:10]
+        if not fm:
+            return
+        fm_presets = [
+            {"name": f"{s['freq_mhz']:.1f}", "freq_hz": int(s["freq_hz"]), "mode": "WFM"}
+            for s in fm
+        ]
+        fm_presets.sort(key=lambda p: p["freq_hz"])
+        self.config["presets_fm"] = fm_presets
+        self.config["presets_region"] = self.profile["region"]
+        save_config(self.config)
+        self.gui.set_presets(fm_presets, self.config.get("presets_am") or [])
+
+    def init_hardware(self):
+        """RTL-SDRデバイスの初期化"""
+        dev_count = self.driver.get_device_count()
+        if dev_count == 0:
+            raise NoDeviceFoundError()
+
+        print(f"[*] Found {dev_count} RTL-SDR device(s)")
+        self.driver.open(0)
+        print(f"[*] Device opened: {self.driver.get_device_name(0)}")
+
+        self.driver.set_sample_rate(self.sample_rate)
+        self._apply_frequency_and_mode(self.freq, self.mode)
+
+        # コントローラ初期化
+        self.controller.init_gains()
+        self.gui.gains_list = self.controller.available_gains
+        self.gui.is_auto_gain = True
+        self.gui.gain_auto_label = self._ctrl_label()
+        self.gui.btn_gain_auto.text = self._ctrl_label()
+        print(f"[*] {self._ctrl_label()} autonomous optimization engine enabled")
+
+        # 起動直後の音声途切れ(2秒後のスキャン停止)を防止するため、
+        # 帯域スキャンはGUI上の [全帯域スキャン] ボタン押下時に実行する設計に変更
+        # threading.Thread(target=self._initial_bg_scan, daemon=True).start()
+
+    def _ctrl_label(self) -> str:
+        return "Hyper: ON" if self.controller_type == "hyper" else "Cascade: ON"
+
+    def _initial_bg_scan(self):
+        """起動直後の初回バックグラウンドFMスキャン"""
+        # 受信が安定するまで少し待機
+        time.sleep(2.0)
+        if not self.running:
+            return
+        print("[*] Background full-band scan started...")
+        self.cmd_queue.put(("SCAN", "auto_best"))
+
+    def _apply_frequency_and_mode(self, freq: int, mode: str):
+        """周波数と復調モードをハードウェア・DSPに適用"""
+        self.freq = freq
+        self.mode = mode
+
+        # AM中波帯 (24MHz未満) の場合はダイレクトサンプリング (Q-branch = 2) を自動有効化
+        if freq < 24000000:
+            self.driver.set_direct_sampling(2)
+            self.driver.set_center_freq(freq)
+            self.dsp.set_offset_freq(0.0)
+        else:
+            self.driver.set_direct_sampling(0)
+            # DCスパイクを避けるため +150kHz オフセットしてチューニング
+            offset = 150000
+            self.driver.set_center_freq(freq + offset)
+            self.dsp.set_offset_freq(offset)
+
+        st_name = match_station_name(freq)
+        if st_name == "Unknown FM Station":
+            st_name = t("station_unknown")
+        self.gui.scan_status_text = t("receiving", freq=f"{freq / 1e6:.2f}") + f" - {st_name}"
+
+        # 選局変更時は探索状態をリセットして新局へ即座に適応
+        if hasattr(self, "controller") and self.use_controller and self.controller.available_gains:
+            self.controller.reset_tracking()
+
+    def set_frequency(self, freq_hz: int):
+        self.cmd_queue.put(("FREQ", freq_hz))
+
+    def set_mode(self, mode: str):
+        self.cmd_queue.put(("MODE", mode))
+
+    def set_gain(self, auto_gain: bool, gain_val: float):
+        self.cmd_queue.put(("GAIN", (auto_gain, gain_val)))
+
+    def _sdr_worker(self):
+        """SDRデータ受信 & DSP処理ワーカースレッド"""
+        # GUI描画(GIL)による一時的な処理落ちを吸収する深いバッファ (約6.9秒分)。
+        # 浅いバッファだと溢れた生IQが捨てられ、音声が時間圧縮(早回し+飛び)になる。
+        raw_queue = queue.Queue(maxsize=120)
+        usb_running = threading.Event()
+
+        def on_async_data(raw_bytes):
+            if not self.running or not usb_running.is_set():
+                return
+            if raw_queue.full():
+                try:
+                    raw_queue.get_nowait()
+                except queue.Empty:
+                    pass
+            raw_queue.put(raw_bytes)
+
+        # 非同期USB受信スレッド
+        def async_usb_loop():
+            while self.running and usb_running.is_set():
+                try:
+                    self.driver.read_async(on_async_data, num_buffers=16, buffer_len=132096)
+                except Exception:
+                    time.sleep(0.01)
+
+        def start_usb_stream():
+            self.driver.resume_async()
+            usb_running.set()
+            t = threading.Thread(target=async_usb_loop, daemon=True)
+            t.start()
+            return t
+
+        def stop_usb_stream(t):
+            """Cループが実際に抜けるまで待機してから同期読み込みを行う (競合・ハング根絶)"""
+            usb_running.clear()
+            self.driver.cancel_async()
+            t.join(timeout=2.0)
+
+        def restore_after_scan():
+            """帯域スキャンで変更された受信パラメータを通常受信状態へ復元"""
+            self.driver.set_sample_rate(self.sample_rate)
+            self._apply_frequency_and_mode(self.freq, self.mode)
+            self.controller.init_gains()
+
+        def safe_band_scan(status_label: str, auto_best: bool = False):
+            """USBストリームを安全に停止して帯域スキャンを実行 (失敗しても必ず復帰)"""
+            nonlocal t_usb
+            self.gui.scan_status_text = status_label
+            stop_usb_stream(t_usb)
+            stations = []
+            try:
+                stations = self.tuner.scan_band(
+                    self.profile["fm_start_hz"], self.profile["fm_end_hz"],
+                    step_hz=1800000, snr_threshold=4.2)
+                self.gui.detected_stations = stations
+                self._update_presets_from_scan(stations)
+            except Exception as e:
+                print(f"[ERROR] Band scan failed: {e}", file=sys.stderr)
+            finally:
+                try:
+                    restore_after_scan()
+                except Exception as e:
+                    print(f"[ERROR] Failed to restore receiver after scan: {e}", file=sys.stderr)
+                t_usb = start_usb_stream()
+
+            self.gui.scan_status_text = t("scan_done", n=len(stations))
+
+            best_station = None
+            if auto_best and stations:
+                best = max(stations, key=lambda s: s["snr_db"])
+                cur_snr = -99.0
+                for s in stations:
+                    if abs(s["freq_hz"] - self.freq) <= 50000:
+                        cur_snr = s["snr_db"]
+                        break
+                if best["snr_db"] >= cur_snr + 4.0:
+                    best_station = best
+                    self.freq = best["freq_hz"]
+
+            if best_station:
+                self._apply_frequency_and_mode(self.freq, self.mode)
+                self.gui.center_freq = best_station["freq_hz"]
+                self.gui.scan_status_text = t("auto_tuned", freq=f"{best_station['freq_mhz']:.2f}", snr=f"{best_station['snr_db']:+.1f}")
+            return stations
+
+        t_usb = start_usb_stream()
+
+        while self.running:
+            # コマンドキューの処理
+            while not self.cmd_queue.empty():
+                try:
+                    cmd, val = self.cmd_queue.get_nowait()
+                except queue.Empty:
+                    break
+                try:
+                    if cmd == "FREQ":
+                        self._apply_frequency_and_mode(val, self.mode)
+                    elif cmd == "MODE":
+                        self._apply_frequency_and_mode(self.freq, val)
+                    elif cmd == "GAIN_LOCK_TOGGLE":
+                        # 手動ゲイン中だった場合は、コントローラを再有効化して自動最適化へ復帰
+                        if not self.use_controller:
+                            self.use_controller = True
+                            self.controller.enabled = True
+                            # 古い観測値ではなく新たにベイズ的スウィートスポットから再探索
+                            self.controller.reset_tracking()
+                            self.gui.is_auto_gain = True
+                            self.gui.scan_status_text = t("auto_gain_resumed")
+                        elif hasattr(self.controller, "set_hard_lock"):
+                            current_locked = getattr(self.controller, "hard_lock", False)
+                            new_locked = not current_locked
+                            self.controller.set_hard_lock(new_locked)
+                            if new_locked:
+                                if self.controller.available_gains:
+                                    g_val = self.controller.available_gains[self.controller.current_gain_idx]
+                                    self.gui.scan_status_text = t("gain_locked_msg", db=f"{g_val:.1f}")
+                            else:
+                                self.gui.scan_status_text = t("gain_research_msg")
+                    elif cmd == "GAIN":
+                        auto_gain, gain_val = val
+                        if auto_gain:
+                            self.use_controller = True
+                            self.controller.enabled = True
+                            if hasattr(self.controller, "set_hard_lock"):
+                                self.controller.set_hard_lock(False)
+                            self.gui.is_auto_gain = True
+                            self.gui.scan_status_text = t("auto_gain_resumed")
+                        else:
+                            self.use_controller = False
+                            self.controller.enabled = False
+                            self.driver.set_gain_mode(True)
+                            self.driver.set_gain(gain_val)
+                            self.gui.is_auto_gain = False
+                            self.gui.is_hard_locked = True
+                            self.gui.btn_gain_auto.text = t("gain_manual", db=f"{gain_val:.1f}")
+                            self.gui.btn_gain_auto.bg_color = (206, 236, 224)
+                            self.gui.scan_status_text = t("manual_gain_set", db=f"{gain_val:.1f}")
+                    elif cmd == "FILTER":
+                        self.dsp.filter_mode = val
+                        # Cascade式の離散モード切替ではなく、Hyperは連続カットオフの手動固定として反映
+                        if self.controller_type == "hyper" and hasattr(self.controller, "set_filter_override"):
+                            self.controller.set_filter_override(val)
+                    elif cmd == "SEEK":
+                        # 次局/前局シーク
+                        direction = val
+                        # 初回シークは局リストが無いため帯域スキャンが必要
+                        # (USBストリームを安全に停止しないとread_syncが競合・ハングする)
+                        if not self.tuner.discovered_stations:
+                            safe_band_scan(t("first_seek_scan"))
+                        st = self.tuner.seek_next(self.freq, direction=direction)
+                        if st:
+                            self._apply_frequency_and_mode(st["freq_hz"], self.mode)
+                            self.gui.center_freq = self.freq
+                            self.gui.scan_status_text = t("tuned", freq=f"{st['freq_mhz']:.2f}", snr=f"{st['snr_db']:+.1f}")
+                    elif cmd == "SCAN":
+                        # 全帯域スキャン (USBストリームを安全に停止してスイープ)
+                        safe_band_scan(t("scanning", start=f"{self.profile['fm_start']:g}", end=f"{self.profile['fm_end']:g}"), auto_best=(val == "auto_best"))
+
+                    elif cmd == "DX":
+                        # DX超高感度モード
+                        self.controller.dx_mode = val
+                        if val:
+                            self.dsp.filter_mode = "narrow"
+                        self.gui.scan_status_text = t("dx_on") if val else t("dx_off")
+                    elif cmd == "AFC":
+                        # AFC自動周波数追従
+                        self.dsp.afc_enabled = val
+                        self.gui.scan_status_text = t("afc_on") if val else t("afc_off")
+
+                except Exception as e:
+                    # 1つのコマンド失敗で受信ワーカー全体を落とさない
+                    print(f"[ERROR] Command '{cmd}' failed: {e}", file=sys.stderr)
+
+            try:
+                # 生IQデータをキューから取得
+                try:
+                    raw_bytes = raw_queue.get(timeout=0.2)
+                except queue.Empty:
+                    continue
+
+                # オーディオバッファ水位（残存チャンク数）を適応リサンプラにフィードバック (クロック自動同期)
+                q_size = self.audio.get_queue_size()
+                self.dsp.update_resampler_feedback(float(q_size))
+
+                # DSP復調処理 (適応リサンプラによる完全無欠損ストリーミング)
+                audio_pcm, spectrum_db = self.dsp.process(raw_bytes, mode=self.mode)
+                # ステレオ/モノラル状態をGUIへ反映
+                self.gui.is_stereo = bool(getattr(self.dsp, "is_stereo", False))
+
+                # 自律最適化ループ (Hyperは復調音声そのものを聴感評価に使用)
+                if self.use_controller:
+                    if self.controller_type == "hyper":
+                        stats = self.controller.process_frame(
+                            raw_bytes, spectrum_db, audio=audio_pcm, mode=self.mode
+                        )
+                    else:
+                        stats = self.controller.process_frame(raw_bytes, spectrum_db)
+                    self.gui.gain_val = stats["gain_db"]
+                    if hasattr(self.gui, "btn_filter"):
+                        self.gui.btn_filter.text = f"Filter: {stats['filter_mode'].capitalize()}"
+
+                    # ゲインボタンの表示を決め打ち（手動固定）・自動収束・探索状態に正確に同期
+                    hard_locked = stats.get("hard_lock", False)
+                    converged = stats.get("converged", False)
+                    if hard_locked:
+                        self.gui.is_hard_locked = True
+                        self.gui.btn_gain_auto.text = t("gain_fixed", db=f"{stats['gain_db']:.1f}")
+                        self.gui.btn_gain_auto.bg_color = (206, 236, 224)  # ミント (完全固定)
+                    elif converged:
+                        self.gui.is_hard_locked = False
+                        self.gui.btn_gain_auto.text = t("gain_converged", db=f"{stats['gain_db']:.1f}")
+                        self.gui.btn_gain_auto.bg_color = (214, 236, 236)  # 青緑 (自動収束)
+                    else:
+                        self.gui.is_hard_locked = False
+                        ctrl_name = "Hyper" if self.controller_type == "hyper" else "Cascade"
+                        self.gui.btn_gain_auto.text = t("gain_searching", ctrl=ctrl_name)
+                        self.gui.btn_gain_auto.bg_color = (250, 234, 206)  # アプリコット (探索中)
+
+                    if self.controller_type == "hyper":
+                        lock_tag = t("lock_fixed") if hard_locked else (t("lock_converged") if stats["converged"] else stats.get("search_phase", "..."))
+                        ant_tag = stats.get("antenna_profile", "BALANCED").replace("LOW_GAIN_", "LOW:").replace("HIGH_GAIN_", "HI:").replace("SATELLITE_", "SAT:")
+                        drift = self.dsp.resampler.drift_ppm
+                        sync_tag = "LOCK" if abs(drift) < 0.5 else f"{drift:+.0f}ppm"
+                        afc_val = self.dsp.nfm_afc_offset_hz if self.mode == "NFM" else self.dsp.afc_offset_hz
+                        afc_str = f"AFC:{afc_val:+.0f}Hz" if abs(afc_val) >= 1.0 else "AFC:0Hz"
+                        self.gui.telemetry_text = (
+                            f"C/N {stats.get('channel_snr_db', stats['estimated_snr']):.1f}dB | "
+                            f"Aud {stats.get('audio_snr_db', 0.0):.1f}dB | "
+                            f"Ant:{ant_tag} | "
+                            f"Sync:{sync_tag} | {afc_str} | {lock_tag}"
+                        )
+                    else:
+                        lock_str = t("lock_fixed") if hard_locked else (t("lock_converged") if stats["converged"] else t("lock_searching"))
+                        self.gui.telemetry_text = (
+                            f"Cascade SNR {stats['estimated_snr']:.1f}dB | IQ {stats['iq_std']:.0f} | "
+                            f"Gain {stats['gain_db']:.1f}dB | {lock_str}"
+                        )
+
+                # 音声キューへ転送
+                self.audio.put_audio(audio_pcm)
+
+                # スペクトラム・波形データの更新
+                with self.spectrum_lock:
+                    self.latest_spectrum = spectrum_db
+                    self.latest_audio = audio_pcm
+
+            except Exception as e:
+                # 受信ループは継続しつつ、原因を可視化 (2秒に1回だけ表示)
+                now = time.time()
+                if now - getattr(self, "_last_worker_error_time", 0.0) > 2.0:
+                    self._last_worker_error_time = now
+                    print(f"[ERROR] Receiver exception: {type(e).__name__}: {e}", file=sys.stderr)
+                time.sleep(0.005)
+
+        stop_usb_stream(t_usb)
+
+    def run(self):
+        """アプリケーションのメインループ"""
+        print("[*] Starting Antigravity Full-Scratch SDR Radio...")
+        print(f"[*] Region: {self.profile['region']} ({self.profile['label']}), "
+              f"language: {i18n_language()}, stereo: {self.config.get('stereo', True)}")
+        try:
+            self.init_hardware()
+        except NoDeviceFoundError:
+            print("[ERROR] No RTL-SDR device found.")
+            show_message_screen(t("no_device_title"), t("no_device_body"))
+            return
+        except Exception as e:
+            print(f"[ERROR] Hardware initialization failed: {e}")
+            show_message_screen(t("device_error_title"), [str(e), "", t("quit_hint")])
+            return
+
+        self.running = True
+        self.sdr_thread = threading.Thread(target=self._sdr_worker, daemon=True)
+        self.sdr_thread.start()
+
+        # 音声ストリーム起動 (内部のis_prerolled判定により自動プレロール)
+        self.audio.start()
+        print("[*] Receiver running. Use the GUI window to control.")
+
+        # GUIループ (メインスレッド)
+        try:
+            while self.gui.running:
+                self.gui.handle_events()
+
+                with self.spectrum_lock:
+                    spec_copy = self.latest_spectrum.copy()
+                    audio_ref = self.latest_audio
+
+                self.gui.render(spec_copy, audio_ref)
+
+        except KeyboardInterrupt:
+            pass
+        finally:
+            print("[*] Shutting down...")
+            self.running = False
+            if self.sdr_thread:
+                self.sdr_thread.join(timeout=1.0)
+            self.audio.stop()
+            self.driver.close()
+            self.gui.close()
+            print("[*] Exited cleanly.")
+
+
+def _setup_stdout_log():
+    """--windowed exe では stdout が無いため、ログファイルへリダイレクト"""
+    try:
+        if sys.stdout is None or sys.stderr is None:
+            logf = open(LOG_PATH, "w", encoding="utf-8", buffering=1)
+            sys.stdout = logf
+            sys.stderr = logf
+    except Exception:
+        pass
+
+
+def main():
+    _setup_stdout_log()
+    parser = argparse.ArgumentParser(description="Antigravity Full-Scratch SDR Radio")
+    parser.add_argument("--freq", type=float, default=None,
+                        help="Initial frequency in MHz (default: region profile)")
+    parser.add_argument("--mode", type=str, default=None, choices=["WFM", "AM", "NFM"],
+                        help="Demodulation mode (WFM / AM / NFM)")
+    parser.add_argument("--controller", type=str, default="hyper", choices=["hyper", "cascade"],
+                        help="Autonomous optimization engine (hyper / cascade)")
+    parser.add_argument("--country", type=str, default=None,
+                        help="Country code override (e.g. JP, US, DE). Default: auto-detect")
+    parser.add_argument("--lang", type=str, default=None, choices=["ja", "en"],
+                        help="UI language override. Default: auto-detect")
+    parser.add_argument("--mono", action="store_true", help="Force monaural FM (disable stereo)")
+    args = parser.parse_args()
+
+    cfg = load_config()
+    detected_country = detect_country()
+    country = (args.country or cfg.get("country") or detected_country or "CCIR").upper()
+    language = args.lang or cfg.get("language") or detect_language()
+    i18n_set_language(language)
+    if args.mono:
+        cfg["stereo"] = False
+
+    freq_hz = int(args.freq * 1e6) if args.freq is not None else None
+    app = SdrApp(initial_freq=freq_hz, initial_mode=args.mode,
+                 controller_type=args.controller, config=cfg, country=country)
+
+    try:
+        app.run()
+    finally:
+        # 音量・言語・地域など次回起動に引き継ぐ設定を保存
+        # (国は明示指定 or 初回自動判定できた場合のみ固定し、判定不能な "CCIR" は保存しない)
+        app.config["volume"] = app.audio.volume
+        if args.country:
+            app.config["country"] = args.country.upper()
+        elif detected_country and not cfg.get("country"):
+            app.config["country"] = detected_country
+        app.config["language"] = language
+        save_config(app.config)
+
+
+if __name__ == "__main__":
+    main()
