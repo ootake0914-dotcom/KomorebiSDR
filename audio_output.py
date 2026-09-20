@@ -7,6 +7,7 @@ Audio Output Module using sounddevice - Hi-Fi Edition.
 """
 
 import threading
+import time
 import queue
 import numpy as np
 import sounddevice as sd
@@ -32,15 +33,34 @@ class AudioOutput:
         self.preroll_threshold = 8  # 深層ジッターバッファ: 約400ms (8チャンク) 蓄積して完全安定再生
         self.last_out_samples = np.zeros(2, dtype=np.float32)
 
+        # リアルタイムコールバック内の動的確保を排除 (uac2: pre-allocated pool / single-copy)
+        self._empty = np.empty((0, 2), dtype=np.float32)
+        self._scratch = np.zeros((max(int(blocksize), 8192), 2), dtype=np.float32)
+        self._absbuf = np.empty_like(self._scratch)
+        self._mask = np.empty(self._scratch.shape, dtype=bool)
+
         # 長時間安定稼働モニタリング統計
         self.underrun_count = 0
         self.overflow_count = 0
         self.total_callbacks = 0
         self.total_frames_played = 0
+        self.callback_us_max = 0.0
 
     def _audio_callback(self, outdata, frames, time_info, status):
-        """深層ジッターバッファによる完全安定オーディオ再生コールバック"""
-        # プレロール判定: バッファが深層クッション（約400ms）まで蓄積されるまで待機
+        """深層ジッターバッファによる完全安定オーディオ再生コールバック。
+
+        リアルタイムパスでは新規メモリ確保を行わず、事前確保した _scratch へ
+        キュー内容を直接コピーする (uac2 の pre-allocated pool / single-copy 方式)。
+        """
+        t0 = time.perf_counter()
+        frames = int(frames)
+        if frames > len(self._scratch):
+            # 想定外の大きなブロック要求時のみ拡張 (通常は発生しない)
+            self._scratch = np.zeros((frames, 2), dtype=np.float32)
+            self._absbuf = np.empty_like(self._scratch)
+            self._mask = np.empty(self._scratch.shape, dtype=bool)
+
+        # プレロール判定: バッファが深層クッション(約400ms)まで蓄積されるまで待機
         if not self.is_prerolled:
             if self.audio_queue.qsize() >= self.preroll_threshold:
                 self.is_prerolled = True
@@ -49,84 +69,87 @@ class AudioOutput:
                 self.last_out_samples[:] = 0.0
                 return
 
-        collected = []
-        needed = frames
+        scratch = self._scratch
+        n = 0
 
-        # 1. 前回のコールバックで余ったサンプルがあれば先頭から消費
+        # 1. 前回のコールバックで余ったサンプルを先頭から消費
         if len(self.remainder) > 0:
-            if len(self.remainder) <= needed:
-                collected.append(self.remainder)
-                needed -= len(self.remainder)
-                self.remainder = np.empty((0, 2), dtype=np.float32)
-            else:
-                collected.append(self.remainder[:needed])
-                self.remainder = self.remainder[needed:]
-                needed = 0
+            take = min(len(self.remainder), frames)
+            scratch[:take] = self.remainder[:take]
+            n = take
+            self.remainder = self.remainder[take:] if take < len(self.remainder) else self._empty
 
-        # 2. 不足分をキューから時系列順に厳格に取り出す（余りはremainderへ退避）
-        while needed > 0 and not self.audio_queue.empty():
+        # 2. 不足分をキューから時系列順にコピー (余りはremainderへ、コピーなしのビュー)
+        while n < frames:
             try:
                 chunk = self.audio_queue.get_nowait()
-                if len(chunk) <= needed:
-                    collected.append(chunk)
-                    needed -= len(chunk)
-                else:
-                    collected.append(chunk[:needed])
-                    self.remainder = chunk[needed:]
-                    needed = 0
             except queue.Empty:
                 break
-
-        if collected:
-            data = np.concatenate(collected, axis=0)
-        else:
-            data = np.zeros((0, 2), dtype=np.float32)
+            take = min(len(chunk), frames - n)
+            scratch[n:n + take] = chunk[:take]
+            n += take
+            if take < len(chunk):
+                self.remainder = chunk[take:]
 
         self.total_callbacks += 1
         self.total_frames_played += frames
 
-        # アンダーフロー補完 & リバッファリング保護 (クリック音・破裂音の完全根絶)
-        if len(data) < frames:
+        # アンダーフロー補完 (直前サンプルから0Vへコサイン減衰、バッファへ直接書込)
+        if n < frames:
             self.underrun_count += 1
-            missing = frames - len(data)
+            missing = frames - n
             fade_len = min(32, missing)
-            pad = np.zeros((missing, 2), dtype=np.float32)
-            # 直前サンプルから0Vへコサインカーブで超滑らかに減衰（ステップ不連続ノイズゼロ）
-            last = data[-1] if len(data) > 0 else self.last_out_samples
-            if np.any(np.abs(last) > 1e-4):
+            if n > 0:
+                last = scratch[n - 1]
+            else:
+                last = self.last_out_samples
+            if fade_len > 0 and np.any(np.abs(last) > 1e-4):
                 fade = 0.5 * (1.0 + np.cos(np.linspace(0.0, np.pi, fade_len, dtype=np.float32)))
-                pad[:fade_len] = (last[None, :] * fade[:, None]).astype(np.float32)
-            data = np.concatenate((data, pad), axis=0) if len(data) > 0 else pad
+                scratch[n:n + fade_len] = last[None, :] * fade[:, None]
+                scratch[n + fade_len:frames] = 0.0
+            else:
+                scratch[n:frames] = 0.0
 
-            # 万が一キューが完全に空になった場合は、小刻みなバタつきを防止するため再プレロール(4チャンク)
+            # キューが完全に空なら再プレロール(4チャンク)して小刻みなバタつきを防止
             if self.audio_queue.empty() and len(self.remainder) == 0:
                 self.is_prerolled = False
                 self.preroll_threshold = 4
+
+        data = scratch[:frames]
 
         # ミュート処理
         if self.is_muted:
             outdata[:, 0] = 0.0
             outdata[:, 1] = 0.0
+            us = (time.perf_counter() - t0) * 1e6
+            if us > self.callback_us_max:
+                self.callback_us_max = us
             return
 
-        # スムーズな音量スケーリング
-        data = data * self.volume
+        # 音量スケーリング (in-place、確保なし)
+        np.multiply(data, self.volume, out=data)
 
-        # 高音質ソフトリミッター (0.95を超えた部分だけを滑らかに圧縮してクリップ歪みを完全排除)
+        # ソフトリミッター (0.85超のみ圧縮。通常はmaskが全てFalseで何もしない)
         threshold = 0.85
-        over = np.abs(data) > threshold
-        if np.any(over):
-            sign = np.sign(data[over])
-            mag = np.abs(data[over])
-            # ソフトニー圧縮曲線
-            compressed = threshold + (1.0 - threshold) * np.tanh((mag - threshold) / (1.0 - threshold))
-            data[over] = sign * compressed
+        np.absolute(data, out=self._absbuf[:frames])
+        over = np.greater(self._absbuf[:frames], threshold, out=self._mask[:frames])
+        if over.any():
+            idx = over
+            sign = np.sign(data[idx])
+            mag = self._absbuf[:frames][idx]
+            compressed = threshold + (1.0 - threshold) * np.tanh(
+                (mag - threshold) / (1.0 - threshold))
+            data[idx] = sign * compressed
 
-        # ステレオ出力
+        # ステレオ出力 (outdata は C-contiguous な (frames,2))
         outdata[:, 0] = data[:, 0]
         outdata[:, 1] = data[:, 1]
-        if len(data) > 0:
-            self.last_out_samples = data[-1].astype(np.float32, copy=True)
+        if n > 0:
+            self.last_out_samples[:] = data[n - 1]
+
+        us = (time.perf_counter() - t0) * 1e6
+        if us > self.callback_us_max:
+            self.callback_us_max = us
 
     def start(self):
         if self.is_running:

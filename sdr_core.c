@@ -12,6 +12,15 @@
 #include <stdint.h>
 #include <stdlib.h>
 
+#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
+#include <xmmintrin.h>
+#include <pmmintrin.h>
+#endif
+#if defined(_M_X64) || defined(__SSE2__)
+#include <emmintrin.h>
+#define SDR_HAVE_SSE2 1
+#endif
+
 #ifdef _WIN32
 #define SDR_EXPORT __declspec(dllexport)
 #else
@@ -23,7 +32,185 @@
 
 SDR_EXPORT int sdr_version(void)
 {
-    return 2;
+    return 5;
+}
+
+/* denormal(非正規化数)対策: FTZ/DAZを有効化。
+ * IIRフィルタやPLLの減衰テールで非正規化数が発生すると、x86では数百サイクルの
+ * ペナルティで周期的なジッタ (じりじりノイズ) の原因になる。
+ */
+SDR_EXPORT void sdr_fast_fpu(void)
+{
+#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
+    unsigned int csr = _mm_getcsr();
+    csr |= 0x8040u; /* bit15=FTZ, bit6=DAZ */
+    _mm_setcsr(csr);
+#endif
+}
+
+/* ---- 高速sin LUT (1024エントリ + 線形補間, 誤差 ~5e-6) ----
+ * PLLのサンプル毎のlibm sin/cos呼び出しを置換 (1.2M呼び出し/秒を削減)
+ */
+#define SDR_LUT_BITS 10
+#define SDR_LUT_SIZE (1 << SDR_LUT_BITS)
+#define SDR_TWO_PI_F 6.283185307179586
+static float g_sin_lut[SDR_LUT_SIZE + 1];
+static int g_sin_lut_ready = 0;
+
+static void sdr_lut_init(void)
+{
+    for (int i = 0; i < SDR_LUT_SIZE; ++i) {
+        g_sin_lut[i] = (float)sin(SDR_TWO_PI_F * (double)i / (double)SDR_LUT_SIZE);
+    }
+    g_sin_lut[SDR_LUT_SIZE] = g_sin_lut[0];
+    g_sin_lut_ready = 1;
+}
+
+static inline float sdr_sin(double x)
+{
+    if (!g_sin_lut_ready) {
+        sdr_lut_init();
+    }
+    while (x < 0.0) {
+        x += SDR_TWO_PI_F;
+    }
+    while (x >= SDR_TWO_PI_F) {
+        x -= SDR_TWO_PI_F;
+    }
+    double f = x * ((double)SDR_LUT_SIZE / SDR_TWO_PI_F);
+    int i = (int)f;
+    if (i >= SDR_LUT_SIZE) {
+        i = SDR_LUT_SIZE - 1;
+    }
+    float fr = (float)(f - (double)i);
+    float a = g_sin_lut[i];
+    return a + fr * (g_sin_lut[i + 1] - a);
+}
+
+static inline float sdr_cos(double x)
+{
+    return sdr_sin(x + 1.5707963267948966);
+}
+
+/* ---- SIMD実数FIR (valid畳み込み) ----
+ * np.convolve (MSVC/NumPyのスカラー相関) をSSE2 4並列 + 4アキュムレータで置換。
+ * y[i] = sum_k x[i+k]*h[k]  (n_out = len(x)-taps+1)
+ */
+SDR_EXPORT void sdr_fir_real(const float * __restrict x, const float * __restrict h,
+                             float * __restrict y, int n_out, int taps)
+{
+    for (int i = 0; i < n_out; ++i) {
+        const float *xp = x + i;
+        float acc = 0.0f;
+#ifdef SDR_HAVE_SSE2
+        if (taps >= 8) {
+            __m128 a0 = _mm_setzero_ps();
+            __m128 a1 = _mm_setzero_ps();
+            int k = 0;
+            for (; k + 8 <= taps; k += 8) {
+                a0 = _mm_add_ps(a0, _mm_mul_ps(_mm_loadu_ps(xp + k), _mm_loadu_ps(h + k)));
+                a1 = _mm_add_ps(a1, _mm_mul_ps(_mm_loadu_ps(xp + k + 4), _mm_loadu_ps(h + k + 4)));
+            }
+            __m128 s = _mm_add_ps(a0, a1);
+            s = _mm_add_ps(s, _mm_movehl_ps(s, s));
+            s = _mm_add_ss(s, _mm_shuffle_ps(s, s, 0x55));
+            acc = _mm_cvtss_f32(s);
+            for (; k < taps; ++k) {
+                acc += xp[k] * h[k];
+            }
+        } else
+#endif
+        {
+            for (int k = 0; k < taps; ++k) {
+                acc += xp[k] * h[k];
+            }
+        }
+        y[i] = acc;
+    }
+}
+
+/* 19kHzパイロットPLL + RDS用57kHz(3θ)搬送波出力 (sdr_stereo_pllの拡張版)
+ * cos3/sin3 = cos/sin(3*theta) を追加出力する。RDS復調は57kHzを3θから
+ * 生成することでパイロットと完全にコヒーレントになる。
+ */
+SDR_EXPORT void sdr_stereo_pll3(const float *sig, int n, double *theta, double w0,
+                                double kp, double ki, double *integ, double *ef_state,
+                                double alpha, float *cos2, float *sin2,
+                                float *cos3, float *sin3, float *quality)
+{
+    double th = *theta;
+    double ig = *integ;
+    double ef = *ef_state;
+    double qsum = 0.0;
+    for (int i = 0; i < n; ++i) {
+        double s = (double)sdr_sin(th);
+        double c = (double)sdr_cos(th);
+        double e = -(double)sig[i] * s;
+        ef += alpha * (e - ef);
+        ig += ki * ef;
+        th += w0 + kp * ef + ig;
+        if (th > 3.141592653589793) {
+            th -= 6.283185307179586;
+        } else if (th < -3.141592653589793) {
+            th += 6.283185307179586;
+        }
+        double c2 = (double)sdr_cos(2.0 * th);
+        double s2 = (double)sdr_sin(2.0 * th);
+        cos2[i] = (float)c2;
+        sin2[i] = (float)s2;
+        cos3[i] = (float)(c * c2 - s * s2);
+        sin3[i] = (float)(s * c2 + c * s2);
+        qsum += (double)sig[i] * c;
+    }
+    *theta = th;
+    *integ = ig;
+    *ef_state = ef;
+    *quality = (float)(qsum / (n > 0 ? n : 1));
+}
+
+/* AM同期検波 (キャリア再生PLL + 同期検波)
+ * - iq: 複素IFインタリーブ配列 (re,im,...) 288kHz想定、キャリアは0Hz付近
+ * - out: 同相成分 (同期検波音声)
+ * - phase/integ/ef_state: PLL状態
+ * - lock: ロック指標 = |平均(同相)| / 平均(|IQ|)  (キャリア捕捉時 ~0.7-1.0)
+ *
+ * 包絡線検波と違い直交成分を捨てるため、選択性フェージング時の
+ * ひずみ (AM成分) や隣接混信の影響を大幅に低減できる。
+ */
+SDR_EXPORT void sdr_am_sync(const float *iq, float *out, int n,
+                            double *phase, double *integ, double *ef_state,
+                            double kp, double ki, double alpha, float *lock)
+{
+    double th = *phase;
+    double ig = *integ;
+    double ef = *ef_state;
+    double sum_i = 0.0;
+    double sum_m = 0.0;
+    for (int i = 0; i < n; ++i) {
+        double re = (double)iq[2 * i];
+        double im = (double)iq[2 * i + 1];
+        double c = (double)sdr_cos(th);
+        double s = (double)sdr_sin(th);
+        double i_out = re * c + im * s;   /* 同相 = 同期検波出力 */
+        double q = im * c - re * s;       /* 直交 = 位相誤差 */
+        ef += alpha * (q - ef);
+        ig += ki * ef;
+        th += kp * ef + ig;
+        if (th > 3.141592653589793) {
+            th -= 6.283185307179586;
+        } else if (th < -3.141592653589793) {
+            th += 6.283185307179586;
+        }
+        out[i] = (float)i_out;
+        sum_i += i_out;
+        sum_m += sqrt(re * re + im * im);
+    }
+    *phase = th;
+    *integ = ig;
+    *ef_state = ef;
+    double mi = fabs(sum_i) / (n > 0 ? n : 1);
+    double mm = sum_m / (n > 0 ? n : 1) + 1e-12;
+    *lock = (float)(mi / mm);
 }
 
 /* 双一次変換ディエンファシス (50us) - 1次IIR
@@ -128,8 +315,8 @@ SDR_EXPORT void sdr_stereo_pll(const float *sig, int n, double *theta, double w0
     double ef = *ef_state;
     double qsum = 0.0;
     for (int i = 0; i < n; ++i) {
-        double s = sin(th);
-        double c = cos(th);
+        double s = (double)sdr_sin(th);
+        double c = (double)sdr_cos(th);
         /* 位相検波 (符号反転で負帰還) */
         double e = -(double)sig[i] * s;
         /* ループフィルタ: 音声成分(可聴帯域)を除去しパイロットのみで追従 */
@@ -141,8 +328,8 @@ SDR_EXPORT void sdr_stereo_pll(const float *sig, int n, double *theta, double w0
         } else if (th < -3.141592653589793) {
             th += 6.283185307179586;
         }
-        cos2[i] = (float)cos(2.0 * th);
-        sin2[i] = (float)sin(2.0 * th);
+        cos2[i] = sdr_cos(2.0 * th);
+        sin2[i] = sdr_sin(2.0 * th);
         qsum += (double)sig[i] * c;
     }
     *theta = th;

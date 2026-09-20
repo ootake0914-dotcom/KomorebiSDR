@@ -7,6 +7,7 @@ Auto-Tuner & Smart DX Station Search Engine for SDR.
 import time
 import numpy as np
 from rtlsdr_driver import RtlSdrDriver
+from config import SHORTWAVE_BANDS, SW_MAX_HZ, shortwave_scan_centers
 
 
 # 日本の主要FM局データベース (関東・茨城・東京・広域)
@@ -54,7 +55,8 @@ class AutoTuner:
     def __init__(self, driver: RtlSdrDriver = None):
         self.driver = driver if driver is not None else RtlSdrDriver()
         self.owns_driver = driver is None
-        self.discovered_stations = []  # スキャンで発見された局リスト
+        self.discovered_stations = []  # スキャンで発見された局リスト (FM)
+        self.discovered_sw = []        # 短波(HF)スキャン結果
         self.last_scan_time = 0.0
 
     def scan_band(
@@ -201,14 +203,108 @@ class AutoTuner:
         self.last_scan_time = time.time()
         return filtered_stations
 
+    def scan_band_hf(
+        self,
+        snr_threshold: float = 6.5,
+        rate_hz: int = 1152000,
+        max_results: int = 40,
+    ) -> list[dict]:
+        """短波(HF)放送バンドをダイレクトサンプリング(Qブランチ)でスキャンする。
+
+        2.0〜14.4MHzのSW放送バンドを5kHzグリッドで走査し、受信可能な局を返す。
+        15MHz以上はRTL-SDRのダイレクトサンプリング上限を超えるため対象外
+        (アップコンバータ使用時は config.SW_MAX_HZ を変更)。
+        """
+        was_open = self.driver.is_open
+        if not was_open:
+            self.driver.open(0)
+
+        self.driver.set_sample_rate(int(rate_hz))
+        self.driver.set_direct_sampling(2)   # Qブランチ (HF)
+        self.driver.set_gain_mode(True)
+        self.driver.set_gain(33.8)           # ダイレクトサンプリングでは実質無効
+
+        centers = shortwave_scan_centers(rate_hz)
+        fft_size = 2048
+        window = np.hamming(fft_size).astype(np.float32)
+        win_power = np.sum(window ** 2) / fft_size
+        band_ranges = [
+            (int(lo * 1000), int(min(hi * 1000, SW_MAX_HZ)))
+            for _name, lo, hi in SHORTWAVE_BANDS
+        ]
+        stations = []
+
+        for fc in centers:
+            self.driver.set_center_freq(fc)
+            self.driver.reset_buffer()
+            _ = self.driver.read_sync(32768)
+
+            num_avg = 6
+            raw = self.driver.read_sync(fft_size * 2 * num_avg)
+            if len(raw) < fft_size * 2:
+                continue
+            raw_f = raw.astype(np.float32)
+            iq = (raw_f[0::2] - 127.5) * (1.0 / 128.0) + \
+                 1j * (raw_f[1::2] - 127.5) * (1.0 / 128.0)
+
+            accum_power = np.zeros(fft_size, dtype=np.float64)
+            frames = len(iq) // fft_size
+            for fi in range(frames):
+                chunk = iq[fi * fft_size:(fi + 1) * fft_size] * window
+                fft_data = np.fft.fftshift(np.fft.fft(chunk)) / fft_size
+                accum_power += (np.abs(fft_data) ** 2) / win_power
+            avg_power = accum_power / max(1, frames) + 1e-12
+            spec_db = 10.0 * np.log10(avg_power)
+
+            noise_floor = float(np.percentile(spec_db, 40))
+            freq_axis = np.linspace(fc - rate_hz / 2, fc + rate_hz / 2, fft_size)
+
+            # DCスパイクとその裾 (±30kHz) を除去
+            dc = fft_size // 2
+            guard = int(30000 / (rate_hz / fft_size))
+            spec_db[dc - guard: dc + guard + 1] = noise_floor
+
+            peaks = self._find_spectral_peaks(
+                spec_db, freq_axis, noise_floor, snr_threshold, min_width_bins=3)
+            for p in peaks:
+                # SW放送は5kHzグリッド
+                snapped = int(round(p["peak_freq"] / 5000.0) * 5000)
+                if not any(lo <= snapped <= hi for lo, hi in band_ranges):
+                    continue
+                existing = next(
+                    (s for s in stations if abs(s["freq_hz"] - snapped) < 4000), None)
+                if existing:
+                    if p["snr_db"] > existing["snr_db"]:
+                        existing["snr_db"] = round(p["snr_db"], 1)
+                        existing["peak_power_db"] = round(p["peak_power"], 1)
+                    continue
+                stations.append({
+                    "freq_hz": snapped,
+                    "freq_mhz": snapped / 1e6,
+                    "name": "Unknown FM Station",
+                    "snr_db": round(p["snr_db"], 1),
+                    "peak_power_db": round(p["peak_power"], 1),
+                    "afc_offset_hz": round(p["peak_freq"] - snapped, 0),
+                    "quality": "STRONG" if p["snr_db"] >= 20.0 else (
+                        "MEDIUM" if p["snr_db"] >= 10.0 else "WEAK (DX)"),
+                })
+
+        if not was_open and self.owns_driver:
+            self.driver.close()
+
+        stations.sort(key=lambda s: s["freq_hz"])
+        stations = stations[:max_results]
+        self.discovered_sw = stations
+        self.last_scan_time = time.time()
+        return stations
+
     def _find_spectral_peaks(
-        self, spec_db: np.ndarray, freq_axis: np.ndarray, noise_floor: float, threshold_snr: float
+        self, spec_db: np.ndarray, freq_axis: np.ndarray, noise_floor: float,
+        threshold_snr: float, min_width_bins: int = 5,
     ) -> list[dict]:
         """スペクトラムから凸形状のピークを抽出"""
         peaks = []
         n = len(spec_db)
-        # FM信号の帯域幅（約100〜150kHz）に相当するビン幅
-        min_width_bins = 5
         margin = 10
 
         for i in range(margin, n - margin):

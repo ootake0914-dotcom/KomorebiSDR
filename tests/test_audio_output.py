@@ -1,0 +1,102 @@
+"""AudioOutput callback tests (no hardware, no sounddevice stream).
+
+Verifies the preallocated-scratch callback path:
+- sample-accurate reassembly across chunk boundaries
+- preroll gating
+- underrun fade + re-preroll
+- volume/limiter correctness
+"""
+
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import numpy as np
+from audio_output import AudioOutput
+
+BLOCK = 1024
+
+
+def put(ao, arr):
+    """stream無しでもキューへ直接投入 (テスト用)"""
+    ao.audio_queue.put_nowait(np.asarray(arr, dtype=np.float32))
+
+
+def main() -> int:
+    ok = True
+    ao = AudioOutput(48000, blocksize=BLOCK)
+    ao.volume = 1.0
+
+    # 1) プレロール前は無音
+    out = np.ones((BLOCK, 2), dtype=np.float32)
+    ao._audio_callback(out, BLOCK, None, None)
+    ok &= bool(np.all(out == 0.0))
+    print(f"[{'OK' if ok else 'FAIL'}] preroll outputs silence")
+
+    # 2) チャンク境界をまたぐ再構成 (2752サンプル × 8)
+    ao.preroll_threshold = 2
+    chunks = []
+    for i in range(8):
+        n = 2752
+        t = np.arange(i * n, (i + 1) * n) / 48000.0
+        # 振幅0.5 (ソフトリミッターしきい値0.85未満で素通しを検証)
+        chunks.append((0.5 * np.stack([np.sin(2 * np.pi * 440 * t),
+                                       np.sin(2 * np.pi * 660 * t)], axis=1)).astype(np.float32))
+    for c in chunks:
+        put(ao, c)
+    ref = np.concatenate(chunks, axis=0)
+    nblocks = len(ref) // BLOCK  # 端数ブロックは意図的に除外
+    got = []
+    for _ in range(nblocks):
+        out = np.zeros((BLOCK, 2), dtype=np.float32)
+        ao._audio_callback(out, BLOCK, None, None)
+        got.append(out.copy())
+    y = np.concatenate(got, axis=0)
+    err = float(np.max(np.abs(y - ref[:len(y)])))
+    good = err < 1e-6 and ao.underrun_count == 0
+    ok &= good
+    print(f"[{'OK' if good else 'FAIL'}] reassembly across chunk boundaries "
+          f"(max error {err:.2e}, underruns={ao.underrun_count})")
+
+    # 3) アンダーラン時: 減衰して0へ (クリックなし)
+    ao2 = AudioOutput(48000, blocksize=BLOCK)
+    ao2.is_prerolled = True
+    put(ao2, np.full((4096, 2), 0.5, dtype=np.float32))
+    tail = None
+    for _ in range(8):
+        out = np.zeros((BLOCK, 2), dtype=np.float32)
+        ao2._audio_callback(out, BLOCK, None, None)
+        tail = out.copy()
+    good = ao2.underrun_count > 0 and float(np.max(np.abs(tail))) < 0.02
+    ok &= good
+    print(f"[{'OK' if good else 'FAIL'}] underrun fades to silence "
+          f"(underruns={ao2.underrun_count}, tail={float(np.max(np.abs(tail))):.4f})")
+
+    # 4) 音量とソフトリミッター
+    ao3 = AudioOutput(48000, blocksize=BLOCK)
+    ao3.is_prerolled = True
+    ao3.volume = 0.5
+    put(ao3, np.full((2048, 2), 0.4, dtype=np.float32))
+    out = np.zeros((BLOCK, 2), dtype=np.float32)
+    ao3._audio_callback(out, BLOCK, None, None)
+    good = abs(float(out[0, 0]) - 0.2) < 1e-6
+    ok &= good
+    print(f"[{'OK' if good else 'FAIL'}] volume scaling (got {out[0, 0]:.3f}, expect 0.200)")
+
+    ao3.volume = 2.0
+    put(ao3, np.full((2048, 2), 0.9, dtype=np.float32))
+    out = np.zeros((BLOCK, 2), dtype=np.float32)
+    ao3._audio_callback(out, BLOCK, None, None)
+    peak = float(np.max(np.abs(out)))
+    good = threshold_ok = peak <= 1.0 and peak > 0.8
+    ok &= good
+    print(f"[{'OK' if good else 'FAIL'}] soft limiter keeps peak <= 1.0 (peak {peak:.3f})")
+
+    print(f"     callback max time: {ao.callback_us_max:.0f} us")
+    print("OK" if ok else "FAILED")
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

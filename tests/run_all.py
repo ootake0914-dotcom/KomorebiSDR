@@ -12,6 +12,13 @@ ROOT = os.path.dirname(HERE)
 
 TESTS = [
     "test_regions.py",
+    "test_shortwave.py",
+    "test_am_sync.py",
+    "test_ssb.py",
+    "test_sw_schedule.py",
+    "test_rds.py",
+    "test_audio_output.py",
+    "test_rt_profile.py",
     "test_native_equiv.py",
     "test_stereo.py",
     "test_mock_worker.py",

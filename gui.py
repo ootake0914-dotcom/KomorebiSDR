@@ -65,19 +65,35 @@ def show_message_screen(title: str, lines: list, width: int = 760, height: int =
                     pygame.quit()
                     return
             screen.fill(C_BG_TOP)
-            ts = f_title.render(title, True, (178, 62, 62))
+            ts = cached_text(f_title, title, (178, 62, 62))
             screen.blit(ts, (28, 22))
             y = 76
             for line in lines:
-                s = f_body.render(line, True, C_TEXT)
+                s = cached_text(f_body, line, C_TEXT)
                 screen.blit(s, (28, y))
                 y += 24
-            hint = f_body.render(t("quit_hint"), True, C_MUTED)
+            hint = cached_text(f_body, t("quit_hint"), C_MUTED)
             screen.blit(hint, (28, height - 36))
             pygame.display.flip()
             clock.tick(30)
     except Exception:
         pass
+
+
+# 文字サーフェスのキャッシュ (dirty update方式)
+# 毎フレームの font.render (ラスタライズ) を排除。内容が変わった時だけ再生成する。
+_TEXT_CACHE = {}
+
+
+def cached_text(font, text, color):
+    key = (id(font), text, color)
+    surf = _TEXT_CACHE.get(key)
+    if surf is None:
+        surf = font.render(text, True, color)
+        if len(_TEXT_CACHE) > 1500:
+            _TEXT_CACHE.clear()
+        _TEXT_CACHE[key] = surf
+    return surf
 
 
 class Button:
@@ -116,7 +132,7 @@ class Button:
             border = C_BTN_BORDER
         pygame.draw.rect(surface, fill, self.rect, border_radius=self.radius)
         pygame.draw.rect(surface, border, self.rect, width=1, border_radius=self.radius)
-        txt_surf = font.render(self.text, True, txt_color)
+        txt_surf = cached_text(font, self.text, txt_color)
         txt_rect = txt_surf.get_rect(center=self.rect.center)
         surface.blit(txt_surf, txt_rect)
 
@@ -168,6 +184,10 @@ class SdrGui:
         self.on_filter_change = None
         self.on_seek_change = None      # lambda direction: ...
         self.on_scan_request = None     # lambda: ...
+        self.on_sw_scan_request = None  # lambda: ...
+        self.on_stereo_toggle = None    # lambda: ...
+        self.on_nr_toggle = None        # lambda: ...
+        self.on_bfo_change = None       # lambda delta_hz: ...
         self.on_dx_toggle = None        # lambda enabled: ...
         self.on_afc_toggle = None       # lambda enabled: ...
 
@@ -185,7 +205,20 @@ class SdrGui:
         self.is_dx_mode = False
         self.is_afc_enabled = True
         self.is_stereo = False
+        self.stereo_status = "MONO"
+        self.stereo_enabled = True
+        self.nr_enabled = True
+        # 描画用の事前確保バッファ (毎フレームの確保を排除)
+        self._wave_xs = None
+        self._spec_px = None
+        self._wf_x_src = None
+        self._wf_lo = None
+        self._wf_w = None
+        self._wf_src_n = -1
+        self._wf_line_surf = None
+        self._wf_arr = None
         self.region_label = ""
+        self.station_name = ""   # メインから設定 (RDS PS / 番組表 / 既知局)
         self.scan_range = (76.0, 95.0)
         self.presets_fm = []
         self.presets_am = []
@@ -267,7 +300,7 @@ class SdrGui:
         self.region_label = label
         self.scan_range = (start_mhz, end_mhz)
         if hasattr(self, "btn_scan_band"):
-            self.btn_scan_band.text = t("scan_button", start=f"{start_mhz:g}", end=f"{end_mhz:g}")
+            self.btn_scan_band.text = t("scan_button")
 
     def set_presets(self, presets_fm: list, presets_am: list):
         """スキャン結果などからプリセットボタンを再構築する"""
@@ -292,14 +325,38 @@ class SdrGui:
                                     bg_color=(226, 235, 248), active_color=C_BTN_ACTIVE2)
         self.btn_seek_next = Button((tx + half + 6, 300, half, 28), "Auto Seek >>", lambda: self._seek(1),
                                     bg_color=(226, 235, 248), active_color=C_BTN_ACTIVE2)
-        self.btn_scan_band = Button((tx, 332, tw, 30), "全帯域スキャン (FM 76〜95MHz)", self._request_scan,
+        fm_w = int(tw * 0.55)
+        self.btn_scan_band = Button((tx, 332, fm_w, 30), t("scan_button"), self._request_scan,
                                     bg_color=(214, 240, 229), active_color=C_ACCENT)
-        btns.extend([self.btn_seek_prev, self.btn_seek_next, self.btn_scan_band])
-        mw = (tw - 12) // 3
-        self.btn_wfm = Button((tx, 382, mw, 28), "WFM", lambda: self._set_mode("WFM"), bg_color=(212, 236, 248))
-        self.btn_am = Button((tx + mw + 6, 382, mw, 28), "AM", lambda: self._set_mode("AM"), bg_color=(212, 236, 248))
-        self.btn_nfm = Button((tx + 2 * (mw + 6), 382, mw, 28), "NFM", lambda: self._set_mode("NFM"), bg_color=(212, 236, 248))
-        btns.extend([self.btn_wfm, self.btn_am, self.btn_nfm])
+        self.btn_scan_sw = Button((tx + fm_w + 6, 332, tw - fm_w - 6, 30), t("scan_sw_button"),
+                                  self._request_sw_scan, bg_color=(226, 236, 248), active_color=C_ACCENT)
+        btns.extend([self.btn_seek_prev, self.btn_seek_next, self.btn_scan_band, self.btn_scan_sw])
+        gap = 4
+        mw = (tw - 5 * gap) // 6
+        mode_defs = [("WFM", (212, 236, 248)), ("AM", (212, 236, 248)), ("NFM", (212, 236, 248)),
+                     ("USB", (226, 236, 250)), ("LSB", (226, 236, 250)), ("CW", (226, 236, 250))]
+        self.mode_buttons = {}
+        for i, (name, col) in enumerate(mode_defs):
+            b = Button((tx + i * (mw + gap), 382, mw, 27), name,
+                       (lambda m=name: self._set_mode(m)), bg_color=col)
+            self.mode_buttons[name] = b
+            btns.append(b)
+        self.btn_wfm = self.mode_buttons["WFM"]
+        self.btn_am = self.mode_buttons["AM"]
+        self.btn_nfm = self.mode_buttons["NFM"]
+        # ステレオ/モノラル切替 / NR切替 / BFO微調整 (SSB・CW用)
+        gap2 = 6
+        hw = (tw - 3 * gap2) // 4
+        self.btn_stereo = Button((tx, 412, hw, 24), t("stereo"), self._toggle_stereo,
+                                 bg_color=(206, 240, 226), active_color=C_ACCENT)
+        self.btn_nr = Button((tx + hw + gap2, 412, hw, 24),
+                             f"{t('nr')}: ON", self._toggle_nr,
+                             bg_color=(226, 236, 248), active_color=C_ACCENT)
+        self.btn_bfo_down = Button((tx + 2 * (hw + gap2), 412, hw, 24), "BFO-",
+                                   lambda: self._step_bfo(-50), bg_color=(240, 243, 248))
+        self.btn_bfo_up = Button((tx + 3 * (hw + gap2), 412, hw, 24), "BFO+",
+                                 lambda: self._step_bfo(50), bg_color=(240, 243, 248))
+        btns.extend([self.btn_stereo, self.btn_nr, self.btn_bfo_down, self.btn_bfo_up])
 
         # ---- GAIN / AUDIOパネル ----
         gx, gy = self.gain_rect.x + 12, self.gain_rect.y
@@ -393,8 +450,40 @@ class SdrGui:
 
     def _request_scan(self):
         if self.on_scan_request:
-            self.scan_status_text = "全帯域スキャン実行中..."
+            self.scan_status_text = t("scanning", start=f"{self.scan_range[0]:g}",
+                                      end=f"{self.scan_range[1]:g}")
             self.on_scan_request()
+
+    def _request_sw_scan(self):
+        if self.on_sw_scan_request:
+            self.scan_status_text = t("sw_scanning")
+            self.on_sw_scan_request()
+
+    def _toggle_stereo(self):
+        if self.on_stereo_toggle:
+            self.on_stereo_toggle()
+
+    def _toggle_nr(self):
+        if self.on_nr_toggle:
+            self.on_nr_toggle()
+
+    def _step_bfo(self, delta):
+        if self.on_bfo_change:
+            self.on_bfo_change(delta)
+
+    def set_stereo_enabled(self, enabled: bool):
+        """ステレオ/モノラル切替ボタンの表示を更新"""
+        self.stereo_enabled = bool(enabled)
+        if hasattr(self, "btn_stereo"):
+            self.btn_stereo.text = t("stereo") if self.stereo_enabled else t("mono")
+            self.btn_stereo.bg_color = (206, 240, 226) if self.stereo_enabled else (246, 228, 228)
+
+    def set_nr_enabled(self, enabled: bool):
+        """ステレオNR切替ボタンの表示を更新"""
+        self.nr_enabled = bool(enabled)
+        if hasattr(self, "btn_nr"):
+            self.btn_nr.text = f"{t('nr')}: {'ON' if self.nr_enabled else 'OFF'}"
+            self.btn_nr.bg_color = (226, 236, 248) if self.nr_enabled else (236, 238, 244)
 
     def _toggle_dx(self):
         self.is_dx_mode = not self.is_dx_mode
@@ -451,34 +540,47 @@ class SdrGui:
         wf_w = self.wf_rect.width
         self.wf_surface.scroll(0, 2)
 
+        n = len(spectrum_db)
+        # 補間係数とサーフェスを事前確保 (内容が同じ間は再計算しない)
+        if (self._wf_line_surf is None or self._wf_src_n != n
+                or self._wf_line_surf.get_width() != wf_w):
+            self._wf_x_src = np.linspace(0, n - 1, wf_w)
+            self._wf_lo = np.clip(np.floor(self._wf_x_src).astype(np.int32), 0, n - 2)
+            self._wf_w = self._wf_x_src - self._wf_lo
+            self._wf_src_n = n
+            self._wf_line_surf = pygame.Surface((wf_w, 2))
+            self._wf_arr = np.empty((wf_w, 2, 3), dtype=np.uint8)
+
         norm = np.clip((spectrum_db + 70.0) / 55.0, 0.0, 1.0)
         indices = (norm * 255).astype(np.uint8)
         rgb_line = self.colormap[indices]
 
-        x_src = np.linspace(0, len(indices) - 1, wf_w)
-        r = np.interp(x_src, np.arange(len(indices)), rgb_line[:, 0]).astype(np.uint8)
-        g = np.interp(x_src, np.arange(len(indices)), rgb_line[:, 1]).astype(np.uint8)
-        b = np.interp(x_src, np.arange(len(indices)), rgb_line[:, 2]).astype(np.uint8)
+        lo, w = self._wf_lo, self._wf_w
+        r = (rgb_line[lo, 0] * (1.0 - w) + rgb_line[lo + 1, 0] * w).astype(np.uint8)
+        g = (rgb_line[lo, 1] * (1.0 - w) + rgb_line[lo + 1, 1] * w).astype(np.uint8)
+        b = (rgb_line[lo, 2] * (1.0 - w) + rgb_line[lo + 1, 2] * w).astype(np.uint8)
 
-        line_surf = pygame.Surface((wf_w, 2))
-        arr = np.stack([r, g, b], axis=-1)
-        arr2 = np.repeat(arr[:, np.newaxis, :], 2, axis=1)
-        pygame.surfarray.blit_array(line_surf, arr2)
-        self.wf_surface.blit(line_surf, (0, 0))
+        arr = self._wf_arr
+        arr[:, 0, 0] = r
+        arr[:, 0, 1] = g
+        arr[:, 0, 2] = b
+        arr[:, 1, :] = arr[:, 0, :]
+        pygame.surfarray.blit_array(self._wf_line_surf, arr)
+        self.wf_surface.blit(self._wf_line_surf, (0, 0))
 
     def _draw_chip(self, text, x, y, fill, txt_color=C_TEXT):
         font = self.font_small
         w = font.size(text)[0] + 16
         rect = pygame.Rect(x, y, w, 20)
         pygame.draw.rect(self.screen, fill, rect, border_radius=10)
-        surf = font.render(text, True, txt_color)
+        surf = cached_text(font, text, txt_color)
         self.screen.blit(surf, (x + 8, y + 3))
         return w
 
     def _draw_header(self):
         # 周波数ヒーローパネル
         self._draw_panel("hero", self.hero_rect)
-        lbl = self.font_title.render(t("freq"), True, C_MUTED)
+        lbl = cached_text(self.font_title, t("freq"), C_MUTED)
         self.screen.blit(lbl, (self.hero_rect.x + 18, self.hero_rect.y + 10))
 
         if self.center_freq >= 1000000:
@@ -487,17 +589,18 @@ class SdrGui:
         else:
             freq_str = f"{self.center_freq / 1e3:,.1f}"
             unit = "kHz"
-        freq_surf = self.font_huge.render(freq_str, True, C_TEXT)
+        freq_surf = cached_text(self.font_huge, freq_str, C_TEXT)
         self.screen.blit(freq_surf, (self.hero_rect.x + 16, self.hero_rect.y + 22))
-        unit_surf = self.font_med.render(unit, True, C_ACCENT_DARK)
+        unit_surf = cached_text(self.font_med, unit, C_ACCENT_DARK)
         self.screen.blit(unit_surf, (self.hero_rect.x + 20 + freq_surf.get_width(), self.hero_rect.y + 48))
 
-        # 局名 (既知局データベース or 検出リストから表示)
-        st_name = ""
-        for st in self.detected_stations:
-            if abs(st["freq_hz"] - self.center_freq) <= 50000:
-                st_name = st["name"]
-                break
+        # 局名 (RDS PS / 番組表 / 既知局DB / 検出リストの優先順)
+        st_name = self.station_name
+        if not st_name:
+            for st in self.detected_stations:
+                if abs(st["freq_hz"] - self.center_freq) <= 50000:
+                    st_name = st["name"]
+                    break
         if not st_name:
             try:
                 from auto_tuner import match_station_name
@@ -507,7 +610,7 @@ class SdrGui:
             except Exception:
                 st_name = ""
         if st_name:
-            name_surf = self.font_small.render(st_name, True, C_MUTED)
+            name_surf = cached_text(self.font_small, st_name, C_MUTED)
             self.screen.blit(name_surf, (self.hero_rect.x + 20, self.hero_rect.y + 68))
 
         # 情報パネル (モード/音量/ゲイン + テレメトリ)
@@ -519,12 +622,17 @@ class SdrGui:
         w1 = self._draw_chip(f"MODE {self.mode}", x0, y0, (210, 236, 246))
         w2 = self._draw_chip(f"VOL {int(self.volume * 100)}%", x0 + w1 + 6, y0, (226, 222, 246))
         w3 = self._draw_chip(f"GAIN {gain_txt}", x0 + w1 + w2 + 12, y0, (246, 232, 210))
-        st_txt = t("stereo") if self.is_stereo else t("mono")
-        self._draw_chip(st_txt, x0 + w1 + w2 + w3 + 18, y0,
-                        (206, 240, 226) if self.is_stereo else (236, 238, 244))
+        status = getattr(self, "stereo_status", None) or ("STEREO" if self.is_stereo else "MONO")
+        if status == "STEREO":
+            st_txt, st_col = t("stereo"), (206, 240, 226)
+        elif status == "BLEND":
+            st_txt, st_col = t("blend"), (250, 234, 206)
+        else:
+            st_txt, st_col = t("mono"), (236, 238, 244)
+        self._draw_chip(st_txt, x0 + w1 + w2 + w3 + 18, y0, st_col)
 
         if self.region_label:
-            rl = self.font_tiny.render(f"{t('region')}: {self.region_label}", True, C_MUTED)
+            rl = cached_text(self.font_tiny, f"{t('region')}: {self.region_label}", C_MUTED)
             self.screen.blit(rl, (self.hero_rect.right - 12 - rl.get_width(), self.hero_rect.y + 68))
 
         # テレメトリ (「|」区切りをチップ化して2行に)
@@ -549,7 +657,7 @@ class SdrGui:
             gx = r.x + int(r.width * i / 8)
             pygame.draw.line(self.screen, (28, 36, 52), (gx, r.y + 4), (gx, r.bottom - 4), 1)
 
-        lbl = self.font_tiny.render(t("spectrum"), True, (110, 128, 150))
+        lbl = cached_text(self.font_tiny, t("spectrum"), (110, 128, 150))
         self.screen.blit(lbl, (r.x + 12, r.y + 8))
 
         if len(spectrum_db) > 1:
@@ -559,9 +667,11 @@ class SdrGui:
             norm = np.nan_to_num(norm, nan=0.0, posinf=1.0, neginf=0.0)
             xs = np.linspace(0, len(norm) - 1, pw)
             ys = np.interp(xs, np.arange(len(norm)), norm)
-            px = np.linspace(r.x + 4, r.right - 4, pw)
+            if self._spec_px is None or len(self._spec_px) != pw:
+                self._spec_px = np.linspace(r.x + 4, r.right - 4, pw)
+            px = self._spec_px
             py = r.bottom - 10 - ys * (r.height - 34)
-            pts = [(float(a), float(b)) for a, b in zip(px, py)]
+            pts = np.stack((px, py), axis=1).tolist()
 
             poly = [(r.x + 4, r.bottom - 4)] + pts + [(r.right - 4, r.bottom - 4)]
             pygame.draw.polygon(self.screen, (14, 78, 88), poly)
@@ -587,13 +697,13 @@ class SdrGui:
                 color = (58, 200, 140) if st["quality"] == "STRONG" else (230, 178, 75) if st["quality"] == "MEDIUM" else (186, 130, 210)
                 pygame.draw.polygon(self.screen, color,
                                     [(m_x, r.y + 16), (m_x - 5, r.y + 6), (m_x + 5, r.y + 6)])
-                lbl = self.font_tiny.render(f"{st['freq_mhz']:.1f}", True, color)
+                lbl = cached_text(self.font_tiny, f"{st['freq_mhz']:.1f}", color)
                 self.screen.blit(lbl, (m_x - 11, r.y + 18))
 
         f_start = (self.center_freq - self.sample_rate / 2) / 1e6
         f_end = (self.center_freq + self.sample_rate / 2) / 1e6
-        l1 = self.font_tiny.render(f"{f_start:.3f} MHz", True, (150, 166, 190))
-        l2 = self.font_tiny.render(f"{f_end:.3f} MHz", True, (150, 166, 190))
+        l1 = cached_text(self.font_tiny, f"{f_start:.3f} MHz", (150, 166, 190))
+        l2 = cached_text(self.font_tiny, f"{f_end:.3f} MHz", (150, 166, 190))
         self.screen.blit(l1, (r.x + 12, r.bottom - 18))
         self.screen.blit(l2, (r.right - 86, r.bottom - 18))
 
@@ -604,13 +714,13 @@ class SdrGui:
         pygame.draw.rect(self.screen, (60, 76, 100), self.wf_rect, width=1, border_radius=14)
         cx = self.wf_rect.centerx
         pygame.draw.line(self.screen, C_GOLD, (cx, self.wf_rect.y + 2), (cx, self.wf_rect.bottom - 2), 1)
-        lbl = self.font_tiny.render(t("waterfall"), True, (110, 128, 150))
+        lbl = cached_text(self.font_tiny, t("waterfall"), (110, 128, 150))
         self.screen.blit(lbl, (self.wf_rect.x + 12, self.wf_rect.y + 6))
 
     def _draw_waveform(self, audio_pcm):
         self._draw_panel("wave", self.wave_rect)
         r = self.wave_rect
-        lbl = self.font_tiny.render(t("waveform"), True, (110, 128, 150))
+        lbl = cached_text(self.font_tiny, t("waveform"), (110, 128, 150))
         self.screen.blit(lbl, (r.x + 12, r.y + 5))
         if audio_pcm is None or len(audio_pcm) < 32:
             return
@@ -620,13 +730,17 @@ class SdrGui:
         seg = max(1, n // pw)
         m = (n // seg) * seg
         env = np.max(np.abs(chunk[-m:].reshape(-1, seg)), axis=1).astype(np.float32)
-        peak = max(0.01, float(np.percentile(env, 99)))
+        k = int(0.99 * (len(env) - 1)) if len(env) > 1 else 0
+        peak = max(0.01, float(np.partition(env, k)[k])) if len(env) else 0.01
         env = np.clip(env / peak * 0.92, 0.0, 1.0)
-        xs = np.linspace(r.x + 12, r.right - 12, len(env))
+        # 座標配列は長さが変わった時だけ再生成 (O(n)リスト内包をCレベルのtolistへ)
+        if self._wave_xs is None or len(self._wave_xs) != len(env):
+            self._wave_xs = np.linspace(r.x + 12, r.right - 12, len(env))
+        xs = self._wave_xs
         mid = r.centery + 7
         amp = r.height / 2 - 13
-        top = [(float(x), float(mid - e * amp)) for x, e in zip(xs, env)]
-        bot = [(float(x), float(mid + e * amp)) for x, e in zip(xs, env)]
+        top = np.stack((xs, mid - env * amp), axis=1).tolist()
+        bot = np.stack((xs, mid + env * amp), axis=1).tolist()
         if len(top) >= 2:
             pygame.draw.polygon(self.screen, (14, 78, 88), top + bot[::-1])
             pygame.draw.lines(self.screen, (0, 220, 184), False, top, 1)
@@ -634,14 +748,14 @@ class SdrGui:
 
     def _draw_telemetry(self):
         self._draw_panel("tele", self.tele_rect)
-        lbl = self.font_title.render(t("status"), True, C_MUTED)
+        lbl = cached_text(self.font_title, t("status"), C_MUTED)
         self.screen.blit(lbl, (self.tele_rect.x + 14, self.tele_rect.y + 8))
         parts = [p.strip() for p in self.telemetry_text.split("|") if p.strip()]
         for i, part in enumerate(parts[:6]):
             col, row = i // 3, i % 3
             x = self.tele_rect.x + 14 + col * 132
             y = self.tele_rect.y + 28 + row * 16
-            surf = self.font_small.render(part, True, C_TEXT)
+            surf = cached_text(self.font_small, part, C_TEXT)
             self.screen.blit(surf, (x, y))
 
         # 音量 / ゲインのスリムインジケータ
@@ -656,32 +770,31 @@ class SdrGui:
     def _draw_controls(self):
         # TUNINGパネル
         self._draw_panel("tune", self.tune_rect)
-        lbl = self.font_title.render(t("tuning"), True, C_MUTED)
+        lbl = cached_text(self.font_title, t("tuning"), C_MUTED)
         self.screen.blit(lbl, (self.tune_rect.x + 14, self.tune_rect.y + 8))
-        lbl2 = self.font_tiny.render(t("mode"), True, C_MUTED)
+        lbl2 = cached_text(self.font_tiny, t("mode"), C_MUTED)
         self.screen.blit(lbl2, (self.tune_rect.x + 14, self.tune_rect.y + 156))
 
         # GAIN/AUDIOパネル
         self._draw_panel("gain", self.gain_rect)
-        lbl = self.font_title.render(t("gain_audio"), True, C_MUTED)
+        lbl = cached_text(self.font_title, t("gain_audio"), C_MUTED)
         self.screen.blit(lbl, (self.gain_rect.x + 14, self.gain_rect.y + 6))
 
         # プリセットパネル
         self._draw_panel("preset", self.preset_rect)
-        self.screen.blit(self.font_tiny.render("FM", True, C_MUTED), (self.preset_rect.x + 16, 578))
-        self.screen.blit(self.font_tiny.render("AM", True, C_MUTED), (self.preset_rect.x + 16, 606))
+        self.screen.blit(cached_text(self.font_tiny, "FM", C_MUTED), (self.preset_rect.x + 16, 578))
+        self.screen.blit(cached_text(self.font_tiny, "AM", C_MUTED), (self.preset_rect.x + 16, 606))
 
         # ステータスバー
         self._draw_panel("status", self.status_rect)
-        st_surf = self.font_small.render(f"{t('rx_status')}: {self.scan_status_text}", True, C_ACCENT_DARK)
+        st_surf = cached_text(self.font_small, f"{t('rx_status')}: {self.scan_status_text}", C_ACCENT_DARK)
         self.screen.blit(st_surf, (self.status_rect.x + 16, self.status_rect.y + 6))
-        cnt = self.font_small.render(f"{t('detected')}: {len(self.detected_stations)}", True, C_MUTED)
+        cnt = cached_text(self.font_small, f"{t('detected')}: {len(self.detected_stations)}", C_MUTED)
         self.screen.blit(cnt, (self.status_rect.right - 110, self.status_rect.y + 6))
 
         # 全ボタン描画 (アクティブ状態更新)
-        self.btn_wfm.is_active = (self.mode == "WFM")
-        self.btn_am.is_active = (self.mode == "AM")
-        self.btn_nfm.is_active = (self.mode == "NFM")
+        for name, b in self.mode_buttons.items():
+            b.is_active = (self.mode == name)
         for btn in self.buttons:
             btn.draw(self.screen, self.font_small)
 

@@ -19,7 +19,10 @@ from gui import SdrGui, show_message_screen
 from cascade_controller import CascadeController
 from hyper_controller import HyperController
 from auto_tuner import AutoTuner, match_station_name
-from config import load_config, save_config, detect_country, detect_language, region_profile, LOG_PATH
+import sw_schedule
+from rt_profile import RtProfile
+from config import (load_config, save_config, detect_country, detect_language,
+                    region_profile, LOG_PATH, shortwave_band_name)
 from i18n import set_language as i18n_set_language, get_language as i18n_language, t
 
 
@@ -47,6 +50,9 @@ class SdrApp:
         self.audio_rate = 48000
         self.controller_type = controller_type
 
+        # RT締切プロファイル (1ブロック=66048IQ@1.152MHz ≒ 57.3ms)
+        self.rt_profile = RtProfile(budget_ms=57.3)
+
         # ハードウェアドライバ
         self.driver = RtlSdrDriver()
         # DSPパイプライン
@@ -54,6 +60,7 @@ class SdrApp:
         # 地域規格 (ディエンファシス 50/75μs) とステレオ設定を適用
         self.dsp.set_deemphasis(self.profile["deemphasis_us"])
         self.dsp.set_stereo_enabled(self.config.get("stereo", True))
+        self.dsp.set_stereo_nr(self.config.get("stereo_nr", True))
         # オーディオ出力
         self.audio = AudioOutput(self.audio_rate)
         self.audio.set_volume(float(self.config.get("volume", 0.7)))
@@ -91,8 +98,15 @@ class SdrApp:
         self.gui.on_filter_change = lambda m: self.cmd_queue.put(("FILTER", m))
         self.gui.on_seek_change = lambda d: self.cmd_queue.put(("SEEK", d))
         self.gui.on_scan_request = lambda: self.cmd_queue.put(("SCAN", None))
+        self.gui.on_sw_scan_request = lambda: self.cmd_queue.put(("SW_SCAN", None))
+        self.gui.on_stereo_toggle = lambda: self.cmd_queue.put(("STEREO_TOGGLE", None))
+        self.gui.on_nr_toggle = lambda: self.cmd_queue.put(("NR_TOGGLE", None))
+        self.gui.on_bfo_change = lambda d: self.cmd_queue.put(("BFO", d))
         self.gui.on_dx_toggle = lambda en: self.cmd_queue.put(("DX", en))
         self.gui.on_afc_toggle = lambda en: self.cmd_queue.put(("AFC", en))
+        # 起動時のステレオ/NR状態をボタン表示へ反映
+        self.gui.set_stereo_enabled(self.config.get("stereo", True))
+        self.gui.set_nr_enabled(self.config.get("stereo_nr", True))
 
         self.gui.center_freq = self.freq
         self.gui.mode = self.mode
@@ -145,6 +159,29 @@ class SdrApp:
         save_config(self.config)
         self.gui.set_presets(fm_presets, self.config.get("presets_am") or [])
 
+    def _update_presets_from_sw_scan(self, stations):
+        """短波スキャン結果からAMプリセットを生成し、設定へ保存"""
+        if not stations:
+            return
+        top = sorted(stations, key=lambda s: s["snr_db"], reverse=True)[:7]
+        am_presets = []
+        for s in top:
+            name = ""
+            try:
+                hit = sw_schedule.lookup(s["freq_hz"], tolerance_hz=2500)
+                if hit and hit["station"]:
+                    name = hit["station"][:13]
+            except Exception:
+                pass
+            if not name:
+                name = f"{shortwave_band_name(s['freq_hz'])} {s['freq_mhz']:.2f}"
+            am_presets.append({"name": name, "freq_hz": int(s["freq_hz"]), "mode": "AM"})
+        am_presets.sort(key=lambda p: p["freq_hz"])
+        self.config["presets_am"] = am_presets
+        self.config["presets_region"] = self.profile["region"]
+        save_config(self.config)
+        self.gui.set_presets(self.config.get("presets_fm") or [], am_presets)
+
     def init_hardware(self):
         """RTL-SDRデバイスの初期化"""
         dev_count = self.driver.get_device_count()
@@ -190,8 +227,11 @@ class SdrApp:
         # AM中波帯 (24MHz未満) の場合はダイレクトサンプリング (Q-branch = 2) を自動有効化
         if freq < 24000000:
             self.driver.set_direct_sampling(2)
-            self.driver.set_center_freq(freq)
-            self.dsp.set_offset_freq(0.0)
+            # ダイレクトサンプリングはDC付近に巨大なスパイクがあるため、キャリアを
+            # +150kHzずらして受信しDSP側で戻す (スパイクがAM復調を汚染しない)
+            offset = 150000
+            self.driver.set_center_freq(freq + offset)
+            self.dsp.set_offset_freq(offset)
         else:
             self.driver.set_direct_sampling(0)
             # DCスパイクを避けるため +150kHz オフセットしてチューニング
@@ -199,9 +239,23 @@ class SdrApp:
             self.driver.set_center_freq(freq + offset)
             self.dsp.set_offset_freq(offset)
 
-        st_name = match_station_name(freq)
+        # ノイズ推定履歴をリセット (選局先の電界強度へ素早く追従)
+        self.dsp.reset_stereo_nr()
+
+        # 短波(HF)は番組表DBから実局名を引く
+        st_name = ""
+        if freq < 24000000:
+            try:
+                hit = sw_schedule.lookup(freq, tolerance_hz=2500)
+                if hit:
+                    st_name = hit["name"]
+            except Exception:
+                pass
+        if not st_name:
+            st_name = match_station_name(freq)
         if st_name == "Unknown FM Station":
             st_name = t("station_unknown")
+        self.gui.station_name = "" if st_name == t("station_unknown") else st_name
         self.gui.scan_status_text = t("receiving", freq=f"{freq / 1e6:.2f}") + f" - {st_name}"
 
         # 選局変更時は探索状態をリセットして新局へ即座に適応
@@ -302,6 +356,37 @@ class SdrApp:
                 self.gui.scan_status_text = t("auto_tuned", freq=f"{best_station['freq_mhz']:.2f}", snr=f"{best_station['snr_db']:+.1f}")
             return stations
 
+        def safe_hf_scan(status_label: str):
+            """短波(HF)放送バンドをスキャンし、AMプリセットを更新する"""
+            nonlocal t_usb
+            self.gui.scan_status_text = status_label
+            stop_usb_stream(t_usb)
+            stations = []
+            try:
+                stations = self.tuner.scan_band_hf(snr_threshold=6.5)
+                self.gui.detected_stations = stations
+                self._update_presets_from_sw_scan(stations)
+            except Exception as e:
+                print(f"[ERROR] Shortwave scan failed: {e}", file=sys.stderr)
+            finally:
+                try:
+                    restore_after_scan()
+                except Exception as e:
+                    print(f"[ERROR] Failed to restore receiver after scan: {e}", file=sys.stderr)
+                t_usb = start_usb_stream()
+
+            if stations:
+                best = max(stations, key=lambda s: s["snr_db"])
+                self._apply_frequency_and_mode(best["freq_hz"], "AM")
+                self.gui.center_freq = best["freq_hz"]
+                self.gui.mode = "AM"
+                self.gui.scan_status_text = t(
+                    "sw_scan_done", n=len(stations),
+                    freq=f"{best['freq_mhz']:.3f}", snr=f"{best['snr_db']:+.1f}")
+            else:
+                self.gui.scan_status_text = t("sw_scan_none")
+            return stations
+
         t_usb = start_usb_stream()
 
         while self.running:
@@ -374,6 +459,27 @@ class SdrApp:
                     elif cmd == "SCAN":
                         # 全帯域スキャン (USBストリームを安全に停止してスイープ)
                         safe_band_scan(t("scanning", start=f"{self.profile['fm_start']:g}", end=f"{self.profile['fm_end']:g}"), auto_best=(val == "auto_best"))
+                    elif cmd == "SW_SCAN":
+                        # 短波(HF)放送バンドスキャン (ダイレクトサンプリング)
+                        safe_hf_scan(t("sw_scanning"))
+                    elif cmd == "STEREO_TOGGLE":
+                        enabled = not bool(getattr(self.dsp, "stereo_enabled", True))
+                        self.dsp.set_stereo_enabled(enabled)
+                        self.config["stereo"] = enabled
+                        save_config(self.config)
+                        self.gui.set_stereo_enabled(enabled)
+                        self.gui.scan_status_text = t("stereo_on_msg") if enabled else t("mono_on_msg")
+                    elif cmd == "BFO":
+                        bfo = float(np.clip(self.dsp.bfo_offset_hz + float(val), -2000.0, 2000.0))
+                        self.dsp.bfo_offset_hz = bfo
+                        self.gui.scan_status_text = t("bfo_msg", hz=f"{bfo:+.0f}")
+                    elif cmd == "NR_TOGGLE":
+                        enabled = not bool(getattr(self.dsp, "stereo_nr_enabled", True))
+                        self.dsp.set_stereo_nr(enabled)
+                        self.config["stereo_nr"] = enabled
+                        save_config(self.config)
+                        self.gui.set_nr_enabled(enabled)
+                        self.gui.scan_status_text = t("nr_on_msg") if enabled else t("nr_off_msg")
 
                     elif cmd == "DX":
                         # DX超高感度モード
@@ -402,9 +508,17 @@ class SdrApp:
                 self.dsp.update_resampler_feedback(float(q_size))
 
                 # DSP復調処理 (適応リサンプラによる完全無欠損ストリーミング)
+                t_dsp = time.perf_counter()
                 audio_pcm, spectrum_db = self.dsp.process(raw_bytes, mode=self.mode)
+                self.rt_profile.add((time.perf_counter() - t_dsp) * 1000.0)
                 # ステレオ/モノラル状態をGUIへ反映
                 self.gui.is_stereo = bool(getattr(self.dsp, "is_stereo", False))
+                self.gui.stereo_status = getattr(self.dsp, "stereo_status", "MONO")
+                # RDS PS名が取れたら局名として優先表示 (FM海外局)
+                if self.mode == "WFM":
+                    rds_ps = getattr(self.dsp, "rds_ps", "")
+                    if rds_ps and rds_ps != self.gui.station_name:
+                        self.gui.station_name = rds_ps
 
                 # 自律最適化ループ (Hyperは復調音声そのものを聴感評価に使用)
                 if self.use_controller:
@@ -442,18 +556,25 @@ class SdrApp:
                         sync_tag = "LOCK" if abs(drift) < 0.5 else f"{drift:+.0f}ppm"
                         afc_val = self.dsp.nfm_afc_offset_hz if self.mode == "NFM" else self.dsp.afc_offset_hz
                         afc_str = f"AFC:{afc_val:+.0f}Hz" if abs(afc_val) >= 1.0 else "AFC:0Hz"
-                        self.gui.telemetry_text = (
+                        su = self.dsp.s_units
+                        s_txt = f"S9+{su - 9:.0f}dB" if su >= 9.0 else f"S{max(0.0, su):.0f}"
+                        txt = (
                             f"C/N {stats.get('channel_snr_db', stats['estimated_snr']):.1f}dB | "
                             f"Aud {stats.get('audio_snr_db', 0.0):.1f}dB | "
-                            f"Ant:{ant_tag} | "
+                            f"{s_txt} | {self.rt_profile.summary()} | Ant:{ant_tag} | "
                             f"Sync:{sync_tag} | {afc_str} | {lock_tag}"
                         )
                     else:
                         lock_str = t("lock_fixed") if hard_locked else (t("lock_converged") if stats["converged"] else t("lock_searching"))
-                        self.gui.telemetry_text = (
+                        txt = (
                             f"Cascade SNR {stats['estimated_snr']:.1f}dB | IQ {stats['iq_std']:.0f} | "
-                            f"Gain {stats['gain_db']:.1f}dB | {lock_str}"
+                            f"{self.rt_profile.summary()} | Gain {stats['gain_db']:.1f}dB | {lock_str}"
                         )
+                    # テレメトリ表示は5Hzに間引き (GUI描画/GIL競合の低減)
+                    now_t = time.time()
+                    if now_t - getattr(self, "_last_telemetry_time", 0.0) >= 0.2:
+                        self._last_telemetry_time = now_t
+                        self.gui.telemetry_text = txt
 
                 # 音声キューへ転送
                 self.audio.put_audio(audio_pcm)
@@ -476,6 +597,8 @@ class SdrApp:
     def run(self):
         """アプリケーションのメインループ"""
         print("[*] Starting Antigravity Full-Scratch SDR Radio...")
+        # 短波番組表をバックグラウンドで取得 (オフラインでも動作継続)
+        threading.Thread(target=sw_schedule.load_schedule, daemon=True).start()
         print(f"[*] Region: {self.profile['region']} ({self.profile['label']}), "
               f"language: {i18n_language()}, stereo: {self.config.get('stereo', True)}")
         try:
@@ -537,8 +660,9 @@ def main():
     parser = argparse.ArgumentParser(description="Antigravity Full-Scratch SDR Radio")
     parser.add_argument("--freq", type=float, default=None,
                         help="Initial frequency in MHz (default: region profile)")
-    parser.add_argument("--mode", type=str, default=None, choices=["WFM", "AM", "NFM"],
-                        help="Demodulation mode (WFM / AM / NFM)")
+    parser.add_argument("--mode", type=str, default=None,
+                        choices=["WFM", "AM", "NFM", "USB", "LSB", "CW"],
+                        help="Demodulation mode (WFM / AM / NFM / USB / LSB / CW)")
     parser.add_argument("--controller", type=str, default="hyper", choices=["hyper", "cascade"],
                         help="Autonomous optimization engine (hyper / cascade)")
     parser.add_argument("--country", type=str, default=None,
@@ -546,6 +670,8 @@ def main():
     parser.add_argument("--lang", type=str, default=None, choices=["ja", "en"],
                         help="UI language override. Default: auto-detect")
     parser.add_argument("--mono", action="store_true", help="Force monaural FM (disable stereo)")
+    parser.add_argument("--no-stereo-nr", action="store_true",
+                        help="Disable stereo noise reduction (keep full stereo even when noisy)")
     args = parser.parse_args()
 
     cfg = load_config()
@@ -555,6 +681,8 @@ def main():
     i18n_set_language(language)
     if args.mono:
         cfg["stereo"] = False
+    if args.no_stereo_nr:
+        cfg["stereo_nr"] = False
 
     freq_hz = int(args.freq * 1e6) if args.freq is not None else None
     app = SdrApp(initial_freq=freq_hz, initial_mode=args.mode,

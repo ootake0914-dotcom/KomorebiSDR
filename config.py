@@ -123,12 +123,65 @@ def region_profile(country: str) -> dict:
 
 
 # ----------------------------------------------------------------------
+# 短波 (HF) 放送バンド (kHz)
+#   RTL-SDRのダイレクトサンプリングで受信可能な ~14.4MHz 以下を対象。
+#   それ以上のバンドはアップコンバータが必要。
+# ----------------------------------------------------------------------
+SHORTWAVE_BANDS = [
+    ("120m", 2300, 2495),
+    ("90m", 3200, 3400),
+    ("75m", 3900, 4000),
+    ("60m", 4750, 5060),
+    ("49m", 5900, 6200),
+    ("41m", 7200, 7450),
+    ("31m", 9400, 9900),
+    ("25m", 11600, 12100),
+    ("22m", 13570, 13870),
+]
+
+SW_MAX_HZ = 14400000  # ダイレクトサンプリングの実用上限
+
+
+def shortwave_band_name(freq_hz: int) -> str:
+    """周波数から短波放送バンド名 (49m等) を返す"""
+    for name, lo_khz, hi_khz in SHORTWAVE_BANDS:
+        if lo_khz * 1000 <= freq_hz <= hi_khz * 1000:
+            return name
+    return "SW"
+
+
+def shortwave_scan_centers(rate_hz: float, bands=None, usable_max_hz: int = SW_MAX_HZ,
+                           overlap_hz: int = 100000) -> list:
+    """短波バンドを覆うセンタ周波数リストを生成 (各帯域は窓幅で確実にカバー)"""
+    bands = bands if bands is not None else SHORTWAVE_BANDS
+    centers = []
+    half = rate_hz / 2.0 - overlap_hz
+    if half <= 0:
+        return centers
+    step = 2.0 * half
+    for _name, lo_khz, hi_khz in bands:
+        lo = lo_khz * 1000
+        hi = min(hi_khz * 1000, usable_max_hz)
+        if hi <= lo:
+            continue
+        fc = lo + half
+        while True:
+            centers.append(int(round(min(fc, hi - half))))
+            if fc + half >= hi:
+                break
+            fc += step
+    return sorted(set(centers))
+
+
+# ----------------------------------------------------------------------
 # 設定ファイル
 # ----------------------------------------------------------------------
 DEFAULT_CONFIG = {
     "country": None,          # None = OSロケールから自動判定
     "language": None,         # None = OSロケールから自動判定 ("ja" / "en")
     "volume": 0.7,
+    "stereo": True,           # FMステレオ復調
+    "stereo_nr": True,        # ステレオノイズリダクション (弱電界ヒス対策)
     "presets_fm": [],         # [{"name": str, "freq_hz": int}, ...]
     "presets_am": [],
     "presets_region": None,   # プリセットを生成した地域 (地域変更で無効化)
