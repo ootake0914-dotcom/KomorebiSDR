@@ -29,6 +29,7 @@ TESTS = [
     "test_station_list.py",
     "test_server.py",
     "test_resampler.py",
+    "test_audio_device.py",
     "test_mock_worker.py",
 ]
 

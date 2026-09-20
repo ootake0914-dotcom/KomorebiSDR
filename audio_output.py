@@ -31,6 +31,10 @@ class AudioOutput:
         self.stream = None
         self.is_running = False
         self.is_prerolled = False
+        self.current_device = None
+        self._last_default_name = None
+        self._device_watch_thread = None
+        self._device_watch_stop = threading.Event()
         self.preroll_threshold = 8  # 深層ジッターバッファ: 約400ms (8チャンク) 蓄積して完全安定再生
         self.last_out_samples = np.zeros(2, dtype=np.float32)
 
@@ -203,6 +207,129 @@ class AudioOutput:
             except Exception:
                 pass
 
+    def _open_stream(self, device_idx=None):
+        """指定デバイス(既定出力)でストリームを開いて再生開始する。
+        デバイスは明示指定で固定し、後続の監視で変更を検出する。"""
+        kwargs = dict(
+            samplerate=self.sample_rate,
+            blocksize=self.blocksize,
+            channels=2,
+            dtype="float32",
+            callback=self._audio_callback,
+        )
+        if device_idx is not None:
+            kwargs["device"] = int(device_idx)
+        s = sd.OutputStream(**kwargs)
+        s.start()
+        self.stream = s
+        self.current_device = device_idx
+        self.is_running = True
+        self.is_prerolled = False
+
+    @staticmethod
+    def _default_output_index(devices=None) -> int | None:
+        """Windows既定の再生デバイスインデックスを返す。
+        - 古いsounddeviceは is_default_output_device を持つ
+        - 現行sounddeviceは持たないため、Core Audio (MMDevice) で既定出力の
+          フレンドリ名を取得し、PortAudioデバイス名と突合する
+        検出できない場合は None (現状維持)。"""
+        try:
+            if devices is None:
+                devices = sd.query_devices()
+            for d in devices:
+                if (d.get("is_default_output_device")
+                        and d.get("max_output_channels", 0) > 0):
+                    return int(d["index"])
+        except Exception:
+            pass
+        # Core Audio 経由 (Windows動的検出)
+        try:
+            from win_audio import _win_default_output_name
+            name = _win_default_output_name()
+            if name:
+                return AudioOutput._match_output_index(name, None)
+        except Exception:
+            pass
+        return None
+
+    @staticmethod
+    def _match_output_index(name: str, current_index=None) -> int | None:
+        """フレンドリ名に一致するPortAudio出力デバイスを返す。
+        現在デバイスと同じホストAPIを優先し、無ければホストAPI昇順で最初の一致。"""
+        try:
+            devs = sd.query_devices()
+            cur_host = None
+            if current_index is not None:
+                for d in devs:
+                    if int(d["index"]) == int(current_index):
+                        cur_host = d["hostapi"]
+                        break
+            cands = [d for d in devs
+                     if d.get("max_output_channels", 0) > 0
+                     and name.strip().lower() in d["name"].lower()]
+            if not cands:
+                return None
+            if cur_host is not None:
+                for d in cands:
+                    if d["hostapi"] == cur_host:
+                        return int(d["index"])
+            cands.sort(key=lambda d: d["hostapi"])
+            return int(cands[0]["index"])
+        except Exception:
+            return None
+
+    def _reopen_for_device(self, device_idx):
+        """デバイス変更 (イヤホン挿抜等) でストリームを開き直す。
+        キューとリミッタ状態は保持し、再プレロールで滑らかに再接続する。"""
+        if self.stream is not None:
+            try:
+                self.stream.stop()
+                self.stream.close()
+            except Exception:
+                pass
+            self.stream = None
+        self.is_prerolled = False
+        try:
+            self._open_stream(device_idx)
+        except Exception:
+            self.stream = None
+            self.is_running = False
+
+    def _start_device_watch(self):
+        """Windows既定再生デバイスを監視し、変更時にストリームを再オープンする。
+        (イヤホン挿抜はWindowsが既定デバイスを切替えるが、開いたストリームは
+        旧デバイスに張り付いたまま無音になるため)"""
+        self._device_watch_stop.clear()
+        try:
+            from win_audio import _win_default_output_name
+            self._last_default_name = _win_default_output_name()
+        except Exception:
+            self._last_default_name = None
+
+        def loop():
+            last = self._last_default_name
+            while not self._device_watch_stop.is_set():
+                try:
+                    if self.is_running:
+                        try:
+                            from win_audio import _win_default_output_name
+                            name = _win_default_output_name()
+                        except Exception:
+                            name = None
+                        if name is not None and name != last:
+                            last = name
+                            self._last_default_name = name
+                            idx = self._match_output_index(name, self.current_device)
+                            if idx is not None and idx != self.current_device:
+                                self._reopen_for_device(idx)
+                except Exception:
+                    pass
+                self._device_watch_stop.wait(1.0)
+
+        t = threading.Thread(target=loop, daemon=True, name="audio-device-watch")
+        self._device_watch_thread = t
+        t.start()
+
     def start(self):
         if self.is_running:
             return
@@ -211,22 +338,20 @@ class AudioOutput:
         self.last_out_samples = np.zeros(2, dtype=np.float32)
         self._lim_delay = np.zeros((self._lim_delay_n, 2), dtype=np.float32)
         self._lim_env = 0.0
+        dev = self._default_output_index()
         try:
-            self.stream = sd.OutputStream(
-                samplerate=self.sample_rate,
-                blocksize=self.blocksize,
-                channels=2,
-                dtype="float32",
-                callback=self._audio_callback,
-            )
-            self.stream.start()
-            self.is_running = True
+            self._open_stream(dev)
         except Exception:
             # オーディオデバイスが無い環境でも受信自体は継続する (無音)
             self.stream = None
             self.is_running = False
+        self._start_device_watch()
 
     def stop(self):
+        self._device_watch_stop.set()
+        if self._device_watch_thread is not None:
+            self._device_watch_thread.join(timeout=1.5)
+            self._device_watch_thread = None
         if not self.is_running:
             return
         self.is_running = False
