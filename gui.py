@@ -6,6 +6,7 @@ Pygame-based SDR GUI Module - Frosted Glass Edition.
 
 import numpy as np
 import pygame
+import time
 from collections import OrderedDict
 
 from i18n import t
@@ -85,6 +86,54 @@ def show_message_screen(title: str, lines: list, width: int = 760, height: int =
 # 毎フレームの font.render (ラスタライズ) を排除。内容が変わった時だけ再生成する。
 _TEXT_CACHE = OrderedDict()
 _TEXT_CACHE_MAX = 512
+
+
+def find_spectrum_peaks(spectrum_db, sample_rate: float, center_freq: float,
+                        top_n: int = 14, min_snr_db: float = 6.0,
+                        min_sep_hz: float = 25000.0) -> list:
+    """表示スペクトラムからliveピークを抽出 (スキャン不要のワンクリック選局用)。
+    ノイズフロア=中央値、局所最大＋3点放物線補間で周波数を精密化し、
+    min_sep_hzで間引いた上位top_n件を返す。
+    戻り値: [{"freq_hz": float, "snr_db": float, "db": float}] (snr降順)。
+    """
+    try:
+        spec = np.asarray(spectrum_db, dtype=np.float64)
+    except Exception:
+        return []
+    n = len(spec)
+    if n < 8 or not np.isfinite(sample_rate) or sample_rate <= 0:
+        return []
+    spec = np.nan_to_num(spec, nan=-120.0, posinf=0.0, neginf=-120.0)
+    floor = float(np.partition(spec, n // 2)[n // 2])
+    if not np.isfinite(floor):
+        return []
+    inner = spec[1:-1]
+    is_peak = ((inner > spec[:-2]) & (inner >= spec[2:])
+               & (inner >= floor + min_snr_db))
+    idx = np.flatnonzero(is_peak) + 1
+    if len(idx) == 0:
+        return []
+    # 3点放物線補間 (ビン内精度)
+    denom = (spec[idx - 1] - 2.0 * spec[idx] + spec[idx + 1])
+    shift = np.zeros(len(idx))
+    nz = denom != 0.0
+    shift[nz] = 0.5 * (spec[idx[nz] - 1] - spec[idx[nz] + 1]) / denom[nz]
+    shift = np.clip(shift, -0.5, 0.5)
+    order = np.argsort(spec[idx])[::-1]
+    peaks = []
+    taken_hz = []
+    for k in order:
+        b = float(idx[k]) + float(shift[k])
+        f_hz = center_freq - sample_rate / 2.0 + b / n * sample_rate
+        if any(abs(f_hz - t) < min_sep_hz for t in taken_hz):
+            continue
+        taken_hz.append(f_hz)
+        peaks.append({"freq_hz": float(f_hz),
+                      "snr_db": float(spec[idx[k]] - floor),
+                      "db": float(spec[idx[k]])})
+        if len(peaks) >= top_n:
+            break
+    return peaks
 
 
 def cached_text(font, text, color):
@@ -246,6 +295,9 @@ class SdrGui:
         self.presets_fm = []
         self.presets_am = []
         self.detected_stations = []
+        self.live_peaks = []          # 表示中スペクトラムのliveピーク (ワンクリック選局用)
+        self._last_peak_time = 0.0    # liveピーク更新時刻 (5Hz間引き)
+        self.hover_freq_hz = None     # スペクトラム上のマウス位置の周波数
         self.scan_status_text = "待機中 (Auto Seek / 全帯域スキャン可能)"
         self.telemetry_text = ""
 
@@ -644,7 +696,26 @@ class SdrGui:
                         self.scan_status_text = (f"局吸着同調: {snapped_station['name']} "
                                                  f"({snapped_station['freq_mhz']:.2f}MHz, SNR:+{snapped_station['snr_db']}dB)")
                     else:
-                        self.center_freq = int(round(clicked_freq / 10000) * 10000)
+                        # 第2段: liveピーク吸着 (スキャン不要。30kHz以内で正確周波数へ)
+                        best_pk = None
+                        best_pd = 30000.0
+                        for pk in self.live_peaks:
+                            pd = abs(pk["freq_hz"] - clicked_freq)
+                            if pd < best_pd:
+                                best_pd = pd
+                                best_pk = pk
+                        if best_pk is not None:
+                            try:
+                                from auto_tuner import match_station_name
+                                pk_name = match_station_name(int(best_pk["freq_hz"]))
+                            except Exception:
+                                pk_name = ""
+                            self.center_freq = int(best_pk["freq_hz"])
+                            self.scan_status_text = (
+                                f"ピーク同調: {pk_name} "
+                                f"({best_pk['freq_hz'] / 1e6:.2f}MHz, SNR:+{best_pk['snr_db']:.1f}dB)")
+                        else:
+                            self.center_freq = int(round(clicked_freq / 10000) * 10000)
 
                     if self.on_freq_change:
                         self.on_freq_change(self.center_freq)
@@ -657,7 +728,14 @@ class SdrGui:
         mx, my = pygame.mouse.get_pos()
         is_hover_btn = any(btn.rect.collidepoint(mx, my) for btn in self.buttons)
         is_hover_digit = (self.hovered_freq_digit is not None)
-        if is_hover_btn or is_hover_digit:
+        # スペクトラム上のホバー周波数 (ワンクリック選局の照準表示)
+        if self.spec_rect.collidepoint(mx, my) and self.spec_rect.width > 0:
+            sr = self.sample_rate if self.sample_rate > 0 else 1152000
+            self.hover_freq_hz = ((self.center_freq - sr / 2)
+                                  + (mx - self.spec_rect.x) / self.spec_rect.width * sr)
+        else:
+            self.hover_freq_hz = None
+        if is_hover_btn or is_hover_digit or self.hover_freq_hz is not None:
             try:
                 pygame.mouse.set_cursor(pygame.SYSTEM_CURSOR_HAND)
             except Exception:
@@ -968,6 +1046,29 @@ class SdrGui:
                                     [(m_x, r.y + 16), (m_x - 5, r.y + 6), (m_x + 5, r.y + 6)])
                 lbl = cached_text(self.font_tiny, f"{st['freq_mhz']:.1f}", color)
                 self.screen.blit(lbl, (m_x - 11, r.y + 18))
+
+        # liveピーク (スキャン不要のワンクリック選局マーカー。5Hz更新)
+        try:
+            now_p = time.monotonic()
+            if now_p - self._last_peak_time >= 0.2 and len(spectrum_db) > 8:
+                self.live_peaks = find_spectrum_peaks(
+                    spectrum_db, self.sample_rate, self.center_freq)
+                self._last_peak_time = now_p
+        except Exception:
+            pass
+        for pk in self.live_peaks[:8]:
+            pf = pk["freq_hz"]
+            if f_min <= pf <= f_max and (f_max - f_min) > 0:
+                p_x = r.x + int((pf - f_min) / (f_max - f_min) * r.width)
+                pygame.draw.line(self.screen, (0, 210, 170), (p_x, r.y + 30), (p_x, r.y + 40), 2)
+                pl = cached_text(self.font_tiny, f"{pf / 1e6:.2f}", (0, 190, 155))
+                self.screen.blit(pl, (p_x - 20, r.y + 41))
+
+        # ホバー周波数表示
+        if self.hover_freq_hz is not None and f_min <= self.hover_freq_hz <= f_max:
+            hov = cached_text(self.font_tiny, f"{self.hover_freq_hz / 1e6:.4f} MHz",
+                              (255, 215, 130))
+            self.screen.blit(hov, (r.right - 128, r.y + 8))
 
         f_start = (self.center_freq - self.sample_rate / 2) / 1e6
         f_end = (self.center_freq + self.sample_rate / 2) / 1e6

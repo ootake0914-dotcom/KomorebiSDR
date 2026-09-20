@@ -23,6 +23,7 @@ TESTS = [
     "test_stereo.py",
     "test_adaptive_dsp.py",
     "test_gui.py",
+    "test_live_peaks.py",
     "test_mock_worker.py",
 ]
 
