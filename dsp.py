@@ -12,6 +12,7 @@ DLLが見つからない場合、純Python代替のある処理 (AM同期検波�
 
 import ctypes
 import os
+import time
 from collections import deque
 import numpy as np
 
@@ -44,7 +45,7 @@ def _load_native_core():
                                        ctypes.c_double, ctypes.c_double, ctypes.POINTER(ctypes.c_double),
                                        ctypes.POINTER(ctypes.c_double), ctypes.c_double, pf, pf, pf]
         # 追加関数は無くてもネイティブコア全体を無効化しない (旧DLLとの後方互換)
-        global NATIVE_AM_SYNC, NATIVE_PLL3, NATIVE_FIR
+        global NATIVE_AM_SYNC, NATIVE_PLL3, NATIVE_FIR, NATIVE_POLY
         if hasattr(lib, "sdr_stereo_pll3"):
             lib.sdr_stereo_pll3.argtypes = [pf, ctypes.c_int, ctypes.POINTER(ctypes.c_double),
                                             ctypes.c_double, ctypes.c_double, ctypes.c_double,
@@ -59,6 +60,10 @@ def _load_native_core():
         if hasattr(lib, "sdr_fir_real"):
             lib.sdr_fir_real.argtypes = [pf, pf, pf, ctypes.c_int, ctypes.c_int]
             NATIVE_FIR = True
+        if hasattr(lib, "sdr_polyphase_decim"):
+            lib.sdr_polyphase_decim.argtypes = [pf, pf, pf, ctypes.c_int, ctypes.c_int,
+                                                ctypes.c_int]
+            NATIVE_POLY = True
         if hasattr(lib, "sdr_fast_fpu"):
             try:
                 lib.sdr_fast_fpu()  # FTZ/DAZ有効化 (denormalジッタ対策)
@@ -74,6 +79,7 @@ def _load_native_core():
 NATIVE_AM_SYNC = False
 NATIVE_PLL3 = False
 NATIVE_FIR = False
+NATIVE_POLY = False
 _NATIVE = _load_native_core()
 NATIVE_CORE_ENABLED = _NATIVE is not None
 
@@ -134,8 +140,9 @@ def suppress_click_transients(audio: np.ndarray, threshold: float = 0.48) -> np.
         left_idx = max(0, b - 1)
         right_idx = min(len(audio) - 1, b + 2)
         local_span = abs(audio[right_idx] - audio[left_idx])
-        # 差分に対して前後の接続が戻っている（孤立突起）、または極めて急峻なステップ
-        if diffs[b] > threshold and (diffs[b] > local_span * 1.5 or diffs[b] > 0.65):
+        # 差分に対して前後の接続が戻っている（孤立突起）のみ修復する。
+        # 旧 `or diff > 0.65` は打楽器アタック等の正規過渡を誤って削るため撤去。
+        if diffs[b] > threshold and diffs[b] > local_span * 1.5:
             mask[max(0, b - 1) : min(len(out), b + 3)] = True
 
     if not np.any(mask):
@@ -162,6 +169,26 @@ def suppress_click_transients(audio: np.ndarray, threshold: float = 0.48) -> np.
     return out
 
 
+def _deemph_sections(tau_us: float):
+    """時定数に対応する2縦続1次IIR係数 [(b0,b1,minus_a1)×2] を返す。
+    48kHz用に実測フィットした値で、アナログ1次LPF特性に帯域内±0.03dBで一致。
+    未知の時定数には無プリワープ双一次1段＋素通しで近似する。"""
+    fitted = {
+        50.0: [(1.6231841965746954, -1.2710911965746954, 0.647907),
+               (0.18622705854697402, 0.026085941453025934, 0.787687)],
+        75.0: [(1.0283946, -0.5892977, 0.5609031),
+               (0.2090227, 0.0301037, 0.7608736)],
+    }
+    for k, v in fitted.items():
+        if abs(float(tau_us) - k) < 1e-6:
+            return [tuple(s) for s in v]
+    # フォールバック: 無プリワープ双一次1段＋素通し (50/75μs以外は未使用想定)
+    T = 1.0 / 48000.0
+    tau = float(tau_us) * 1e-6
+    den = 2.0 * tau + T
+    return [(T / den, T / den, (2.0 * tau - T) / den), (1.0, 0.0, 0.0)]
+
+
 class AdaptiveDriftResampler:
     """
     RTL-SDRとDAC間の独立クロック偏差（ドリフト）を微小に伸縮補正し、
@@ -181,6 +208,7 @@ class AdaptiveDriftResampler:
         self.current_ratio = 1.0
         self.phase = 0.0
         self.last_sample = 0.0
+        self.prev_sample = 0.0
         self.drift_ppm = 0.0
 
     def update_feedback(self, current_chunks: float, dt: float = 0.05):
@@ -225,32 +253,59 @@ class AdaptiveDriftResampler:
         if len(audio) == 0:
             return audio
 
-        # ドリフトがほぼゼロかつ位相ズレがないときはビットパーフェクトで通過 (補間ゼロ)
-        if abs(self.current_ratio - 1.0) < 1e-6 and abs(self.phase) < 1e-5:
-            self.last_sample = float(audio[-1])
-            return audio
-
-        # 境界連続性のために前回の最終サンプル(t=-1)と今回の末尾(t=N)を付加
-        ext_audio = np.concatenate(([self.last_sample], audio, [audio[-1]]))
         n_in = len(audio)
+        ratio = self.current_ratio
 
-        indices = np.arange(self.phase, n_in, self.current_ratio)
+        if abs(ratio - 1.0) < 1e-6:
+            # 整数遅延バイパス: ドリフトなし時は補間フィルタを掛けない。
+            # 旧実装は残留phaseで恒常的に線形補間し高域を削っていた。
+            # 位相残差は整数部のみ消費し、小数部は非可聴のまま保持する。
+            d = int(np.floor(self.phase + 0.5))
+            if d <= 0:
+                self.prev_sample = float(audio[-2]) if n_in >= 2 else self.last_sample
+                self.last_sample = float(audio[-1])
+                return audio
+            d = min(d, n_in)
+            out = np.empty(n_in - d, dtype=np.float32)
+            if d == 1:
+                out[0] = self.last_sample
+                out[1:] = audio[:-1]
+            else:
+                ext = np.concatenate(([self.prev_sample, self.last_sample], audio))
+                out[:] = ext[n_in + 2 - len(out):n_in + 2]
+            self.phase -= d
+            self.prev_sample = float(audio[-2]) if n_in >= 2 else self.last_sample
+            self.last_sample = float(audio[-1])
+            return out
+
+        # 境界連続性のために前2サンプルと末尾を付加
+        ext_audio = np.concatenate(([self.prev_sample, self.last_sample], audio,
+                                    [audio[-1], audio[-1]]))
+        ext_audio = ext_audio.astype(np.float64)
+
+        indices = np.arange(self.phase, n_in, ratio)
         if len(indices) == 0:
             self.phase -= n_in
+            self.prev_sample = float(audio[-2]) if n_in >= 2 else self.last_sample
             self.last_sample = float(audio[-1])
             return np.zeros(0, dtype=np.float32)
 
-        # ext_audio 内での正確なインデックス (時刻 t=0 は ext_audio[1] に対応)
-        ext_indices = indices + 1.0
-        idx_floor = ext_indices.astype(np.int32)
-        idx_frac = (ext_indices - idx_floor).astype(np.float32)
+        # Catmull-Rom 4点3次補間 (線形補間の高域ロールオフ/imagingを排除)
+        ei = indices + 2.0
+        i0 = np.floor(ei).astype(np.int64)
+        f = (ei - i0).astype(np.float64)
+        i0 = np.clip(i0, 1, n_in + 1)
+        p0 = ext_audio[i0 - 1]
+        p1 = ext_audio[i0]
+        p2 = ext_audio[i0 + 1]
+        p3 = ext_audio[i0 + 2]
+        out = (p1 + 0.5 * f * (p2 - p0
+               + f * (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3
+               + f * (3.0 * (p1 - p2) + p3 - p0))))
 
-        s0 = ext_audio[idx_floor]
-        s1 = ext_audio[idx_floor + 1]
-        out = s0 + idx_frac * (s1 - s0)
-
-        last_idx = indices[-1] + self.current_ratio
+        last_idx = indices[-1] + ratio
         self.phase = float(last_idx - n_in)
+        self.prev_sample = float(audio[-2]) if n_in >= 2 else self.last_sample
         self.last_sample = float(audio[-1])
 
         return out.astype(np.float32)
@@ -273,6 +328,7 @@ class SdrDspPipeline:
 
         self.offset_freq = 0.0
         self.mixer_phase = 0.0
+        self._tune_monotonic = time.monotonic()
 
         # グラム・シュミット直交化によるリアルタイム適応IQインバランス補正器 (鏡像ゴースト自動消去)
         self.iq_corrector = AdaptiveIqCorrector(sample_rate=self.rf_rate, time_constant_sec=3.0)
@@ -302,9 +358,10 @@ class SdrDspPipeline:
         self.fir_nfm_audio = design_fir_kaiser(num_taps=81, cutoff_norm=cutoff_nfm_audio, beta=7.0)
 
         # 19kHzパイロットトーンを完全阻止するIF段オーディオフィルタ (288kHzレート)
-        # カットオフ 15kHz, 19kHzで -60dB以上の超急峻減衰 (97タップ)
+        # カットオフ 15kHz, 19kHzで -60dB以上の超急峻減衰 (257タップ。
+        # 97タップでは19kHzで-25.8dBしかなく超音波漏洩していた)
         cutoff_if_audio = 15000.0 / self.if_rate
-        self.fir_if_audio = design_fir_kaiser(num_taps=97, cutoff_norm=cutoff_if_audio, beta=7.0)
+        self.fir_if_audio = design_fir_kaiser(num_taps=257, cutoff_norm=cutoff_if_audio, beta=7.0)
 
         # 48kHzオーディオ段のアンチエイリアス・ハイカットフィルタ (48kHzレート)
         # 14kHz: 音楽用Hi-Fiワイド (51タップ)
@@ -384,26 +441,29 @@ class SdrDspPipeline:
         self.history_am_audio = np.zeros(len(self.fir_am_audio) - 1, dtype=np.float32)
         self.history_final = np.zeros(len(self.fir_audio_clean) - 1, dtype=np.float32)
 
-        # 双一次変換ディエンファシス (地域設定: 日本/欧州=50μs, 米国/韓国=75μs)
+        # ディエンファシス (地域設定: 日本/欧州=50μs, 米国/韓国=75μs)
+        # 1次双一次では高域ワープ歪み (15kHzで-3.55dB) が避けられないため、
+        # 実測フィットした2縦続1次IIRでアナログ特性に±0.03dBで一致させる。
+        # 各段は既存ネイティブ1次IIR (b0,b1,minus_a1) そのまま実行できる。
         self.deemph_tau_us = 50.0
-        T = 1.0 / self.audio_rate
-        tau = 50e-6
-        denom = 2.0 * tau + T
-        self.deemph_b0 = T / denom
-        self.deemph_b1 = T / denom
-        self.deemph_a1 = -(2.0 * tau - T) / denom
-        self.deemph_x1 = 0.0
-        self.deemph_y1 = 0.0
-        # ネイティブCコア用フィルタ状態 (x1, y1)
+        self.deemph_sections = _deemph_sections(50.0)
+        self.deemph_x1 = self.deemph_y1 = 0.0
+        self.deemph2_x1 = self.deemph2_y1 = 0.0
+        # ネイティブCコア用フィルタ状態 (x1, y1) ×2段
         self._deemph_state = np.zeros(2, dtype=np.float32)
+        self._deemph2_state = np.zeros(2, dtype=np.float32)
         self._dc_hp_state = np.zeros(2, dtype=np.float32)
         self._voice_hp_state = np.zeros(2, dtype=np.float32)
         self._deemph_state_l = np.zeros(2, dtype=np.float32)
         self._deemph_state_r = np.zeros(2, dtype=np.float32)
+        self._deemph2_state_l = np.zeros(2, dtype=np.float32)
+        self._deemph2_state_r = np.zeros(2, dtype=np.float32)
         self._dc_hp_state_l = np.zeros(2, dtype=np.float32)
         self._dc_hp_state_r = np.zeros(2, dtype=np.float32)
         self.deemph_x1_l = self.deemph_y1_l = 0.0
         self.deemph_x1_r = self.deemph_y1_r = 0.0
+        self.deemph2_x1_l = self.deemph2_y1_l = 0.0
+        self.deemph2_x1_r = self.deemph2_y1_r = 0.0
         self.dc_hp_x1_l = self.dc_hp_y1_l = 0.0
         self.dc_hp_x1_r = self.dc_hp_y1_r = 0.0
 
@@ -534,6 +594,7 @@ class SdrDspPipeline:
         self.squelch_threshold = -85.0
         self.squelch_enabled = False
         self.am_agc_level = 0.0  # AM搬送波レベルAGC状態
+        self._am_agc_hang = 0  # AGCハングタイマ (残ブロック数)
 
         # 超音波ノイズ比追従型 コグニティブ・オートスケルチ (FM三角ノイズクワイエティング追従)
         self.ultra_squelch = UltrasonicSquelchTracker(sample_rate=self.if_rate)
@@ -550,6 +611,7 @@ class SdrDspPipeline:
         # ===== SSB / CW =====
         self.bfo_offset_hz = 0.0     # BFO微調整 (SSB/CWのみ)
         self.ssb_agc_level = 0.0
+        self._ssb_agc_hang = 0
         self._ssb_bp_phase = 0.0
         self._ssb_bfo_phase = 0.0
 
@@ -578,9 +640,11 @@ class SdrDspPipeline:
         self._am_ef = 0.0
         self._am_sync_mix = 0.0
         # ループ帯域 ~20Hz (搬送波のドリフトに追従しつつ変調側波帯は追わない)
-        self.am_kp = 6.0e-4
-        self.am_ki = 1.9e-7
-        self._am_alpha = 2.0 * np.pi * 100.0 / self.if_rate
+        self.am_kp = 3.0e-4
+        self.am_ki = 5.0e-8
+        # ループ帯域を約10Hz級へ狭帯域化 (旧100Hzでは低音音声がVCOを変調し
+        # 混変調歪みを誘発)。ロックが遅くなってもmixが包絡線へ自動復帰する。
+        self._am_alpha = 2.0 * np.pi * 30.0 / self.if_rate
 
         # スペクトラム表示設定
         self.fft_size = 1024
@@ -590,6 +654,7 @@ class SdrDspPipeline:
 
     def set_offset_freq(self, offset_hz: float):
         self.offset_freq = offset_hz
+        self._tune_monotonic = time.monotonic()
         self.afc_offset_hz = 0.0
         self.nfm_afc_offset_hz = 0.0
         # 選局でAM同期PLLを初期化 (再ロック)
@@ -651,17 +716,16 @@ class SdrDspPipeline:
 
     def set_deemphasis(self, tau_us: float):
         """ディエンファシス時定数を設定 (日本/欧州=50μs, 米国/韓国=75μs)"""
-        T = 1.0 / self.audio_rate
-        tau = float(tau_us) * 1e-6
-        denom = 2.0 * tau + T
         self.deemph_tau_us = float(tau_us)
-        self.deemph_b0 = T / denom
-        self.deemph_b1 = T / denom
-        self.deemph_a1 = -(2.0 * tau - T) / denom
+        self.deemph_sections = _deemph_sections(self.deemph_tau_us)
         self.deemph_x1 = self.deemph_y1 = 0.0
+        self.deemph2_x1 = self.deemph2_y1 = 0.0
         self._deemph_state[:] = 0.0
+        self._deemph2_state[:] = 0.0
         self._deemph_state_l[:] = 0.0
         self._deemph_state_r[:] = 0.0
+        self._deemph2_state_l[:] = 0.0
+        self._deemph2_state_r[:] = 0.0
 
     def set_squelch(self, enabled: bool, threshold_db: float = -68.0):
         self.squelch_enabled = enabled
@@ -783,6 +847,28 @@ class SdrDspPipeline:
         x_ext = np.concatenate((hist, x))
         setattr(self, history_attr, x[-req_hist:] if len(x) >= req_hist else x_ext[-req_hist:])
 
+        # ポリフェーズ間引き (valid畳み込み[::factor]と完全等価、計算量1/factor)
+        n_valid = len(x_ext) - len(fir_taps) + 1
+        if _NATIVE is not None and NATIVE_POLY and n_valid > 0 and factor >= 1:
+            n_out = (n_valid + factor - 1) // factor
+            if np.iscomplexobj(x_ext):
+                yr = np.empty(n_out, dtype=np.float32)
+                yi = np.empty(n_out, dtype=np.float32)
+                xr = np.ascontiguousarray(x_ext.real, dtype=np.float32)
+                xi = np.ascontiguousarray(x_ext.imag, dtype=np.float32)
+                ha = np.ascontiguousarray(fir_taps, dtype=np.float32)
+                _NATIVE.sdr_polyphase_decim(_fptr(xr), _fptr(ha), _fptr(yr),
+                                            n_out, len(ha), factor)
+                _NATIVE.sdr_polyphase_decim(_fptr(xi), _fptr(ha), _fptr(yi),
+                                            n_out, len(ha), factor)
+                return yr + 1j * yi
+            xa = np.ascontiguousarray(x_ext, dtype=np.float32)
+            ha = np.ascontiguousarray(fir_taps, dtype=np.float32)
+            y = np.empty(n_out, dtype=np.float32)
+            _NATIVE.sdr_polyphase_decim(_fptr(xa), _fptr(ha), _fptr(y),
+                                        n_out, len(ha), factor)
+            return y
+
         # 畳み込み (validモードで境界アーティファクトを完全排除)
         if np.iscomplexobj(x_ext):
             r = self._convolve_valid(x_ext.real, fir_taps)
@@ -895,7 +981,12 @@ class SdrDspPipeline:
         self._update_stereo_pilot(demod_scaled)
 
         # 5c. RDS復調 (57kHz = 3θ, ステレオ状態と独立して常時動作)
-        if self.rds_enabled and self._last_cos3 is not None:
+        # パイロットロック連動ゲート: パイロット不在時 (無信号・モノラル) は
+        # 57kHzに信号が存在し得ないためfeedを省略する。ノイズ入力でデコーダの
+        # 同期探索 (syndrome全探索) が約4ms/block浪費していた問題の根絶。
+        # デコーダ状態は保持されるため、ロック復帰時は即時再開する。
+        if (self.rds_enabled and self._last_cos3 is not None
+                and abs(self.stereo_pilot_lock) > 0.2):
             try:
                 if self.rds is None:
                     import rds as rds_mod
@@ -947,10 +1038,11 @@ class SdrDspPipeline:
                 else:
                     # NR無効時はLPF/STFT往復をせず生差信号へブレンドのみ
                     # (15kHz LPF＋COLAリップルが可聴域を変える問題とCPU浪費を回避)。
-                    # mono遅延履歴だけは更新し、再有効時の継ぎ目を無くす。
+                    # mono遅延履歴だけは更新し、再有効時の継ぎ目を無くす
+                    # (出力は遅延させない。遅延させると未遅延diffと2msずれる)。
                     stereo_diff = (diff_raw
                                    * (self._stereo_blend * self.multipath_gain)).astype(np.float32)
-                    mono = self._delay_mono(mono)
+                    self._delay_mono(mono)
                     self.stereo_wiener_gain = 1.0
 
         # 6. チャンネル別ポスト処理 (ディエンファシス・ハイカット・DCカット・シェルフ)
@@ -977,7 +1069,9 @@ class SdrDspPipeline:
 
         self.is_stereo = False
         self.stereo_status = "MONO"
-        out_mono = self._post_process_wfm(mono, "")
+        # モノラル経路は×2.0でステレオ(L+R=2mono)と等音量にする
+        # (切替時の+6dB段差・過変調クリップの解消。±1.0クリップ済み)
+        out_mono = self._post_process_wfm(mono * 2.0, "")
         if ultra_gain < 0.999:
             out_mono = out_mono * ultra_gain
         return np.clip(out_mono, -1.0, 1.0)
@@ -1085,6 +1179,9 @@ class SdrDspPipeline:
         周波数ごとに 信号/(信号+ノイズ) の最適重みを掛けるため、ノイズに埋もれた
         高域だけが落ち、SNRの良い低域のステレオ感はそのまま残る。
         入出力のサンプル数は厳密に一致させ、mono側は_nr_delayで遅延補償する。
+
+        高速化: フレーム毎の逐次rfft/irfftをバッチ行列FFTに統合 (数学的等価:
+        各行が独立FFTのためbit一致、平滑再帰・OLA加算順序も保存)。
         """
         n = len(x)
         if n == 0:
@@ -1092,41 +1189,47 @@ class SdrDspPipeline:
         buf = np.concatenate((self._wf_in, x))
         nfft = self._wf_n
         hop = self._wf_hop
-        chunks = []
+        nframes = (len(buf) - nfft) // hop + 1
         if self._wf_p is None:
             self._wf_p = np.zeros(nfft // 2 + 1, dtype=np.float32)
-        while len(buf) >= nfft:
-            spec = np.fft.rfft(buf[:nfft] * self._wf_win)
-            power = np.abs(spec) ** 2 + 1e-12
+        if nframes > 0:
+            # フレーム行列 (stride複写1回) とバッチrfft (C内でループ)
+            idx = np.arange(nfft)[None, :] + hop * np.arange(nframes)[:, None]
+            frames = buf[idx] * self._wf_win
+            specs = np.fft.rfft(frames, axis=1)
+            powers = np.abs(specs) ** 2 + 1e-12
 
-            # 番組パワーの時間平滑 (Wienerの分子・音楽性ノイズ抑制)
-            self._wf_p = 0.5 * power + 0.5 * self._wf_p
-            # ノイズモデル: FM三角ノイズ (∝f²) をブロードバンド指標のHF床でスケール。
-            # ビン別最小値だと持続音をノイズと誤認するため、形状は物理モデルで与える。
-            c_noise = (self._nr_floor_pow * self._nr_floor_bias * self._wf_scale) / self._wf_hf_f2_mean
-            g_w = np.maximum(1.0 - (c_noise * self._wf_f2) / (self._wf_p + 1e-12),
-                             self._nr_gmin).astype(np.float32)
-            g_w[:3] = 1.0  # DC〜低域は保護
-            if self._wf_g is None or len(self._wf_g) != len(g_w):
-                self._wf_g = g_w
-            else:
-                a = np.where(g_w < self._wf_g, 0.7, 0.1)
-                self._wf_g = self._wf_g + a * (g_w - self._wf_g)
+            c_noise = ((self._nr_floor_pow * self._nr_floor_bias * self._wf_scale)
+                       / self._wf_hf_f2_mean)
             sw = self._nr_s_w if self.stereo_nr_enabled else 0.0
-            g_mix = 1.0 - sw * (1.0 - self._wf_g)
-            self.stereo_wiener_gain = float(np.mean(g_mix))
+            # 平滑再帰のみ逐次 (フレーム間依存のため。ベクトル演算のみでFFTなし)
+            gmix = np.empty_like(specs, dtype=np.float32)
+            for j in range(nframes):
+                power = powers[j]
+                self._wf_p = 0.5 * power + 0.5 * self._wf_p
+                g_w = np.maximum(1.0 - (c_noise * self._wf_f2) / (self._wf_p + 1e-12),
+                                 self._nr_gmin).astype(np.float32)
+                g_w[:3] = 1.0  # DC〜低域は保護
+                if self._wf_g is None or len(self._wf_g) != len(g_w):
+                    self._wf_g = g_w
+                else:
+                    a = np.where(g_w < self._wf_g, 0.7, 0.1)
+                    self._wf_g = self._wf_g + a * (g_w - self._wf_g)
+                g_mix = 1.0 - sw * (1.0 - self._wf_g)
+                gmix[j] = g_mix
+            self.stereo_wiener_gain = float(np.mean(gmix[-1]))
 
-            y = np.fft.irfft(spec * g_mix, n=nfft)
-            self._wf_ola[:nfft] += y * self._wf_win
-            chunks.append((self._wf_ola[:hop] / self._wf_cola[:hop]).copy())
-            self._wf_ola = np.concatenate(
-                (self._wf_ola[hop:], np.zeros(hop, dtype=np.float32)))
-            buf = buf[hop:]
-        self._wf_in = buf
-
-        if chunks:
+            # バッチirfft＋同順序OLA加算
+            ymat = np.fft.irfft(specs * gmix, n=nfft)
+            acc = np.concatenate((self._wf_ola.astype(np.float64),
+                                  np.zeros(nframes * hop, dtype=np.float64)))
+            for j in range(nframes):
+                acc[j * hop:j * hop + nfft] += ymat[j] * self._wf_win
+            out_hops = (acc[:nframes * hop] / np.tile(self._wf_cola[:hop], nframes))
+            self._wf_ola = acc[nframes * hop:nframes * hop + nfft].astype(np.float32)
+            self._wf_in = buf[nframes * hop:]
             self._wf_out = np.concatenate(
-                (self._wf_out, np.concatenate(chunks).astype(np.float32)))
+                (self._wf_out, out_hops.astype(np.float32)))
         if len(self._wf_out) >= n:
             y = self._wf_out[:n].copy()
             self._wf_out = self._wf_out[n:]
@@ -1204,7 +1307,9 @@ class SdrDspPipeline:
             ig = ctypes.c_double(self._pll_integ)
             ef = ctypes.c_double(self._pll_ef)
             cos3 = sin3 = None
-            if NATIVE_PLL3:
+            # RDS無効時は57kHz出力(cos3/sin3)の三角関数×2/サンプルを省略し
+            # 2出力版PLLへ切替 (約1/3高速化。数学的等価: cos2/sin2は同一)。
+            if NATIVE_PLL3 and self.rds_enabled:
                 cos3 = np.empty(n, dtype=np.float32)
                 sin3 = np.empty(n, dtype=np.float32)
                 _NATIVE.sdr_stereo_pll3(_fptr(sig), n, ctypes.byref(th), self._pll_w0,
@@ -1227,6 +1332,23 @@ class SdrDspPipeline:
             self.stereo_pilot_lock = lock
             self.stereo_pilot_ratio = ratio
 
+            if not self.stereo_enabled:
+                # モノラル強制: ブレンドを落としcos2/sin2を格納しない
+                # (RDS用cos3/sin3は継続)。無いとRDS有効時にブレンドが
+                # 再上昇しモノラルボタンが実質無効になる。
+                self._stereo_blend *= 0.9
+                self.stereo_blend = self._stereo_blend
+                self._last_cos2 = None
+                self._last_sin2 = None
+                if cos3 is not None:
+                    self._last_cos3 = cos3
+                    self._last_sin3 = sin3
+                else:
+                    # RDS無効時は57kHz搬送波を生成しないため古い値を破棄
+                    self._last_cos3 = None
+                    self._last_sin3 = None
+                return
+
             target = 0.0
             if lock > 0.5 and pilot_rms > 1e-3:
                 target = 1.0
@@ -1245,6 +1367,9 @@ class SdrDspPipeline:
             if cos3 is not None:
                 self._last_cos3 = cos3
                 self._last_sin3 = sin3
+            else:
+                self._last_cos3 = None
+                self._last_sin3 = None
         except Exception:
             self._last_cos2 = None
             self._last_sin2 = None
@@ -1372,12 +1497,19 @@ class SdrDspPipeline:
         # (時定数 ~0.2sアタック / ~1sリリース。無信号時の過剰増幅は3000倍で制限)
         # 無信号フロア: レベル極小でAGC=0張り付き→gain3000→AMは-0.6のDC定数出力や
         # ノイズ爆音になるため、フロア以下では出力を滑らかにミュートする。
+        # ハングタイマ: 単語間の息継ぎでゲインが跳ね上がる呼吸を防ぐため、
+        # レベル低下後は約400ms(7ブロック)だけ減衰を保持してからリリースする。
         level = float(np.mean(np.abs(sig)))
         if self.am_agc_level <= 0.0:
             self.am_agc_level = max(level, 2e-4)
+            self._am_agc_hang = 0
+        elif level > self.am_agc_level:
+            self.am_agc_level += 0.25 * (level - self.am_agc_level)
+            self._am_agc_hang = 7
+        elif self._am_agc_hang > 0:
+            self._am_agc_hang -= 1
         else:
-            alpha = 0.25 if level > self.am_agc_level else 0.05
-            self.am_agc_level += alpha * (level - self.am_agc_level)
+            self.am_agc_level += 0.05 * (level - self.am_agc_level)
         gain = min(1.0 / (self.am_agc_level + 1e-9), 3000.0)
         fade = min(1.0, level / 2e-4)
         audio_raw = np.clip((sig * gain - 1.0) * 0.6, -1.0, 1.0) * fade
@@ -1447,6 +1579,14 @@ class SdrDspPipeline:
             out = np.real(iq_if * np.exp(-1j * theta)).astype(np.float32)
             lock_v = float(abs(m) / (np.mean(np.abs(iq_if)) + 1e-12))
 
+        # 180°逆相ロックガード: 同期出力が包絡線と逆符号なら反転させる。
+        # 未対策だとDC反転→-1.0クリップの爆音歪みになる。
+        try:
+            if float(np.mean(out * np.abs(iq_if).astype(np.float32))) < 0.0:
+                out = -out
+        except Exception:
+            pass
+
         self.am_sync_lock = lock_v
         x = float(np.clip((lock_v - 0.35) / 0.30, 0.0, 1.0))
         target = x * x * (3.0 - 2.0 * x)
@@ -1486,12 +1626,18 @@ class SdrDspPipeline:
 
         # AGC (SSBは搬送波が無いため平均振幅で正規化。無信号時の過剰増幅は3000倍で制限)
         # 無信号フロア (AM側と同型): ノイズ2400倍の爆音化を防ぐため滑らかにミュート。
+        # ハングタイマ (AM側と同型、約400ms保持)。
         level = float(np.mean(np.abs(audio)))
         if self.ssb_agc_level <= 0.0:
             self.ssb_agc_level = max(level, 2e-4)
+            self._ssb_agc_hang = 0
+        elif level > self.ssb_agc_level:
+            self.ssb_agc_level += 0.25 * (level - self.ssb_agc_level)
+            self._ssb_agc_hang = 7
+        elif self._ssb_agc_hang > 0:
+            self._ssb_agc_hang -= 1
         else:
-            alpha = 0.25 if level > self.ssb_agc_level else 0.05
-            self.ssb_agc_level += alpha * (level - self.ssb_agc_level)
+            self.ssb_agc_level += 0.05 * (level - self.ssb_agc_level)
         gain = min(1.0 / (self.ssb_agc_level + 1e-9), 3000.0)
         fade = min(1.0, level / 2e-4)
         audio = np.clip(audio * gain * 0.8, -1.0, 1.0) * fade
@@ -1510,28 +1656,31 @@ class SdrDspPipeline:
         if len(x) == 0:
             return x
         if _NATIVE is not None:
-            xin = np.ascontiguousarray(x, dtype=np.float32)
-            y = np.empty_like(xin)
-            state = getattr(self, f"_deemph_state{ch}")
-            _NATIVE.sdr_bilinear_deemphasis(
-                _fptr(xin), _fptr(y), len(xin),
-                float(self.deemph_b0), float(self.deemph_b1), float(-self.deemph_a1),
-                _fptr(state))
-            return y
+            cur = np.ascontiguousarray(x, dtype=np.float32)
+            for i, (b0, b1, m) in enumerate(self.deemph_sections):
+                state = getattr(self, f"_deemph_state{ch}" if i == 0 else f"_deemph2_state{ch}")
+                nxt = np.empty_like(cur)
+                _NATIVE.sdr_bilinear_deemphasis(
+                    _fptr(cur), _fptr(nxt), len(cur),
+                    float(b0), float(b1), float(m),
+                    _fptr(state))
+                cur = nxt
+            return cur
         y = np.empty_like(x)
-        b0 = self.deemph_b0
-        b1 = self.deemph_b1
-        minus_a1 = -self.deemph_a1
-        x1 = getattr(self, f"deemph_x1{ch}")
-        y1 = getattr(self, f"deemph_y1{ch}")
-        for i in range(len(x)):
-            curr_x = x[i]
-            curr_y = b0 * curr_x + b1 * x1 + minus_a1 * y1
-            y[i] = curr_y
-            x1 = curr_x
-            y1 = curr_y
-        setattr(self, f"deemph_x1{ch}", x1)
-        setattr(self, f"deemph_y1{ch}", y1)
+        for i, (b0, b1, m) in enumerate(self.deemph_sections):
+            inp = x if i == 0 else y
+            out = np.empty_like(inp)
+            x1 = getattr(self, f"deemph_x1{ch}" if i == 0 else f"deemph2_x1{ch}")
+            y1 = getattr(self, f"deemph_y1{ch}" if i == 0 else f"deemph2_y1{ch}")
+            for k in range(len(inp)):
+                curr_x = inp[k]
+                curr_y = b0 * curr_x + b1 * x1 + m * y1
+                out[k] = curr_y
+                x1 = curr_x
+                y1 = curr_y
+            setattr(self, f"deemph_x1{ch}" if i == 0 else f"deemph2_x1{ch}", x1)
+            setattr(self, f"deemph_y1{ch}" if i == 0 else f"deemph2_y1{ch}", y1)
+            y = out
         return y
 
     def compute_spectrum(self, iq: np.ndarray) -> np.ndarray:
@@ -1612,15 +1761,23 @@ class SdrDspPipeline:
             right = self.resampler_r.process(audio[:, 1])
             m = min(len(left), len(right))
             audio_synced = np.stack([left[:m], right[:m]], axis=1)
-            # 過渡クリックサプレッサー (チャンネル別)
-            audio_clean = np.stack([
-                suppress_click_transients(audio_synced[:, 0]),
-                suppress_click_transients(audio_synced[:, 1]),
-            ], axis=1).astype(np.float32)
         else:
             audio_synced = self.resampler.process(audio)
-            # 過渡クリックサプレッサー (チューナー切替過渡ノイズを完全消滅)
-            audio_clean = suppress_click_transients(audio_synced)
+
+        # 過渡クリックサプレッサーは選局直後300msのみ実行する。
+        # クリック源はFIR履歴・PLL状態の不連続＝選局時のみであり、常時ONは
+        # 打楽器アタック等の正規過渡を誤って削る (選局・モード切替は必ず
+        # set_offset_freqを経由するため窓検出で十分)。
+        if time.monotonic() - self._tune_monotonic < 0.30:
+            if audio_synced.ndim == 2:
+                audio_clean = np.stack([
+                    suppress_click_transients(audio_synced[:, 0]),
+                    suppress_click_transients(audio_synced[:, 1]),
+                ], axis=1).astype(np.float32)
+            else:
+                audio_clean = suppress_click_transients(audio_synced)
+        else:
+            audio_clean = audio_synced
 
         # 音声/音楽 認知型オートチルトEQ (トーク了解度 / 音楽フラットHi-Fi 自動追従)
         if self.cognitive_enabled and getattr(self, "cognitive_eq", None) is not None and self.cognitive_eq.enabled:

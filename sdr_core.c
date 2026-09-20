@@ -156,6 +156,44 @@ SDR_EXPORT void sdr_fir_real(const float * __restrict x, const float * __restric
     }
 }
 
+/* ポリフェーズ間引きFIR (valid畳み込み [::decim] の 1/decim 計算量版)
+ * y[j] = sum_k x[j*decim + k]*h[k], j=0..n_out-1
+ * 呼出側は len(x) >= (n_out-1)*decim + taps を保証すること。
+ * 畳み込み→間引きの定義そのものなので完全等価 (SSE加算順序差のみ)。
+ */
+SDR_EXPORT void sdr_polyphase_decim(const float * __restrict x, const float * __restrict h,
+                                    float * __restrict y, int n_out, int taps, int decim)
+{
+    for (int j = 0; j < n_out; ++j) {
+        const float *xp = x + (size_t)j * (size_t)decim;
+        float acc = 0.0f;
+#ifdef SDR_HAVE_SSE2
+        if (taps >= 8) {
+            __m128 a0 = _mm_setzero_ps();
+            __m128 a1 = _mm_setzero_ps();
+            int k = 0;
+            for (; k + 8 <= taps; k += 8) {
+                a0 = _mm_add_ps(a0, _mm_mul_ps(_mm_loadu_ps(xp + k), _mm_loadu_ps(h + k)));
+                a1 = _mm_add_ps(a1, _mm_mul_ps(_mm_loadu_ps(xp + k + 4), _mm_loadu_ps(h + k + 4)));
+            }
+            __m128 s = _mm_add_ps(a0, a1);
+            s = _mm_add_ps(s, _mm_movehl_ps(s, s));
+            s = _mm_add_ss(s, _mm_shuffle_ps(s, s, 0x55));
+            acc = _mm_cvtss_f32(s);
+            for (; k < taps; ++k) {
+                acc += xp[k] * h[k];
+            }
+        } else
+#endif
+        {
+            for (int k = 0; k < taps; ++k) {
+                acc += xp[k] * h[k];
+            }
+        }
+        y[j] = acc;
+    }
+}
+
 /* 19kHzパイロットPLL + RDS用57kHz(3θ)搬送波出力 (sdr_stereo_pllの拡張版)
  * cos3/sin3 = cos/sin(3*theta) を追加出力する。RDS復調は57kHzを3θから
  * 生成することでパイロットと完全にコヒーレントになる。
