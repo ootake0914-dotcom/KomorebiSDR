@@ -46,6 +46,9 @@ from adaptive_audio import (
     RmtHankelDenoiser,
     FractionalDeemphasis,
     WaveletNoiseShrinkage,
+    HpssNoiseSeparator,
+    TotalVariationDenoiser,
+    AcousticNonLocalMeans,
 )
 from adaptive_multipath import (
     SubspaceMultipathEqualizer,
@@ -77,4 +80,7 @@ __all__ = [
     "CyclostationaryFeatureDetector",
     "DigitalSelfInterferenceCanceller",
     "WaveletNoiseShrinkage",
+    "HpssNoiseSeparator",
+    "TotalVariationDenoiser",
+    "AcousticNonLocalMeans",
 ]
