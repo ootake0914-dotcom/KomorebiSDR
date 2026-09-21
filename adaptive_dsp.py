@@ -29,16 +29,20 @@ from adaptive_demod import (
     RiemannianTopologicalDemodulator,
     ViterbiPhaseDemodulator,
     SymplecticHamiltonianDemodulator,
+    TopologicalClickSuppressor,
 )
 from adaptive_stereo import (
     QuadratureMpxCanceller,
     SuperSpatialBssStereoSeparator,
     SparseSubcarrierExtractor,
+    QuaternionMpxDecoupler,
+    BistableStochasticResonator,
 )
 from adaptive_audio import (
     CognitiveSpeechMusicTracker,
     HolographicAudioEnhancer,
     RmtHankelDenoiser,
+    FractionalDeemphasis,
 )
 from adaptive_multipath import (
     SubspaceMultipathEqualizer,
@@ -63,4 +67,8 @@ __all__ = [
     "WassersteinMultipathEqualizer",
     "SymplecticHamiltonianDemodulator",
     "SparseSubcarrierExtractor",
+    "FractionalDeemphasis",
+    "TopologicalClickSuppressor",
+    "QuaternionMpxDecoupler",
+    "BistableStochasticResonator",
 ]

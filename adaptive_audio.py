@@ -5,6 +5,7 @@ Audio-domain adaptive modules (extracted from adaptive_dsp.py).
 - CognitiveSpeechMusicTracker (音声/音楽判別EQ)
 - HolographicAudioEnhancer (倍音外挿)
 - RmtHankelDenoiser (RMTノイズ除去)
+- FractionalDeemphasis (分数階微積分・非整数階ディエンファシス)
 
 `adaptive_dsp.py` は後方互換のため同名を再エクスポートする。
 """
@@ -361,3 +362,170 @@ class RmtHankelDenoiser:
 
         out = np.convolve(buf, kernel, mode='valid')
         return out[:n].astype(np.float32)
+
+
+class FractionalDeemphasis:
+    """
+    分数階微積分 (Fractional Calculus) に基づく非整数階適応ディエンファシス・プロセッサ。
+
+    【数理的背景】
+    FM復調器から出力される三角ノイズ (f^2 パワースペクトル) および都市部・室内環境での
+    マルチパス反射波スペクトルは、非整数べき乗 (フラクタル次元) 特性を示します。
+    従来の整数階ディエンファシス (alpha = 1.0, 1次ローパス, -6dB/oct) は、
+    カットオフ周波数以上で最大 -90° もの急峻な位相回転を伴い、中高域の群遅延歪み
+    (定位の曖昧さ・ボーカルのアタック感の減退) を引き起こします。
+
+    本クラスでは、連続時間分数階伝達関数:
+        H(s) = 1 / (1 + s * tau)^alpha   (0.5 <= alpha <= 1.0)
+    を、制御理論で標準的な Oustaloup / Matsuda 型の周波数幾何分割法によって
+    可聴帯域 (100Hz 〜 20kHz) において有理極零点カスケード (IIR) として高精度近似します。
+
+    【効果】
+    - 群遅延歪み極小化: 高域位相回転が -alpha * 90° (例: alpha=0.7なら -63°) に抑制され、
+      音場の透明感・シンバルの余韻・ステレオ定位感が向上。
+    - 三角ノイズ適応シェーピング:
+      強電界時は alpha=0.7〜0.8 (超低位相歪み Hi-Fi)
+      弱電界時は alpha=1.0 (標準急峻ノイズカット)
+      へと滑らかに自動遷移。
+    """
+
+    def __init__(self, sample_rate: float = 48000.0, tau_us: float = 50.0, alpha: float = 0.8, order: int = 3):
+        self.fs = float(sample_rate)
+        self.tau = float(tau_us) * 1e-6
+        self.fc = 1.0 / (2.0 * np.pi * self.tau)
+        self.alpha = float(np.clip(alpha, 0.2, 1.0))
+        self.order = int(max(1, min(order, 5)))
+        self.enabled = True
+
+        # フィルタ係数 [N_sections, 2] (b0, b1, a0, a1)
+        self._sections = []
+        # 各チャンネルの Direct Form II Transposed 状態変数
+        # [ch_idx, section_idx] -> float
+        self._state_l = np.zeros(self.order, dtype=np.float64)
+        self._state_r = np.zeros(self.order, dtype=np.float64)
+
+        self._recompute_coefficients()
+
+    def set_alpha(self, alpha: float):
+        """分数階数 alpha を動的に更新 (0.2 <= alpha <= 1.0)"""
+        new_alpha = float(np.clip(alpha, 0.2, 1.0))
+        if abs(new_alpha - self.alpha) > 1e-3:
+            self.alpha = new_alpha
+            self._recompute_coefficients()
+
+    def set_tau(self, tau_us: float):
+        """時定数 tau (マイクロ秒) を更新 (日本: 50.0, 欧米: 75.0)"""
+        new_tau = float(tau_us) * 1e-6
+        if abs(new_tau - self.tau) > 1e-7:
+            self.tau = new_tau
+            self.fc = 1.0 / (2.0 * np.pi * self.tau)
+            self._recompute_coefficients()
+
+    def reset(self):
+        """内部フィルタ状態をゼロクリア"""
+        self._state_l.fill(0.0)
+        self._state_r.fill(0.0)
+
+    def _recompute_coefficients(self):
+        """
+        Oustaloup 極零点配置法による分数階伝達関数 H(s) = (1 + s/wc)^(-alpha) の
+        デジタル IIR カスケード係数再計算。
+        """
+        wc = 2.0 * np.pi * self.fc
+        wh = 2.0 * np.pi * min(self.fs * 0.45, 20000.0)
+        T = 1.0 / self.fs
+
+        if self.alpha >= 0.999 or self.order == 1:
+            # alpha = 1.0 の場合は標準の単一極 (1次ローパス) へ正確に退化
+            # H(s) = 1 / (1 + s/wc)
+            # 双一次変換 (プリワーピング付き)
+            wa = (2.0 / T) * np.tan(wc * T / 2.0)
+            a0 = wa + 2.0 / T
+            b0 = wa / a0
+            b1 = wa / a0
+            a1 = (wa - 2.0 / T) / a0
+            self._sections = [(float(b0), float(b1), 1.0, float(a1))]
+            self._state_l = np.zeros(1, dtype=np.float64)
+            self._state_r = np.zeros(1, dtype=np.float64)
+            return
+
+        N = self.order
+        gamma = self.alpha
+        ratio = wh / wc
+        mu = ratio ** (1.0 / float(N))
+
+        # 極・零点を周波数軸上で幾何学的に交互配置
+        # H(s) ≈ prod_{k=0}^{N-1} (1 + s / z_k) / (1 + s / p_k)
+        sections = []
+        for k in range(N):
+            pk = wc * (mu ** (k + (1.0 - gamma) / 2.0))
+            zk = pk * (mu ** gamma)
+
+            # プリワーピング付き双一次変換
+            pa = (2.0 / T) * np.tan(min(pk, self.fs * np.pi * 0.92) * T / 2.0)
+            za = (2.0 / T) * np.tan(min(zk, self.fs * np.pi * 0.95) * T / 2.0)
+
+            a0 = pa + 2.0 / T
+            b0 = (pa / za) * (za + 2.0 / T) / a0
+            b1 = (pa / za) * (za - 2.0 / T) / a0
+            a1 = (pa - 2.0 / T) / a0
+
+            sections.append((float(b0), float(b1), 1.0, float(a1)))
+
+        self._sections = sections
+        if len(self._state_l) != len(sections):
+            self._state_l = np.zeros(len(sections), dtype=np.float64)
+            self._state_r = np.zeros(len(sections), dtype=np.float64)
+
+    def process(self, audio: np.ndarray, s_meter_dbfs: float = None) -> np.ndarray:
+        """
+        オーディオ信号 (1ch または 2ch) を分数階ディエンファシス処理する。
+        - s_meter_dbfs が指定された場合、電界強度に応じて alpha を自動適応:
+          強電界 (> -25dBFS): alpha = 0.75 (高域の位相歪み最小・定位感向上)
+          中電界 (-38dBFS 〜 -25dBFS): alpha を線形補間
+          弱電界 (< -38dBFS): alpha = 1.0 (標準急峻ノイズカット)
+        - s_meter_dbfs が None の場合、現在の self.alpha をそのまま維持
+        """
+        if not self.enabled or len(audio) == 0:
+            return audio
+
+        # 電界強度に応じた alpha の適応制御 (明示指定時のみ)
+        if s_meter_dbfs is not None:
+            if s_meter_dbfs >= -25.0:
+                target_alpha = 0.75
+            elif s_meter_dbfs <= -38.0:
+                target_alpha = 1.0
+            else:
+                frac = (-25.0 - s_meter_dbfs) / 13.0
+                target_alpha = 0.75 + frac * 0.25
+            self.set_alpha(target_alpha)
+
+        # 1ch / 2ch 判定
+        is_stereo = (audio.ndim == 2 and audio.shape[1] == 2)
+        if is_stereo:
+            out = np.empty_like(audio)
+            out[:, 0] = self._filter_channel(audio[:, 0], self._state_l)
+            out[:, 1] = self._filter_channel(audio[:, 1], self._state_r)
+            return out
+        else:
+            mono = audio.ravel()
+            filtered = self._filter_channel(mono, self._state_l)
+            return filtered.reshape(audio.shape)
+
+    def _filter_channel(self, x: np.ndarray, state: np.ndarray) -> np.ndarray:
+        """単一チャンネルに対するカスケード 1次 IIR (Direct Form II Transposed) 高速演算"""
+        y = x.astype(np.float64, copy=True)
+        for i, (b0, b1, _, a1) in enumerate(self._sections):
+            s0 = state[i]
+            # y_out[n] = b0 * x[n] + s0
+            # s0_next = b1 * x[n] - a1 * y_out[n]
+            y_new = np.empty_like(y)
+            for n in range(len(y)):
+                xn = y[n]
+                yn = b0 * xn + s0
+                s0 = b1 * xn - a1 * yn
+                y_new[n] = yn
+            state[i] = s0
+            y = y_new
+        return y.astype(np.float32)
+
