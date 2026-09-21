@@ -87,12 +87,45 @@ def test_is_settled_blanking():
     print("[OK] is_settled blanking")
 
 
+def test_diagnose_environment():
+    print("===== test_diagnose_environment =====")
+    import numpy as np
+    from signal_logger import SignalLogger, diagnose_environment, format_environment_report
+    _clean()
+    lg = SignalLogger(path=TMP, max_bytes=10 ** 9)
+    # 台風・フェージング・激しいマルチパスの模擬ログ
+    for i in range(50):
+        lg.log({
+            "freq_hz": 79500000, "mode": "WFM", "gain_db": 49.6,
+            "pilot_lock": 0.45 + 0.3 * np.sin(i * 0.5),
+            "blend": 0.2 if (i % 4 == 0) else 0.9,
+            "nr_gain": 0.5,
+            "cut_hz": 7000.0 + 3000.0 * (i % 2),  # 激しいチャタリング
+            "wiener_gain": 0.25,  # 強力抑圧
+            "multipath_gain": 0.38,  # 重篤マルチパス
+            "afc_hz": 20.0,
+            "s_units": 11.5 + 1.2 * np.sin(i * 0.2),  # フェージング
+            "snr_db": 14.0,
+            "audio_snr_db": 10.0,
+        })
+    diag = diagnose_environment(TMP, freq_hz=79500000, recent_n=50)
+    assert diag["status"] == "ok"
+    assert diag["fading"]["is_fading"] is True
+    assert "深刻" in diag["multipath"]["severity"]
+    assert diag["musical_noise"]["risk_score"] > 50
+    assert any("MONO" in r for r in diag["recommendations"])
+    txt = format_environment_report(diag)
+    assert "精密診断レポート" in txt
+    print("[OK] diagnose_environment")
+
+
 def main() -> int:
     try:
         test_log_and_load()
         test_rotation()
         test_summarize_finds_blend_hunting()
         test_is_settled_blanking()
+        test_diagnose_environment()
     except AssertionError as e:
         print(f"FAILED: {e}")
         return 1

@@ -37,6 +37,7 @@ COLUMNS = [
     "ts", "freq_hz", "mode", "gain_db",
     "pilot_lock", "blend", "nr_gain", "cut_hz", "wiener_gain",
     "multipath_gain", "afc_hz", "s_units",
+    "snr_db", "audio_snr_db",
 ]
 
 
@@ -148,13 +149,195 @@ def summarize(path: str, freq_hz: int = None) -> dict:
     return {"n": len(rows), "stats": stats, "order": order, "hints": hints}
 
 
+def diagnose_environment(path: str, freq_hz: int = None, recent_n: int = 120) -> dict:
+    """現在の受信環境を多角的に精密診断する。
+    台風・強風によるマルチパスフェージング、19kHz/38kHzステレオ副搬送波の乱れ、
+    および適応フィルターの過剰反応によるミュージカルノイズ(ピロピロ音)の危険度を算出。
+    """
+    import numpy as np
+    rows = load_rows(path)
+    if freq_hz is not None:
+        rows = [r for r in rows if abs(r.get("freq_hz", -1) - freq_hz) <= 50000]
+    if len(rows) < 10:
+        return {"status": "error", "message": "データ不足 (10行以上記録してから実行してください)"}
+
+    # 直近 recent_n 行（直近約2分間）を分析
+    recent = rows[-recent_n:] if len(rows) > recent_n else rows
+    n = len(recent)
+
+    def get_arr(key: str, default: float = 0.0) -> np.ndarray:
+        v = np.array([r.get(key, np.nan) for r in recent], dtype=np.float64)
+        v = v[np.isfinite(v)]
+        return v if len(v) > 0 else np.array([default], dtype=np.float64)
+
+    s_arr = get_arr("s_units", 9.0)
+    mp_arr = get_arr("multipath_gain", 1.0)
+    pl_arr = get_arr("pilot_lock", 1.0)
+    bl_arr = get_arr("blend", 1.0)
+    w_arr = get_arr("wiener_gain", 1.0)
+    nr_arr = get_arr("nr_gain", 1.0)
+    cut_arr = get_arr("cut_hz", 15000.0)
+    gain_arr = get_arr("gain_db", 30.0)
+    afc_arr = get_arr("afc_hz", 0.0)
+    snr_arr = get_arr("snr_db", 0.0)
+    aud_arr = get_arr("audio_snr_db", 0.0)
+
+    # 1. 電界フェージング診断 (RF Fading)
+    s_depth = float(np.max(s_arr) - np.min(s_arr))
+    s_std = float(np.std(s_arr))
+    is_fading = s_depth > 0.8 or s_std > 0.25
+
+    # 2. マルチパス干渉 (Multipath Distortion)
+    mp_mean = float(np.mean(mp_arr))
+    mp_min = float(np.min(mp_arr))
+    mp_active_ratio = float(np.mean(mp_arr < 0.85))
+    if mp_mean < 0.60 or mp_min < 0.40:
+        mp_severity = "深刻 (SEVERE: 強風・反射物揺れによる激しい多重波)"
+    elif mp_mean < 0.85 or mp_active_ratio > 0.3:
+        mp_severity = "中等度 (MODERATE: 反射波が継続混入中)"
+    else:
+        mp_severity = "軽微 (CLEAN: 直接波が支配的)"
+
+    # 3. 19kHz/38kHz ステレオ副搬送波・パイロット同期
+    pl_min = float(np.min(pl_arr))
+    pl_mean = float(np.mean(pl_arr))
+    pl_unlock_ratio = float(np.mean(pl_arr < 0.70))
+    # ブレンドのハンティング回数 (0.4以下と0.7以上の横断)
+    b_crosses = 0
+    for i in range(1, len(bl_arr)):
+        if (bl_arr[i - 1] < 0.4 and bl_arr[i] > 0.7) or (bl_arr[i - 1] > 0.7 and bl_arr[i] < 0.4):
+            b_crosses += 1
+
+    # 4. ミュージカルノイズ (ピロピロ音) 危険度指数 (0 - 100%)
+    wiener_deep_ratio = float(np.mean(w_arr < 0.40))
+    cut_diffs = np.abs(np.diff(cut_arr)) if len(cut_arr) > 1 else np.array([0.0])
+    cut_chatter_ratio = float(np.mean(cut_diffs > 800.0))
+    
+    # 複合リスクスコア
+    risk_score = int(np.clip(
+        (wiener_deep_ratio * 45.0) +
+        (cut_chatter_ratio * 35.0) +
+        ((1.0 - mp_mean) * 20.0),
+        0.0, 100.0
+    ))
+    if risk_score >= 60:
+        risk_level = "CRITICAL (ピロピロ・バーディ音 激甚発生中)"
+    elif risk_score >= 35:
+        risk_level = "HIGH (ピロピロ音・違和感が顕著に聴こえるレベル)"
+    elif risk_score >= 15:
+        risk_level = "MODERATE (わずかな残差・変調感あり)"
+    else:
+        risk_level = "LOW (極めて自然・ピロピロ音なし)"
+
+    # 5. 推奨アクション
+    recommendations = []
+    if pl_unlock_ratio > 0.2 or mp_mean < 0.75 or b_crosses >= 2:
+        recommendations.append("[Stereo] ボタンを押して「MONO」に切り替える (台風フェージングによる38kHz副搬送波の位相乱れを完全遮断)")
+    if wiener_deep_ratio > 0.3 or cut_chatter_ratio > 0.2:
+        recommendations.append("[NR] ボタンを押して「OFF」にする (適応ウィーナーフィルターの急峻な追従によるミュージカルノイズを停止)")
+    if float(np.std(gain_arr)) > 2.0 or is_fading:
+        recommendations.append("[Auto Gain] を手動ゲイン固定にする (電波の揺れに追従するAGCハンティングを抑止)")
+    if not recommendations:
+        recommendations.append("現在の受信状態は極めて安定しています。特に対処は不要です。")
+
+    latest_freq_mhz = float(recent[-1].get("freq_hz", 0.0)) / 1e6
+
+    return {
+        "status": "ok",
+        "sample_count": n,
+        "latest_freq_mhz": latest_freq_mhz,
+        "fading": {
+            "s_mean": float(np.mean(s_arr)),
+            "s_depth": s_depth,
+            "s_std": s_std,
+            "is_fading": is_fading,
+            "status": "台風・強風フェージング検出 (Deep Fast Fading)" if is_fading else "安定電界",
+        },
+        "multipath": {
+            "gain_mean": mp_mean,
+            "gain_min": mp_min,
+            "active_ratio_pct": mp_active_ratio * 100.0,
+            "severity": mp_severity,
+        },
+        "stereo_stability": {
+            "pilot_lock_mean": pl_mean,
+            "pilot_lock_min": pl_min,
+            "pilot_unlock_ratio_pct": pl_unlock_ratio * 100.0,
+            "blend_hunting_count": b_crosses,
+        },
+        "musical_noise": {
+            "risk_score": risk_score,
+            "risk_level": risk_level,
+            "wiener_deep_suppression_pct": wiener_deep_ratio * 100.0,
+            "cutoff_chatter_pct": cut_chatter_ratio * 100.0,
+        },
+        "recommendations": recommendations,
+    }
+
+
+def format_environment_report(diag: dict) -> str:
+    """診断結果を人間が読みやすい日本語テキストレポートに整形"""
+    if diag.get("status") != "ok":
+        return f"[エラー] {diag.get('message', '不明なエラー')}"
+
+    f = diag["fading"]
+    m = diag["multipath"]
+    s = diag["stereo_stability"]
+    mn = diag["musical_noise"]
+
+    lines = [
+        "============================================================",
+        f"  SDR 受信環境 & 台風・ピロピロノイズ精密診断レポート",
+        f"  対象周波数: {diag['latest_freq_mhz']:.2f} MHz (直近 {diag['sample_count']} 秒間の実測データ)",
+        "============================================================",
+        f"【1. 電波フェージング (台風・風揺れ)】: {f['status']}",
+        f"  - S値 平均: S{f['s_mean']:.1f} | 変動幅 (P-P): {f['s_depth']:.1f} S単位 (std: {f['s_std']:.2f})",
+        "",
+        f"【2. マルチパス反射波干渉】: {m['severity']}",
+        f"  - マルチパス係数 平均: {m['gain_mean']:.2f} (最小値: {m['gain_min']:.2f})",
+        f"  - 反射波抑圧 発動率: {m['active_ratio_pct']:.1f}%",
+        "",
+        f"【3. ステレオ副搬送波 (38kHz) 安定度】",
+        f"  - 19kHzパイロットロック: 平均 {s['pilot_lock_mean']:.2f} (最低: {s['pilot_lock_min']:.2f})",
+        f"  - パイロット脱調・低下率: {s['pilot_unlock_ratio_pct']:.1f}%",
+        f"  - ステレオ⇔モノラル急変 (ハンティング) 回数: {s['blend_hunting_count']} 回",
+        "",
+        f"【4. ピロピロ音 (ミュージカルノイズ) 危険度】: {mn['risk_level']}",
+        f"  - リスク総合スコア: {mn['risk_score']} / 100",
+        f"  - ウィーナー強抑圧率 (wiener<0.40): {mn['wiener_deep_suppression_pct']:.1f}%",
+        f"  - カットオフ周波数の急変頻度: {mn['cutoff_chatter_pct']:.1f}%",
+        "",
+        "------------------------------------------------------------",
+        "【診断結論と推奨対処アクション】",
+    ]
+    for idx, rec in enumerate(diag["recommendations"], start=1):
+        lines.append(f"  {idx}. {rec}")
+    lines.append("============================================================")
+    return "\n".join(lines)
+
+
 if __name__ == "__main__":
     import sys
     import json
-    target = sys.argv[1] if len(sys.argv) > 1 else os.path.join(config_dir(), LOG_NAME)
-    freq = int(sys.argv[2]) if len(sys.argv) > 2 else None
-    if not os.path.exists(target):
-        print(f"ログがありません: {target}\n"
-              f"先に main.py を起動して受信してください (記録は受信中に1Hzで追記されます)。")
-        raise SystemExit(2)
-    print(json.dumps(summarize(target, freq), indent=2, ensure_ascii=False))
+    target = os.path.join(config_dir(), LOG_NAME)
+    freq = None
+    show_env = True
+
+    args = sys.argv[1:]
+    if args and not args[0].startswith("-"):
+        target = args[0]
+        args = args[1:]
+    if args and not args[0].startswith("-"):
+        try:
+            freq = int(args[0])
+            args = args[1:]
+        except ValueError:
+            pass
+
+    if "--json" in args:
+        print(json.dumps(diagnose_environment(target, freq), indent=2, ensure_ascii=False))
+    elif "--summary-json" in args:
+        print(json.dumps(summarize(target, freq), indent=2, ensure_ascii=False))
+    else:
+        diag = diagnose_environment(target, freq)
+        print(format_environment_report(diag))

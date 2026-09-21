@@ -961,19 +961,23 @@ class SdrApp:
                         if _sig_settled(time.monotonic(),
                                         getattr(d, "_tune_monotonic", 0.0),
                                         getattr(self, "_worker_t0", 0.0)):
+                            snr_val = float(stats.get("channel_snr_db", stats.get("estimated_snr", 0.0))) if "stats" in locals() and isinstance(stats, dict) else 0.0
+                            aud_snr = float(stats.get("audio_snr_db", 0.0)) if "stats" in locals() and isinstance(stats, dict) else 0.0
                             self.sig_logger.log({
-                            "freq_hz": self.freq,
-                            "mode": self.mode,
-                            "gain_db": getattr(self.gui, "gain_val", 0.0),
-                            "pilot_lock": getattr(d, "stereo_pilot_lock", 0.0),
-                            "blend": getattr(d, "stereo_blend", 0.0),
-                            "nr_gain": getattr(d, "stereo_nr_gain", 1.0),
-                            "cut_hz": getattr(d, "stereo_cut_hz", 0.0),
-                            "wiener_gain": getattr(d, "stereo_wiener_gain", 1.0),
-                            "multipath_gain": getattr(d, "multipath_gain", 1.0),
-                            "afc_hz": getattr(d, "afc_offset_hz", 0.0),
-                            "s_units": getattr(d, "s_units", 0.0),
-                        })
+                                "freq_hz": self.freq,
+                                "mode": self.mode,
+                                "gain_db": getattr(self.gui, "gain_val", 0.0),
+                                "pilot_lock": getattr(d, "stereo_pilot_lock", 0.0),
+                                "blend": getattr(d, "stereo_blend", 0.0),
+                                "nr_gain": getattr(d, "stereo_nr_gain", 1.0),
+                                "cut_hz": getattr(d, "stereo_cut_hz", 0.0),
+                                "wiener_gain": getattr(d, "stereo_wiener_gain", 1.0),
+                                "multipath_gain": getattr(d, "multipath_gain", 1.0),
+                                "afc_hz": getattr(d, "afc_offset_hz", 0.0),
+                                "s_units": getattr(d, "s_units", 0.0),
+                                "snr_db": snr_val,
+                                "audio_snr_db": aud_snr,
+                            })
                 except Exception:
                     pass
 
