@@ -139,6 +139,14 @@ class CognitiveSpeechMusicTracker:
         音声確率に応じて、3kHz線形位相プレゼンスEQ (トーク了解度) と
         完全フラット (音楽) をシームレスに適用する。
         全体の音量ジャンプ (ポンピング歪み) を排除し等ラウドネス (ユニティゲイン) を維持。
+
+        NOTE (時間軸の一意化): 音声確率に関わらず常に線形位相FIRの群遅延
+        (_dly=20サンプル=0.42ms、知覚不能) だけ遅延した同一時間軸で出力する。
+        旧実装は「音楽=無遅延バイパス / トーク=遅延ウェット」を確率で切り替え、
+        さらに無遅延dryと遅延wetをクロスフェードしていたため、
+        (1) 中間確率で20サンプル遅延のコム打ち消し (1kHzが最大-12dB)、
+        (2) 確率が0.05を跨ぐたびに20サンプルの時間跳び (クリック・ワーブ)、
+        の2つの実害が出た。定遅延化で両方を原理排除する。
         """
         if not self.enabled or len(audio) == 0:
             return audio
@@ -148,24 +156,8 @@ class CognitiveSpeechMusicTracker:
         prob = float(self.speech_prob)
         req = len(self.fir_presence) - 1
 
-        # 音楽時 (prob < 0.05): 履歴バッファのみ更新し原音完全ビットパーフェクト維持
-        if prob < 0.05:
-            for i, ch in enumerate(chs):
-                hist = self.hist_l if i == 0 else self.hist_r
-                if len(hist) != req:
-                    hist = np.zeros(req, dtype=np.float32)
-                    if i == 0:
-                        self.hist_l = hist
-                    else:
-                        self.hist_r = hist
-                hist[:] = ch[-req:] if len(ch) >= req else np.concatenate((hist[len(ch):], ch))
-            return audio
-
         # トーク時: 0.05から1.0へ滑らかに連続立ち上がり (境界クリックゼロ)
-        eff_gain = float(0.25 * (prob - 0.05) / 0.95)
-        # 音楽(0遅延)からトーク(20サンプル群遅延整合)への遷移を滑らかにクロスフェード。
-        # 窓は 0.05〜0.35 と広めに取り (旧0.05〜0.15では番組境界の確率揺らぎが
-        # そのまま可聴な明瞭度ポンピングになった)、確率の速い往復を均す。
+        eff_gain = float(0.25 * max(0.0, prob - 0.05) / 0.95)
         fade_w = float(np.clip((prob - 0.05) / 0.30, 0.0, 1.0))
         outs = []
         for i, ch in enumerate(chs):
@@ -182,11 +174,10 @@ class CognitiveSpeechMusicTracker:
             bp = np.convolve(x_ext, self.fir_presence, mode="valid")
             # 群遅延補償: BPFの中心タップ(self._dly=20)と完全に時間整合した原音声
             ch_dly = x_ext[self._dly : self._dly + len(ch)]
-            # 3kHz成分と同位相で加算することで、クシ型フィルタによる位相打ち消し・歪みを完全排除
-            eq_target = ch_dly + eff_gain * bp
-            modified = (1.0 - fade_w) * ch + fade_w * eq_target
+            # 群遅延整合済み原音へ、フェード量で重み付けしたプレゼンス成分を加算。
+            # dry/wetを同一時間軸に統一しコムを原理的に排除する。
+            modified = ch_dly + fade_w * eff_gain * bp
             outs.append(modified.astype(np.float32))
-
         if is_stereo:
             return np.stack(outs, axis=1)
         return outs[0]
@@ -389,5 +380,207 @@ class RmtHankelDenoiser:
 
         out = np.convolve(buf, kernel, mode='valid')
         return out[:n].astype(np.float32)
+
+
+class MonoNoiseSuppressor:
+    """単一チャンネル スペクトル抑圧ノイズリダクション (ノイズフレーム選択型)。
+
+    FM弱電界ではプログラム帯域内 (0〜カットオフ) に信号と重なったノイズが残る。
+    ハイカットやシェルフでは除去できないこの帯域内ノイズを、STFT領域の
+    Wienerゲイン G = P / (P + alpha * floor) で抑圧する。
+
+    ノイズフロア floor は「ノイズフレーム」からのみ学習する:
+    直近5秒のフレームエネルギーの最小値から +6dB 以内のフレームだけを
+    真の無音/ノイズ区間とみなし、そのスペクトルの下位パーセンタイルを取る。
+    これにより強局の静かな音楽パッセージをノイズと誤学習して抑圧する
+    「ブリージング」を防ぐ (番組フレームは G→1 で透明に通過)。
+
+    - 48kHz / FFT 1024 / hop 344 / Hann (WOLA完全再構成)
+    - 時間平滑 (アタック速・リリース遅) + 周波数3bin平滑でミュージカルノイズ抑制
+    - 出力は常に同一時間軸 (再構成遅延 680サンプル=14ms、知覚不能)
+    - クリーン信号: 再構成誤差のみ (実質ビット一致)
+    """
+
+    def __init__(self, sample_rate: float = 48000.0, n_fft: int = 1024,
+                 hop: int = 344, over_sub: float = 2.5, max_atten_db: float = -15.0,
+                 floor_sec: float = 3.0, floor_pct: float = 10.0,
+                 noise_margin_db: float = 6.0):
+        self.fs = float(sample_rate)
+        self.n_fft = int(n_fft)
+        # hop=344 はパイプラインの1ブロック=2752サンプルの約数 (2752/8)。
+        # ブロック毎に整数ホップ消費となり、STFTフレーム格子がブロック境界を
+        # 跨いで連続する (格子ずれによる周期性アーティファクトを防止)。
+        self.hop = int(hop)
+        self.win = np.hanning(self.n_fft).astype(np.float64)
+        self.over_sub = float(over_sub)
+        self.g_min = float(10.0 ** (max_atten_db / 20.0))
+        self.floor_pct = float(floor_pct)
+        nfr = max(8, int(floor_sec * self.fs / self.hop))
+        self._floor_frames = nfr
+        self._warmup_frames = 32  # ノイズフレーム蓄積中の素通し数 (~0.23s)
+        self._noise_margin = float(10.0 ** (noise_margin_db / 10.0))
+        self._ring_len = max(8, int(5.0 * self.fs / self.hop))  # 5秒スライディング最小
+        nb = self.n_fft // 2 + 1
+        self._tail_len = self.n_fft - self.hop
+        self._st = {}
+        for ch in ("", "_l", "_r"):
+            self._st[ch] = {
+                # ストリーミングWOLA状態: フレーム格子は絶対位置のhop倍数で連続。
+                # buf/buf_pos: 未処理入力、frame_next: 次フレーム開始絶対位置、
+                # acc/wsum/out_pos: 確定待ちWOLAアキュムレータ、pending: 未返却出力。
+                "buf": np.zeros(self._tail_len, dtype=np.float64),
+                "buf_pos": -self._tail_len,
+                "stream_pos": 0,
+                "frame_next": -self._tail_len,
+                "out_pos": -self._tail_len,
+                "acc": np.zeros(0, dtype=np.float64),
+                "wsum": np.zeros(0, dtype=np.float64),
+                "pending": np.zeros(0, dtype=np.float64),
+                # floor は (bin, 履歴) 転置格納: percentile を連続軸で取るため
+                "floor": np.zeros((nb, nfr), dtype=np.float32),
+                "idx": 0,
+                "fidx": 0,
+                "gain": np.ones(nb, dtype=np.float64),
+                "cache": np.ones(nb, dtype=np.float64),
+                "gated": False,
+                "count": 0,
+                # ノイズフレーム選択: 直近5秒のフレームエネルギーの最小値
+                "ering": np.full(self._ring_len, np.inf, dtype=np.float64),
+                "eidx": 0,
+                "nupd": 0,
+            }
+        self.enabled = True
+
+    def reset(self):
+        for ch in self._st:
+            s = self._st[ch]
+            s["buf"] = np.zeros(self._tail_len, dtype=np.float64)
+            s["buf_pos"] = -self._tail_len
+            s["stream_pos"] = 0
+            s["frame_next"] = -self._tail_len
+            s["out_pos"] = -self._tail_len
+            s["acc"] = np.zeros(0, dtype=np.float64)
+            s["wsum"] = np.zeros(0, dtype=np.float64)
+            s["pending"] = np.zeros(0, dtype=np.float64)
+            s["floor"].fill(0.0)
+            s["idx"] = 0
+            s["fidx"] = 0
+            s["gain"].fill(1.0)
+            s["cache"].fill(1.0)
+            s["gated"] = False
+            s["count"] = 0
+            s["ering"].fill(np.inf)
+            s["eidx"] = 0
+            s["nupd"] = 0
+
+    def process(self, audio: np.ndarray, ch: str = "") -> np.ndarray:
+        """オーディオ配列を受け取り、スペクトル抑圧後の同一長配列を返す。
+
+        WOLAアキュムレータを呼び出し間で保持し、フレーム格子を絶対位置の
+        hop倍数に固定するため、ブロック分割と一括処理の結果は完全一致する。
+        出力は入力に対し常に tail_len サンプル (14ms) 遅延する (知覚不能)。
+        性能のため絶対フレーム番号で整列した8フレーム単位で一括処理する
+        (リアルタイム予算: 3ch合計で数ms/ブロック)。
+        """
+        if not self.enabled or len(audio) == 0:
+            return audio
+        st = self._st.get(ch)
+        if st is None:
+            st = self._st[""]
+        n_fft, hop = self.n_fft, self.hop
+        nb = n_fft // 2 + 1
+        win = self.win
+        x = np.asarray(audio, dtype=np.float64)
+        st["buf"] = np.concatenate((st["buf"], x))
+        st["stream_pos"] += len(x)
+        hist = st["floor"]
+        cols_all = np.arange(n_fft)
+        # 入力が揃ったフレームを8フレーム単位で処理 (窓長分の先読みで遅延)
+        while st["frame_next"] + n_fft <= st["stream_pos"]:
+            g0 = st["fidx"]  # 絶対フレーム番号 (フロア更新点を呼び出し分割に依存させない)
+            nf = 8 - (g0 % 8)
+            avail = (st["stream_pos"] - n_fft - st["frame_next"]) // hop + 1
+            if nf > avail:
+                nf = avail
+            f = st["frame_next"]
+            o = f - st["buf_pos"]
+            base = o + np.arange(nf)[:, None] * hop + cols_all[None, :]
+            X = np.fft.rfft(st["buf"][base] * win, axis=1)
+            P = X.real * X.real + X.imag * X.imag
+            e = P.sum(axis=1)
+            # ノイズフレーム選択: 直近5秒の最小フレームエネルギーから
+            # +6dB以内のフレームのみを「真の無音/ノイズ」とみなして学習する。
+            # 静かな音楽パッセージを床と誤学習すると強局でブリージングするため。
+            # 起動時のゼロ尾を含むフレーム (f<0) はリングに入れない。
+            if f >= 0:
+                ring = st["ering"]
+                nring = len(ring)
+                ring[(st["eidx"] + np.arange(nf)) % nring] = e
+                st["eidx"] = (st["eidx"] + nf) % nring
+                sel = (e > 1e-12) & (e <= float(np.min(ring)) * self._noise_margin)
+                k = int(np.sum(sel))
+                if k:
+                    cols = (st["idx"] + np.arange(k)) % self._floor_frames
+                    hist[:, cols] = P[sel].T.astype(np.float32)
+                    st["idx"] = (st["idx"] + k) % self._floor_frames
+                    st["nupd"] += k
+            st["count"] += nf
+            # フロア再計算 (16フレーム毎 = 絶対グループ番号で間引き) と定常性ゲート
+            # (フロアが平均に近い = 信号自身が定常でノイズと分離不能なため素通し)
+            if st["nupd"] > 0 and (g0 // 8) % 2 == 0:
+                valid = hist[:, :min(st["nupd"], self._floor_frames)]
+                kk = int(self.floor_pct * 0.01 * (valid.shape[1] - 1))
+                st["cache"] = np.partition(valid, kk, axis=1)[:, kk].astype(np.float64)
+                st["gated"] = float(np.sum(st["cache"])) > 0.5 * float(np.mean(valid)) * nb
+            # ウォームアップ: ノイズフレームが十分溜まるまでは素通し。
+            # 無音区間が無い定常信号は永久に素通しとなり安全側に倒れる。
+            if st["nupd"] < self._warmup_frames or st["gated"]:
+                g = np.ones((nf, nb), dtype=np.float64)
+            else:
+                g = P / (P + self.over_sub * st["cache"][None, :] + 1e-18)
+                np.maximum(g, self.g_min, out=g)
+            # 時間平滑 (アタック速・リリース遅、フレーム方向のみ逐次)
+            prev = st["gain"]
+            gs = np.empty_like(g)
+            for j in range(nf):
+                a = np.where(g[j] > prev, 0.5, 0.08)
+                prev = a * g[j] + (1.0 - a) * prev
+                gs[j] = prev
+            st["gain"] = prev
+            # 周波数方向3bin平滑 (ミュージカルノイズ抑制)
+            gs[:, 1:-1] = (gs[:, :-2] + gs[:, 1:-1] + gs[:, 2:]) / 3.0
+            y = np.fft.irfft(X * gs, n_fft, axis=1)
+            off0 = f - st["out_pos"]
+            need = off0 + (nf - 1) * hop + n_fft
+            if len(st["acc"]) < need:
+                st["acc"] = np.concatenate((st["acc"], np.zeros(need - len(st["acc"]))))
+                st["wsum"] = np.concatenate((st["wsum"], np.zeros(need - len(st["wsum"]))))
+            w2 = win * win
+            for j in range(nf):
+                off = off0 + j * hop
+                st["acc"][off:off + n_fft] += y[j] * win
+                st["wsum"][off:off + n_fft] += w2
+            st["frame_next"] = f + nf * hop
+            st["fidx"] = g0 + nf
+        # 寄与し得る全フレームが処理済みのサンプルだけを確定する
+        avail = st["frame_next"] - st["out_pos"]
+        if avail > 0:
+            done = st["acc"][:avail] / np.maximum(st["wsum"][:avail], 1e-12)
+            st["pending"] = np.concatenate((st["pending"], done))
+            st["acc"] = st["acc"][avail:]
+            st["wsum"] = st["wsum"][avail:]
+            st["out_pos"] = st["frame_next"]
+        trim = st["frame_next"] - st["buf_pos"]
+        if trim > 0:
+            st["buf"] = st["buf"][trim:]
+            st["buf_pos"] = st["frame_next"]
+        if len(st["pending"]) >= len(x):
+            ret = st["pending"][:len(x)]
+            st["pending"] = st["pending"][len(x):]
+        else:
+            # 入力末尾の窓長未満分 (一括呼び出しの末尾等) はゼロ埋め
+            ret = np.concatenate((st["pending"], np.zeros(len(x) - len(st["pending"]))))
+            st["pending"] = np.zeros(0, dtype=np.float64)
+        return ret.astype(np.float32)
 
 

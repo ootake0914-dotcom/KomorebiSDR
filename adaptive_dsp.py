@@ -36,6 +36,7 @@ from adaptive_audio import (
     CognitiveSpeechMusicTracker,
     HolographicAudioEnhancer,
     RmtHankelDenoiser,
+    MonoNoiseSuppressor,
 )
 
 __all__ = [
@@ -49,6 +50,7 @@ __all__ = [
     "RiemannianTopologicalDemodulator",
     "SuperSpatialBssStereoSeparator",
     "RmtHankelDenoiser",
+    "MonoNoiseSuppressor",
     "TopologicalClickSuppressor",
     "QuaternionMpxDecoupler",
     "DigitalSelfInterferenceCanceller",

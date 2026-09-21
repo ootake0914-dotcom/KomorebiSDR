@@ -28,6 +28,7 @@ from adaptive_dsp import (
     RiemannianTopologicalDemodulator,
     SuperSpatialBssStereoSeparator,
     RmtHankelDenoiser,
+    MonoNoiseSuppressor,
     DigitalSelfInterferenceCanceller,
 )
 from audiophile_dsp import (
@@ -300,6 +301,11 @@ class SdrDspPipeline:
 
         # ランダム行列特異値切除ノイズクリーナー (Random Matrix Theory & Marchenko-Pastur Law ノイズ切除)
         self.rmt_denoiser = RmtHankelDenoiser(sample_rate=self.audio_rate, embed_dim=24)
+
+        # 単一ch スペクトル抑圧NR (帯域内ノイズの最小統計Wiener抑圧。
+        # 弱電界FMでハイカットでは消せない番組帯ノイズを低減。クリーン時は透明)
+        self.mono_nr = MonoNoiseSuppressor(sample_rate=self.audio_rate)
+        self.mono_nr_enabled = True
 
         # ===== RDS (57kHz) =====
         self.rds_enabled = True
@@ -583,6 +589,8 @@ class SdrDspPipeline:
             self.riemann_demodulator.reset()
         if hasattr(self, "rmt_denoiser"):
             self.rmt_denoiser.reset()
+        if hasattr(self, "mono_nr"):
+            self.mono_nr.reset()
         if hasattr(self, "sic_canceller"):
             self.sic_canceller.reset()
         self._sic_detect_counter = 0
@@ -1548,6 +1556,15 @@ class SdrDspPipeline:
                 and (self.cognitive_enabled or getattr(self, "rmt_always", False))):
             s_meter = getattr(self, "s_meter_dbfs", -20.0)
             audio = self.rmt_denoiser.process(audio, ch=ch, s_meter_dbfs=s_meter)
+
+        # 単一ch スペクトル抑圧NR (帯域内ノイズの最小統計Wiener抑圧)
+        # 弱電界FMの番組帯ノイズ (ハイカットでは消せない) を低減する。
+        # クリーン/定常信号ではゲイン1で透明に通過する自己ゲート方式。
+        if (getattr(self, "mono_nr", None) is not None
+                and self.mono_nr.enabled
+                and getattr(self, "mono_nr_enabled", True)
+                and (self.cognitive_enabled or getattr(self, "mono_nr_always", False))):
+            audio = self.mono_nr.process(audio, ch=ch)
 
         return audio.astype(np.float32)
 

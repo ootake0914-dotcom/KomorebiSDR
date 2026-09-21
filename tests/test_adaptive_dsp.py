@@ -150,9 +150,53 @@ def test_cognitive_speech_music_tracker():
     print(f"[*] 音楽区間の推定音声確率: {prob_music:.2f} (期待値 < 0.2)")
     assert prob_music < 0.2, f"音楽区間を音楽と認識できませんでした: {prob_music}"
 
-    # 音楽時は完全フラット（原音維持）
-    music_out = eq.process(music_audio)
-    assert np.allclose(music_out, music_audio, atol=1e-5), "音楽区間で完全フラットが維持されていません"
+    # 音楽時は群遅延のみ (コムなし・時間跳びなし) で原音を維持する
+    # (履歴を温めるため2回処理し、2回目の出力が_dly遅延の原音と一致することを見る)
+    eq_m = CognitiveSpeechMusicTracker(sample_rate=sr)
+    eq_m.primed = True
+    eq_m.speech_prob = 0.0
+    eq_m.process(music_audio)
+    music_out = eq_m.process(music_audio)
+    dly = eq_m._dly
+    assert np.allclose(music_out[dly:], music_audio[:-dly], atol=1e-5), \
+        "音楽区間で群遅延のみのフラット維持がされていません"
+
+    # 3. 中間確率でのコム回帰テスト (弱電波実機で発覚した退行の再発防止)
+    # 旧実装は無遅延dryと20サンプル遅延wetをクロスフェードしていたため、
+    # 中間確率 (fade≈0.5) で1kHzが最大-8dB打ち消された (弱局が「入らない」主因)。
+    # dry/wet同一時間軸化により、中間確率でもトーン振幅が保存されること。
+    eq2 = CognitiveSpeechMusicTracker(sample_rate=sr)
+    eq2.primed = True
+    eq2.speech_prob = 0.20  # fade_w ≈ 0.5 (旧実装のコム最悪域)
+    n = int(sr)
+    tt = np.arange(n) / sr
+    tone = (0.5 * np.sin(2 * np.pi * 1000.0 * tt)).astype(np.float32)
+    out_tone = eq2.process(tone)
+    d = eq2._dly
+    seg_in = tone[10000:40000]
+    seg_out = out_tone[10000 + d:40000 + d]
+    amp = lambda x: float(np.max(np.abs(np.fft.rfft(x * np.hanning(len(x))))))
+    ratio_db = 20.0 * np.log10((amp(seg_out) + 1e-12) / (amp(seg_in) + 1e-12))
+    print(f"[*] 中間確率(fade≈0.5)での1kHz保存: {ratio_db:+.1f} dB (期待 > -1.0)")
+    assert ratio_db > -1.0, f"中間確率でコム打ち消しが発生: {ratio_db:.1f} dB"
+
+    # 4. 時間軸連続性: 確率が0.05を跨いでも出力時間軸が跳ばないこと
+    # (旧クロスフェード実装は境界跨ぎで20サンプルの跳び=クリックを生んだ)
+    eq3 = CognitiveSpeechMusicTracker(sample_rate=sr)
+    eq3.primed = True
+    n3 = int(sr)
+    tt3 = np.arange(n3) / sr
+    tone3 = (0.5 * np.sin(2 * np.pi * 1000.0 * tt3)).astype(np.float32)
+    step = 2752
+    chunks = []
+    for k in range(0, n3 - step + 1, step):
+        eq3.speech_prob = 0.04 if (k // step) % 2 == 0 else 0.06
+        chunks.append(eq3.process(tone3[k:k + step]))
+    cont = np.concatenate(chunks)
+    d_in = float(np.max(np.abs(np.diff(tone3[:len(cont)]))))
+    d_out = float(np.max(np.abs(np.diff(cont))))
+    print(f"[*] 確率0.05跨ぎの最大ステップ: in={d_in:.5f} out={d_out:.5f}")
+    assert d_out < d_in * 1.2, f"時間軸跳びによるクリック: {d_out:.5f} vs {d_in:.5f}"
     print("[OK] 音声/音楽 認知型オートチルトEQテスト成功")
 
 

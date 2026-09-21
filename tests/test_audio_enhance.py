@@ -233,6 +233,81 @@ def test_pilot_flywheel():
     print("[OK] pilot flywheel")
 
 
+def test_mono_noise_suppressor():
+    print("===== test_mono_noise_suppressor =====")
+    from adaptive_audio import MonoNoiseSuppressor
+    sr = 48000.0
+    n = int(sr) * 4
+
+    def floor_db(x):
+        m = int(len(x) // 1024) * 1024
+        fr = np.fft.rfftfreq(1024, 1 / sr)
+        S = np.abs(np.fft.rfft(x[:m].reshape(-1, 1024) * np.hanning(1024), axis=1)) ** 2
+        sel = (fr > 200) & (fr < 8000)
+        return 10 * np.log10(float(np.sum(np.percentile(S, 10, axis=0)[sel])) + 1e-18)
+
+    # 1. クリーン透明性 (定常信号は定常性ゲートで完全素通し)
+    t = np.arange(n) / sr
+    clean = (0.4 * np.sin(2 * np.pi * 1000.0 * t) + 0.2 * np.sin(2 * np.pi * 2500.0 * t)).astype(np.float32)
+    sup = MonoNoiseSuppressor(sample_rate=sr)
+    out_clean = sup.process(clean.copy(), ch="")
+    dly = sup._tail_len  # 定遅延 (14ms)
+    # 一括呼び出しでは末尾の窓長先読み分が未確定 (ストリーミング仕様) ため除外
+    cut = len(out_clean) - 2 * dly
+    md = float(np.max(np.abs(out_clean[dly:cut] - clean[:cut - dly])))
+    print(f"[*] クリーン通過 最大差分: {md:.2e} (遅延{dly}補正・完全透明)")
+    assert md < 1e-6, f"クリーン信号が変形: {md:.2e}"
+
+    # 2. 非定常 (音節バースト+無音) + ノイズ → ノイズフロア低減
+    rng = np.random.default_rng(0)
+    syll = (np.sin(2 * np.pi * 3.1 * t) > 0).astype(np.float64)
+    env = syll * (0.6 + 0.4 * np.sin(2 * np.pi * 0.7 * t))
+    speech = (env * (0.4 * np.sin(2 * np.pi * 800.0 * t)
+                     + 0.3 * np.sin(2 * np.pi * 1800.0 * t))).astype(np.float32)
+    noisy = (speech + rng.normal(0, 0.05, n).astype(np.float32)).astype(np.float32)
+    sup2 = MonoNoiseSuppressor(sample_rate=sr)
+    out = sup2.process(noisy.copy(), ch="")
+    d_floor = floor_db(out) - floor_db(noisy)
+    corr = float(np.corrcoef(out[dly:], speech[:-dly])[0, 1])
+    print(f"[*] ノイズフロア: {d_floor:+.1f} dB (期待 < -1.0), 番組相関 {corr:.3f}")
+    assert d_floor < -1.0, f"ノイズ低減が不十分: {d_floor:.1f} dB"
+    assert corr > 0.95, f"番組が劣化: {corr:.3f}"
+    assert np.all(np.isfinite(out)), "非有限出力"
+
+    # 3. ストリーミング連続性 (ブロック分割と一括で完全一致)
+    sup3 = MonoNoiseSuppressor(sample_rate=sr)
+    bulk = sup3.process(noisy.copy(), ch="")
+    sup4 = MonoNoiseSuppressor(sample_rate=sr)
+    step = 2752
+    blk = np.concatenate([sup4.process(noisy[i:i + step].copy(), ch="")
+                          for i in range(0, n - step + 1, step)])
+    L = min(len(bulk), len(blk))
+    diff = float(np.max(np.abs(bulk[:L] - blk[:L])))
+    print(f"[*] ブロック vs 一括 最大差分: {diff:.2e} (完全一致)")
+    assert diff < 1e-9, f"ストリーミング不整合: {diff:.2e}"
+    # 4. 強局保護: 静かな音楽パッセージをノイズと誤学習して抑圧しない
+    #    (ノイズフレーム選択が無いと強局の静かな番組がブリージングする)
+    gate = (np.sin(2 * np.pi * 0.5 * t) > -0.2).astype(np.float64)  # 2割は真の無音
+    env4 = gate * (0.10 + 0.35 * (0.5 + 0.5 * np.sin(2 * np.pi * 0.31 * t)))
+    music = (env4 * (0.5 * np.sin(2 * np.pi * 700.0 * t) + 0.3 * np.sin(2 * np.pi * 1500.0 * t)
+                     + 0.2 * np.sin(2 * np.pi * 2900.0 * t))).astype(np.float32)
+    with_noise = (music + rng.normal(0, 0.02, n).astype(np.float32)).astype(np.float32)
+    sup5 = MonoNoiseSuppressor(sample_rate=sr)
+    out5 = sup5.process(with_noise.copy(), ch="")
+    m = (n - dly) // 960 * 960
+    rms_i = np.sqrt(np.mean(with_noise[:m].reshape(-1, 960) ** 2, axis=1))
+    rms_o = np.sqrt(np.mean(out5[dly:dly + m].reshape(-1, 960) ** 2, axis=1))
+    q = (rms_i > 0.035) & (rms_i < 0.12)  # 静かな音楽 (無音ギャップより上)
+    d_quiet = 20 * np.log10((np.mean(rms_o[q]) + 1e-20) / (np.mean(rms_i[q]) + 1e-20))
+    loud = rms_i >= 0.12
+    d_loud = 20 * np.log10((np.mean(rms_o[loud]) + 1e-20) / (np.mean(rms_i[loud]) + 1e-20))
+    print(f"[*] 強局保護: 静かな音楽 {d_quiet:+.2f} dB ({int(q.sum())}フレーム), "
+          f"大きな番組 {d_loud:+.2f} dB")
+    assert d_quiet > -1.0, f"静かな番組が抑圧 (ブリージング): {d_quiet:.2f} dB"
+    assert d_loud > -1.0, f"番組が抑圧: {d_loud:.2f} dB"
+    print("[OK] mono noise suppressor")
+
+
 def main() -> int:
     try:
         test_freq_dependent_blend()
@@ -240,6 +315,7 @@ def main() -> int:
         test_slow_agc()
         test_nr_program_decoupling()
         test_pilot_flywheel()
+        test_mono_noise_suppressor()
     except AssertionError as e:
         print(f"FAILED: {e}")
         return 1
