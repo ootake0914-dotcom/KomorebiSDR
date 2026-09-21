@@ -1,28 +1,28 @@
-# 📻 KomorebiSDR
-### A beautiful, lightweight, and zero-configuration radio receiver for RTL-SDR.
+# KomorebiSDR
+### A clean, lightweight, and zero-configuration radio receiver for RTL-SDR.
 *Named after "Komorebi" (木漏れ日) — the gentle sunlight filtering through trees.*
 
 ![KomorebiSDR Screenshot](assets/screenshot.png)
 
 **KomorebiSDR** is a modern, plug-and-play Software Defined Radio (SDR) receiver designed for calm and effortless everyday listening. 
 
-No complex radio jargon, no messy setup, and no DSP degree required. Just plug in your RTL-SDR USB dongle, launch the app, and enjoy high-fidelity radio broadcast right from your computer.
+No complex radio jargon, no messy setup, and no DSP degree required. Just plug in your RTL-SDR USB dongle, launch the app, and enjoy high-fidelity radio broadcasts right from your computer.
 
 ---
 
-## ✨ Why KomorebiSDR?
+## Why KomorebiSDR?
 
-- 🎧 **Plug & Play Radio**: Automatically detects your country, FM grid, and optimal tuner settings. Just turn it on.
-- 🎨 **Modern Frosted-Glass Interface**: Clean, distraction-free spectrum analyzer and responsive waterfall display.
-- 💎 **Pure & Clear Audio**: Crystal-clear FM stereo with automatic noise suppression and smart loudness leveling.
-- 🌍 **Listen to Everything**: Seamlessly switch between local **FM**, **AM** news, international **Shortwave (SW)** broadcasts, airband, and amateur radio (**SSB / CW**).
-- 🔍 **One-Click Station Discovery**: Built-in smart scanner finds active broadcasts and saves them to your presets instantly.
-- 🛡️ **Built-in PC Noise Filter**: Proprietary digital filter automatically cancels out annoying computer buzz and USB clock noise.
-- 🪶 **Fast & Lightweight**: Runs smoothly with minimal CPU usage, built purely on Python and NumPy.
+- **Plug & Play Radio**: Automatically detects your country, FM grid, and optimal tuner settings. Just turn it on.
+- **Modern Frosted-Glass Interface**: Clean, distraction-free spectrum analyzer and responsive waterfall display.
+- **Pure & Clear Audio**: Crystal-clear FM stereo with automatic noise suppression and smart loudness leveling.
+- **Listen to Everything**: Seamlessly switch between local **FM**, **AM** news, international **Shortwave (SW)** broadcasts, airband, and amateur radio (**SSB / CW**).
+- **One-Click Station Discovery**: Built-in smart scanner finds active broadcasts and saves them to your presets instantly.
+- **Built-in PC Noise Filter**: Proprietary digital filter automatically cancels out annoying computer buzz and USB clock noise.
+- **Fast & Lightweight**: Runs smoothly with minimal CPU usage, built purely on Python and NumPy.
 
 ---
 
-## 🚀 Quick Start
+## Quick Start
 
 ### 1. Prerequisites
 - **RTL-SDR USB dongle** (v3, v4, or generic RTL2832U compatible)
@@ -47,7 +47,16 @@ python main.py
 
 ---
 
-## 🎛️ Intuitive Controls
+## Prebuilt Executable
+
+You can also run KomorebiSDR directly without installing Python:
+
+1. Build or download the prebuilt binary from the Releases page (`KomorebiSDR.exe`).
+2. Run `build_exe.bat` to package your own standalone executable locally via PyInstaller.
+
+---
+
+## Intuitive Controls
 
 | Action | How to do it |
 |:---|:---|
@@ -59,7 +68,7 @@ python main.py
 
 ---
 
-## ⌨️ Helpful Keyboard Shortcuts
+## Helpful Keyboard Shortcuts
 
 - `Up` / `Down` Arrow: Step frequency up / down
 - `PageUp` / `PageDown`: Fast frequency jump
@@ -69,7 +78,7 @@ python main.py
 
 ---
 
-## 🏷️ Command Line Options (Optional)
+## Command Line Options (Optional)
 
 You can launch directly to your favorite station or mode from your terminal:
 
@@ -86,7 +95,6 @@ python main.py --freq 9.75 --mode AM
 
 ---
 
-## 📄 License
+## License
 
 This project is licensed under the [MIT License](LICENSE).
-Enjoy clear airwaves! 📻✨

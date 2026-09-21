@@ -15,11 +15,18 @@ import os
 
 
 def _load_native_core():
-    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sdr_core.dll")
-    if not os.path.exists(path):
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    cand_names = ["sdr_core.dll", "sdr_core.so", "sdr_core.dylib"]
+    target_path = None
+    for name in cand_names:
+        p = os.path.join(base_dir, name)
+        if os.path.exists(p):
+            target_path = p
+            break
+    if not target_path:
         return None
     try:
-        lib = ctypes.CDLL(path)
+        lib = ctypes.CDLL(target_path)
         f = ctypes.c_float
         pf = ctypes.POINTER(f)
         lib.sdr_version.restype = ctypes.c_int

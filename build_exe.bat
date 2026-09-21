@@ -9,7 +9,7 @@ if not exist sdr_core.dll (
     if errorlevel 1 goto :err
 )
 
-python -m PyInstaller --noconfirm --clean --windowed --name AntigravitySDR ^
+python -m PyInstaller --noconfirm --clean --windowed --name KomorebiSDR ^
     --add-binary "rtlsdr.dll;." ^
     --add-binary "sdr_core.dll;." ^
     --add-binary "msvcr100.dll;." ^
@@ -18,7 +18,7 @@ python -m PyInstaller --noconfirm --clean --windowed --name AntigravitySDR ^
     main.py
 if errorlevel 1 goto :err
 
-echo [OK] Built: dist\AntigravitySDR\AntigravitySDR.exe
+echo [OK] Built: dist\KomorebiSDR\KomorebiSDR.exe
 popd
 exit /b 0
 

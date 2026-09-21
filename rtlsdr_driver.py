@@ -4,6 +4,7 @@ RTL-SDRドングルの制御と生IQサンプル取得を行う低レイヤド�
 """
 
 import ctypes
+import ctypes.util
 from ctypes import byref, c_int, c_uint32, c_void_p, POINTER, create_string_buffer
 import os
 import sys
@@ -13,28 +14,37 @@ import numpy as np
 
 
 class RtlSdrDriver:
-    """RTL-SDR DLL ラッパークラス"""
+    """RTL-SDR DLL/SO ラッパークラス"""
 
     def __init__(self, dll_path: str = None):
         if dll_path is None:
-            # カレントディレクトリまたはスクリプト配置ディレクトリから探す
+            # カレントディレクトリ、スクリプト配置ディレクトリ、またはOS標準ライブラリパスから探す
             base_dir = os.path.dirname(os.path.abspath(__file__))
             cand_paths = [
                 os.path.join(base_dir, "rtlsdr.dll"),
-                "rtlsdr.dll"
+                "rtlsdr.dll",
+                os.path.join(base_dir, "librtlsdr.so"),
+                os.path.join(base_dir, "librtlsdr.so.0"),
+                "librtlsdr.so",
+                "librtlsdr.so.0",
+                os.path.join(base_dir, "librtlsdr.dylib"),
+                "librtlsdr.dylib",
             ]
+            system_lib = ctypes.util.find_library("rtlsdr")
+            if system_lib:
+                cand_paths.insert(0, system_lib)
             for p in cand_paths:
                 if os.path.exists(p):
                     dll_path = p
                     break
             if dll_path is None:
-                dll_path = "rtlsdr.dll"
+                dll_path = system_lib or ("rtlsdr.dll" if sys.platform.startswith("win") else "librtlsdr.so")
 
-        # DLL読み込み
+        # DLL/SO読み込み
         try:
             self._dll = ctypes.CDLL(dll_path)
         except Exception as e:
-            raise RuntimeError(f"rtlsdr.dll のロードに失敗しました: {dll_path} ({e})")
+            raise RuntimeError(f"RTL-SDR ライブラリ ({dll_path}) のロードに失敗しました: {e}")
 
         self._setup_function_signatures()
         self.dev = c_void_p(0)

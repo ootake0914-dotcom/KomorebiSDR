@@ -1,38 +1,50 @@
-# Python
+# Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
-*.egg-info/
-.venv/
-venv/
+*$py.class
 
-# Build artifacts
+# PyInstaller / Build artifacts
 build/
 dist/
 *.spec
-sdr_core.obj
-sdr_core.exp
-sdr_core.lib
-sdr_core.dll
-*.log
 
-# Generated media / analysis output
+# Executables (Publish as GitHub Releases instead of tracking in Git)
+*.exe
+
+# Logs and runtime databases
+*.log
+*.csv
+*.db
+radio_archive.db
+radio_ai_temp/
+
+# OS / Editor generated
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*~
+
+# Temporary test / scratch files
+scratch/
+test_*.png
+assets_screenshot_test.png
+
+# Audio recordings and raw IQ captures
 *.wav
 *.raw
-*.npy
-audio_spectrum.png
-clicks_analysis.png
-live_test*.png
-luckyfm_*.png
-spectrum*.png
-test_long_term_analysis.png
-noise_*.png
-received_audio.wav
-long_term_analy*.png
+*.iq
+*.bin
 
-# Experiments / diagnostics (本番混入防止)
-scratch_*.py
-diagnose_*.py
+# Analysis / Debug images (Keep assets/ directory tracked)
+*.png
+!assets/**/*.png
+!assets/*.png
 
-# OS
-Thumbs.db
-desktop.ini
+# Native build artifacts / C extensions
+*.obj
+*.o
+*.dll
+*.so
+*.dylib
