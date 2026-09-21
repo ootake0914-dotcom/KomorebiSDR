@@ -45,6 +45,7 @@ from adaptive_audio import (
     HolographicAudioEnhancer,
     RmtHankelDenoiser,
     FractionalDeemphasis,
+    WaveletNoiseShrinkage,
 )
 from adaptive_multipath import (
     SubspaceMultipathEqualizer,
@@ -75,4 +76,5 @@ __all__ = [
     "BistableStochasticResonator",
     "CyclostationaryFeatureDetector",
     "DigitalSelfInterferenceCanceller",
+    "WaveletNoiseShrinkage",
 ]
