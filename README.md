@@ -1,15 +1,16 @@
-# 📻 AuraSDR
+# 📻 KomorebiSDR
 ### A beautiful, lightweight, and zero-configuration radio receiver for RTL-SDR.
+*Named after "Komorebi" (木漏れ日) — the gentle sunlight filtering through trees.*
 
-![AuraSDR Screenshot](assets/screenshot.png)
+![KomorebiSDR Screenshot](assets/screenshot.png)
 
-**AuraSDR** is a modern, plug-and-play Software Defined Radio (SDR) receiver designed for everyday listening. 
+**KomorebiSDR** is a modern, plug-and-play Software Defined Radio (SDR) receiver designed for calm and effortless everyday listening. 
 
 No complex radio jargon, no messy setup, and no DSP degree required. Just plug in your RTL-SDR USB dongle, launch the app, and enjoy high-fidelity radio broadcast right from your computer.
 
 ---
 
-## ✨ Why AuraSDR?
+## ✨ Why KomorebiSDR?
 
 - 🎧 **Plug & Play Radio**: Automatically detects your country, FM grid, and optimal tuner settings. Just turn it on.
 - 🎨 **Modern Frosted-Glass Interface**: Clean, distraction-free spectrum analyzer and responsive waterfall display.
@@ -32,8 +33,8 @@ No complex radio jargon, no messy setup, and no DSP degree required. Just plug i
 
 ```bash
 # 1. Clone the repository
-git clone https://github.com/your-username/AuraSDR.git
-cd AuraSDR
+git clone https://github.com/your-username/KomorebiSDR.git
+cd KomorebiSDR
 
 # 2. Install dependencies
 pip install -r requirements.txt

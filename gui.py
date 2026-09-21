@@ -57,7 +57,7 @@ def show_message_screen(title: str, lines: list, width: int = 760, height: int =
     try:
         pygame.init()
         screen = pygame.display.set_mode((width, height))
-        pygame.display.set_caption("Antigravity SDR Radio")
+        pygame.display.set_caption("KomorebiSDR")
         f_title = pygame.font.SysFont(JP_FONTS, 22, bold=True)
         f_body = pygame.font.SysFont(JP_FONTS, 15)
         clock = pygame.time.Clock()
@@ -218,7 +218,7 @@ class SdrGui:
         self.width = max(320, int(width))
         self.height = max(240, int(height))
         self.screen = pygame.display.set_mode((self.width, self.height))
-        pygame.display.set_caption("Antigravity Full-Scratch SDR Radio")
+        pygame.display.set_caption("KomorebiSDR")
 
         # フォント (日本語対応: Meiryo系を優先)
         self.font_title = pygame.font.SysFont(JP_FONTS, 14, bold=True)

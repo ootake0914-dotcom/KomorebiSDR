@@ -1,5 +1,5 @@
 """
-Antigravity Full-Scratch SDR Radio - Smart Auto-Tuner & DX Edition.
+KomorebiSDR - Smart Auto-Tuner & DX Edition.
 メイン実行スクリプト。
 RTL-SDR受信スレッド、DSP復調パイプライン、オーディオ出力、Pygame GUI、
 および全自動帯域探査＆DX微弱局発掘エンジン (AutoTuner) を統合。
@@ -1013,7 +1013,7 @@ class SdrApp:
 
     def run(self):
         """アプリケーションのメインループ"""
-        print("[*] Starting Antigravity Full-Scratch SDR Radio...")
+        print("[*] Starting KomorebiSDR...")
         # 短波番組表をバックグラウンドで取得 (オフラインでも動作継続)
         threading.Thread(target=sw_schedule.load_schedule, daemon=True).start()
         print(f"[*] Region: {self.profile['region']} ({self.profile['label']}), "
@@ -1095,7 +1095,7 @@ def _setup_stdout_log():
 
 def main():
     _setup_stdout_log()
-    parser = argparse.ArgumentParser(description="Antigravity Full-Scratch SDR Radio")
+    parser = argparse.ArgumentParser(description="KomorebiSDR - Modern Zero-Configuration SDR Radio")
     parser.add_argument("--freq", type=float, default=None,
                         help="Initial frequency in MHz (default: region profile)")
     parser.add_argument("--mode", type=str, default=None,
