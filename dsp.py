@@ -34,6 +34,7 @@ from adaptive_dsp import (
     SymplecticHamiltonianDemodulator,
     SparseSubcarrierExtractor,
     RmtHankelDenoiser,
+    DigitalSelfInterferenceCanceller,
 )
 from audiophile_dsp import (
     ActiveDcServo,
@@ -101,6 +102,17 @@ class SdrDspPipeline:
 
         # グラム・シュミット直交化によるリアルタイム適応IQインバランス補正器 (鏡像ゴースト自動消去)
         self.iq_corrector = AdaptiveIqCorrector(sample_rate=self.rf_rate, time_constant_sec=3.0)
+
+        # 全二重通信理論 (IBFD) デジタル自己干渉消去器 (SIC: PC直挿し時のクロック・スイッチングビート消去)
+        # IF段 (288kHz) でスプリアスを自動検出し、NLMS直交基底追従で逆位相ノッチ消去。
+        # 延長ケーブル使用時などスプリアスが存在しない場合は完全素通し (相関0.999+) となり副作用ゼロ。
+        self.sic_canceller = DigitalSelfInterferenceCanceller(
+            sample_rate=self.if_rate,
+            mu=0.08,
+            max_tones=4,
+        )
+        self.sic_enabled = True
+        self._sic_detect_counter = 0
 
         # IF用ローパス (±95kHz Carson標準帯域幅)
         cutoff_if = 95000.0 / self.rf_rate
@@ -601,6 +613,9 @@ class SdrDspPipeline:
             self.sparse_subcarrier_extractor.reset()
         if hasattr(self, "rmt_denoiser"):
             self.rmt_denoiser.reset()
+        if hasattr(self, "sic_canceller"):
+            self.sic_canceller.reset()
+        self._sic_detect_counter = 0
         # RDS状態も選局でリセット (前局のPS/PI/RTを次局へ持ち越さない)
         if self.rds is not None:
             try:
@@ -2142,18 +2157,14 @@ class SdrDspPipeline:
         if mode == "NFM":
             # ISS / アマチュア無線用ナローバンドFM
             iq_if = self.decimate_with_history(iq_shifted, self.fir_nfm, self.if_decim, "history_nfm")
-            audio = self.demodulate_nfm(iq_if)
         elif mode in ("AM", "AM_NARROW"):
             # 中波・短波放送用AM (狭帯域AMフィルタ対応)
             fir_target = self.fir_am_narrow if (mode == "AM_NARROW" or self.filter_mode == "narrow") else self.fir_am
             hist_attr = "history_am_narrow" if fir_target is self.fir_am_narrow else "history_am"
             iq_if = self.decimate_with_history(iq_shifted, fir_target, self.if_decim, hist_attr)
-            audio = self.demodulate_am(iq_if)
         elif mode in ("USB", "LSB", "CW"):
             # SSB / CW (HF用): 複素非対称バンドパスで側波帯を選択
             iq_if = self.decimate_with_history(iq_shifted, self.fir_am_narrow, self.if_decim, "history_ssb")
-            iq_48 = self.decimate_with_history(iq_if, self.fir_if_audio, self.audio_decim, "history_ssb2")
-            audio = self.demodulate_ssb(iq_48, mode)
         else:
             # ワイドFM (WFM)
             if self.cognitive_enabled:
@@ -2163,6 +2174,23 @@ class SdrDspPipeline:
             else:
                 fir_if_target = self.fir_if
             iq_if = self.decimate(iq_shifted, fir_if_target, self.if_decim)
+
+        # デジタル自己干渉消去器 (SIC: PC直挿し時のクロック・スイッチングビート逆位相消去)
+        if getattr(self, "sic_enabled", False) and getattr(self, "sic_canceller", None) is not None:
+            self._sic_detect_counter += 1
+            # 選局直後、および約0.8秒ごと (約20ブロック) にスプリアス突出ピークを自動走査
+            if self._sic_detect_counter % 20 == 1:
+                self.sic_canceller.auto_detect_spurious(iq_if, n_fft=1024, prominence_db=12.0)
+            iq_if = self.sic_canceller.process(iq_if)
+
+        if mode == "NFM":
+            audio = self.demodulate_nfm(iq_if)
+        elif mode in ("AM", "AM_NARROW"):
+            audio = self.demodulate_am(iq_if)
+        elif mode in ("USB", "LSB", "CW"):
+            iq_48 = self.decimate_with_history(iq_if, self.fir_if_audio, self.audio_decim, "history_ssb2")
+            audio = self.demodulate_ssb(iq_48, mode)
+        else:
             audio = self.demodulate_wfm(iq_if)
 
         # Sメーター: チャンネル通過後の電力を平滑化 (S9=-30dBFS, 6dB/S-unitの目安)
@@ -2213,3 +2241,18 @@ class SdrDspPipeline:
             audio_clean = self.dither.process_float(audio_clean)
 
         return audio_clean, spectrum_db
+
+    @property
+    def sic_cancellation_db(self) -> float:
+        """SIC (デジタル自己干渉消去) による内部スプリアス消去量 (dB)"""
+        if getattr(self, "sic_canceller", None) is not None:
+            return float(self.sic_canceller.cancellation_db)
+        return 0.0
+
+    @property
+    def sic_detected_spurious(self) -> list[float]:
+        """SIC が検出・追従中の内部スプリアス周波数リスト (Hz, IFオフセット)"""
+        if getattr(self, "sic_canceller", None) is not None:
+            return list(self.sic_canceller.spurious_freqs)
+        return []
+

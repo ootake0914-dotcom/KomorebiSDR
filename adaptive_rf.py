@@ -415,34 +415,76 @@ class DigitalSelfInterferenceCanceller:
         self.phases = [0.0] * len(self.spurious_freqs)
 
     def auto_detect_spurious(self, iq_samples: np.ndarray, n_fft: int = 1024,
-                             prominence_db: float = 12.0):
+                             prominence_db: float = 12.0, dc_guard_hz: float = 8000.0,
+                             passband_hz: float = 95000.0):
         """
         FFT スペクトルから周囲ノイズフロアより急峻に突出している固定スプリアス周波数を自動同定。
+        - dc_guard_hz: 所望信号キャリア・主変調帯域 (0Hz近傍のAM搬送波やFM側波帯) を保護する除外帯域 (Hz)。
+        - passband_hz: IFフィルタ通過帯域 (Hz)。阻止域の過小パワーによるメディアン歪みを防止。
+        - 延長ケーブル使用等でスプリアスが消失した場合は自動で周波数リストを空にし、
+          即座に完全バイパス（計算コストゼロ・無歪み）へ移行。
         """
         if len(iq_samples) < n_fft:
             return
 
-        sub = iq_samples[:n_fft]
-        fft_mag = np.abs(np.fft.fft(sub * np.hanning(n_fft)))
-        fft_db = 20.0 * np.log10(np.maximum(fft_mag, 1e-12))
+        # 複数セグメントが存在する場合はウェルチ法風にパワースペクトルを平均し、
+        # 変調音声の一時的なスペクトル揺らぎを平滑化して定常スプリアスのみを抽出
+        n_seg = max(1, min(4, len(iq_samples) // n_fft))
+        win = np.hanning(n_fft).astype(np.float32)
+        psd_accum = np.zeros(n_fft, dtype=np.float64)
+        for s in range(n_seg):
+            sub = iq_samples[s * n_fft : (s + 1) * n_fft] * win
+            psd_accum += np.abs(np.fft.fft(sub)) ** 2
+        psd_avg = psd_accum / n_seg
+        fft_db = 10.0 * np.log10(np.maximum(psd_avg, 1e-12))
         freqs = np.fft.fftfreq(n_fft, 1.0 / self.fs)
 
-        med_floor = float(np.median(fft_db))
-        # 突出ピークの検出
-        peak_mask = (fft_db > med_floor + prominence_db)
+        # 通過帯域内のメディアンを真のノイズフロアとする (阻止域減衰の引きずり防止)
+        pass_mask = (np.abs(freqs) <= passband_hz)
+        if np.any(pass_mask):
+            med_floor = float(np.median(fft_db[pass_mask]))
+        else:
+            med_floor = float(np.median(fft_db))
+
+        # 突出ピーク候補のインデックス抽出
+        peak_mask = (fft_db > med_floor + prominence_db) & pass_mask
         peak_indices = np.where(peak_mask)[0]
 
-        detected_freqs = []
+        detected_candidates = []
+        span = 6  # Hanning窓のメインローブ外側 (±3〜6ビン) を走査
         for idx in peak_indices:
-            # 局所極大値の確認
+            f = float(freqs[idx])
+            # 所望信号主帯域保護: DC近傍 (±dc_guard_hz) は除外
+            if abs(f) < dc_guard_hz:
+                continue
+            # 局所極大値の確認 (左右1ビン以上)
             left = (idx - 1) % n_fft
             right = (idx + 1) % n_fft
-            if fft_db[idx] >= fft_db[left] and fft_db[idx] >= fft_db[right]:
-                detected_freqs.append(float(freqs[idx]))
+            if fft_db[idx] <= fft_db[left] or fft_db[idx] <= fft_db[right]:
+                continue
 
-        if detected_freqs:
-            # 最大トーン数まで登録
-            self.set_spurious_frequencies(detected_freqs[:self.max_tones])
+            # 局所針状性 (Local Prominence):
+            # 狭帯域・CW状スプリアスはHanning窓の減衰により左右3〜6ビンで急落する。
+            # 一方、FM変調側波帯や広帯域信号はなだらかに裾野が続くため除外される。
+            left_floor = float(np.min(fft_db[max(0, idx - span) : max(0, idx - 2)])) if idx >= 3 else med_floor
+            right_floor = float(np.min(fft_db[min(n_fft, idx + 3) : min(n_fft, idx + span + 1)])) if idx + 3 < n_fft else med_floor
+            local_floor = max(left_floor, right_floor)
+
+            local_prom = float(fft_db[idx] - local_floor)
+            global_prom = float(fft_db[idx] - med_floor)
+
+            # 局所的にもグローバルにも突出している針状ピークのみを採用
+            if local_prom >= prominence_db and global_prom >= prominence_db:
+                detected_candidates.append((f, global_prom))
+
+        if detected_candidates:
+            # 突出度 (フロア比) が最も強力なスプリアスから優先して上位 max_tones 件を登録
+            detected_candidates.sort(key=lambda x: x[1], reverse=True)
+            chosen_freqs = [item[0] for item in detected_candidates[:self.max_tones]]
+            self.set_spurious_frequencies(chosen_freqs)
+        else:
+            # スプリアスが存在しない場合は空にして完全バイパス
+            self.set_spurious_frequencies([])
 
     def reset(self):
         """内部状態リセット"""

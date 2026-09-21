@@ -88,9 +88,74 @@ def test_clean_signal_transparency():
     print("[OK] test_clean_signal_transparency passed")
 
 
+def test_pipeline_sic_integration():
+    """
+    SdrDspPipeline 全体を通じた SIC の自動検出・適応消去・素通し透明性の統合テスト。
+    """
+    from dsp import SdrDspPipeline
+
+    pipeline = SdrDspPipeline(sample_rate=1152000, audio_rate=48000)
+    assert hasattr(pipeline, "sic_canceller")
+    assert pipeline.sic_enabled is True
+
+    # 1. PC内部クロック高調波 (+45kHz) が混入した生IQ信号を作成
+    fs_rf = 1152000.0
+    n_rf = 115200  # 0.1秒分
+    t = np.arange(n_rf, dtype=np.float64) / fs_rf
+
+    # 目的FM信号 (1kHzトーン変調)
+    f_mod = 1000.0
+    phase_wanted = 1.0 * np.sin(2.0 * np.pi * f_mod * t)
+    sig_wanted = 0.4 * np.exp(1j * phase_wanted).astype(np.complex64)
+
+    # PCスプリアス (+45kHz の急峻なビート)
+    f_spur = 45000.0
+    spurious = 0.6 * np.exp(1j * (2.0 * np.pi * f_spur * t)).astype(np.complex64)
+    noisy_iq = sig_wanted + spurious
+
+    # uint8 生バイト列へ変換 (RTL-SDR形式: 0..255, 127.5中心)
+    i_u8 = np.clip(np.real(noisy_iq) * 127.5 + 127.5, 0, 255).astype(np.uint8)
+    q_u8 = np.clip(np.imag(noisy_iq) * 127.5 + 127.5, 0, 255).astype(np.uint8)
+    raw_bytes = np.empty(n_rf * 2, dtype=np.uint8)
+    raw_bytes[0::2] = i_u8
+    raw_bytes[1::2] = q_u8
+
+    # 複数ブロック処理して SIC を収束・検出させる
+    for _ in range(5):
+        audio, spec = pipeline.process(raw_bytes, mode="WFM")
+
+    print(f"[*] Pipeline SIC detected spurious freqs: {pipeline.sic_detected_spurious}")
+    print(f"[*] Pipeline SIC cancellation: {pipeline.sic_cancellation_db:.1f} dB")
+
+    # +45kHz 近傍が検出されているか
+    assert len(pipeline.sic_detected_spurious) >= 1, "Pipeline SIC failed to detect spurious tone"
+    detected_f = pipeline.sic_detected_spurious[0]
+    assert abs(detected_f - f_spur) < 2000.0, f"Detected spurious freq mismatch: {detected_f} vs {f_spur}"
+
+    # 2. 延長ケーブルで離してスプリアスが消滅したケース（クリーン信号: アンテナ熱雑音フロアのみ存在）
+    rng = np.random.RandomState(42)
+    thermal_noise = (0.03 * (rng.randn(len(t)) + 1j * rng.randn(len(t)))).astype(np.complex64)
+    clean_iq = sig_wanted + thermal_noise
+    i_c = np.clip(np.real(clean_iq) * 127.5 + 127.5, 0, 255).astype(np.uint8)
+    q_c = np.clip(np.imag(clean_iq) * 127.5 + 127.5, 0, 255).astype(np.uint8)
+    raw_clean = np.empty(n_rf * 2, dtype=np.uint8)
+    raw_clean[0::2] = i_c
+    raw_clean[1::2] = q_c
+
+    # 選局リセット
+    pipeline.set_offset_freq(0.0)
+    for _ in range(5):
+        audio_c, _ = pipeline.process(raw_clean, mode="WFM")
+
+    print(f"[*] Clean signal spurious freqs after reset: {pipeline.sic_detected_spurious}")
+    assert len(pipeline.sic_detected_spurious) == 0, "Spurious freqs should be empty for clean signal"
+    print("[OK] test_pipeline_sic_integration passed")
+
+
 if __name__ == "__main__":
     print("===== Running Digital SIC Tests =====")
     test_single_spurious_cancellation()
     test_auto_detect_spurious()
     test_clean_signal_transparency()
+    test_pipeline_sic_integration()
     print("ALL DIGITAL SIC TESTS PASSED!")
