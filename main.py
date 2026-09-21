@@ -37,16 +37,18 @@ class SdrApp:
     """SDRアプリケーション統合コントローラ (AutoTuner & DX機能搭載)"""
 
     def __init__(self, initial_freq=None, initial_mode=None, controller_type="hyper",
-                 config=None, country=None, stereo=None, stereo_nr=None):
+                 config=None, country=None, stereo=None, stereo_nr=None, sic=None):
         # ---- 設定・地域プロファイル ----
         # configはコピーして使う (--mono等のセッション限り上書きを元cfgに
         # 書き込まず、終了時のsave_configで永続化させないため)
         self.config = dict(config) if config is not None else load_config()
-        # CLI一時上書き (--mono / --no-stereo-nr はこのセッションのみ有効・保存しない)
+        # CLI一時上書き (--mono / --no-stereo-nr / --no-sic はこのセッションのみ有効・保存しない)
         if stereo is not None:
             self.config["stereo"] = bool(stereo)
         if stereo_nr is not None:
             self.config["stereo_nr"] = bool(stereo_nr)
+        if sic is not None:
+            self.config["sic"] = bool(sic)
         self.country = (country or self.config.get("country") or detect_country()).upper()
         self.profile = region_profile(self.country)
         if initial_freq is None:
@@ -72,6 +74,7 @@ class SdrApp:
         self.dsp.set_deemphasis(self.profile["deemphasis_us"])
         self.dsp.set_stereo_enabled(self.config.get("stereo", True))
         self.dsp.set_stereo_nr(self.config.get("stereo_nr", True))
+        self.dsp.sic_enabled = bool(self.config.get("sic", True))
         # オーディオ出力
         self.audio = AudioOutput(self.audio_rate)
         self.audio.set_volume(float(self.config.get("volume", 0.7)))
@@ -1107,6 +1110,8 @@ def main():
     parser.add_argument("--mono", action="store_true", help="Force monaural FM (disable stereo)")
     parser.add_argument("--no-stereo-nr", action="store_true",
                         help="Disable stereo noise reduction (keep full stereo even when noisy)")
+    parser.add_argument("--no-sic", action="store_true",
+                        help="Disable digital self-interference cancellation (SIC)")
     args = parser.parse_args()
 
     cfg = load_config()
@@ -1119,7 +1124,8 @@ def main():
     app = SdrApp(initial_freq=freq_hz, initial_mode=args.mode,
                  controller_type=args.controller, config=cfg, country=country,
                  stereo=(False if args.mono else None),
-                 stereo_nr=(False if args.no_stereo_nr else None))
+                 stereo_nr=(False if args.no_stereo_nr else None),
+                 sic=(False if args.no_sic else None))
 
     try:
         app.run()
