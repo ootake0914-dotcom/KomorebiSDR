@@ -19,7 +19,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from rtlsdr_driver import RtlSdrDriver
 from dsp import SdrDspPipeline
-from adaptive_rf import AdaptiveIqCorrector, DigitalSelfInterferenceCanceller, DynamicIfBandwidthTracker
+from adaptive_rf import AdaptiveIqCorrector, DigitalSelfInterferenceCanceller
 from audiophile_dsp import ActiveDcServo, TpdfDitherNoiseShaper, MinimumPhaseApodizer
 
 
@@ -114,22 +114,9 @@ def run_tier1_ground_truth_benchmark():
     results["SIC_Correlation"] = f"{corr_sig:.4f}"
 
     # -------------------------------------------------------------
-    # 3. DynamicIfBandwidthTracker: Carson則 適応IF帯域幅制御
+    # 3. (廃止) DynamicIfBandwidthTrackerは削除済み。
+    # Carson帯域追従は HyperController の動的IF帯域が担う。
     # -------------------------------------------------------------
-    print("\n[Test 3/7] DynamicIfBandwidthTracker (Carson則 ダイナミックIF帯域)")
-    tracker = DynamicIfBandwidthTracker(min_bw_hz=85000.0, max_bw_hz=190000.0)
-    # ケースA: 静かなトーク区間 (偏移 ±10kHz)
-    dev_quiet = 10000.0 * np.sin(2.0 * np.pi * 500.0 * np.arange(1000) / 48000.0)
-    bw_quiet = tracker.update(dev_quiet)
-    # ケースB: 音楽フォルテシモ区間 (偏移 ±70kHz)
-    dev_loud = 70000.0 * np.sin(2.0 * np.pi * 1000.0 * np.arange(1000) / 48000.0)
-    for _ in range(15):
-        bw_loud = tracker.update(dev_loud)
-
-    print(f"  - 静寂・トーク時 IF帯域幅: {bw_quiet/1e3:.1f} kHz (ノイズフロアを狭窄カット)")
-    print(f"  - 音楽大音量時   IF帯域幅: {bw_loud/1e3:.1f} kHz (歪み防止のため自動全開)")
-    results["Carson_Quiet_BW"] = f"{bw_quiet/1e3:.1f} kHz"
-    results["Carson_Loud_BW"] = f"{bw_loud/1e3:.1f} kHz"
 
     # -------------------------------------------------------------
     # 4. Stereo MPX Separation: ステレオ分離度 (L-R セパレーション)

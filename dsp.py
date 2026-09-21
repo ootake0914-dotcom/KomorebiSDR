@@ -24,15 +24,9 @@ from adaptive_dsp import (
     QuadratureMpxCanceller,
     DeepSpaceEkfDemodulator,
     KalmanPilotTracker,
-    TimeReversalTurboEqualizer,
     HolographicAudioEnhancer,
     RiemannianTopologicalDemodulator,
-    ViterbiPhaseDemodulator,
     SuperSpatialBssStereoSeparator,
-    SubspaceMultipathEqualizer,
-    WassersteinMultipathEqualizer,
-    SymplecticHamiltonianDemodulator,
-    SparseSubcarrierExtractor,
     RmtHankelDenoiser,
     DigitalSelfInterferenceCanceller,
 )
@@ -295,32 +289,14 @@ class SdrDspPipeline:
         # NASA DSN方式 自律適応カルマン・パイロット搬送波追従器 (AKCTL)
         self.pilot_tracker = KalmanPilotTracker(sample_rate=self.if_rate)
 
-        # MAP-BCJR 時間反転最尤系列ターボ平滑化器 (ゼロ位相・過渡アタック完全保存)
-        self.turbo_equalizer = TimeReversalTurboEqualizer(sample_rate=self.audio_rate, fc_default=14500.0)
-
         # ホログラフィック・ハイレゾ倍音外挿エンジン (15kHz〜22kHz エアバンド再合成)
         self.holographic_enhancer = HolographicAudioEnhancer(sample_rate=self.audio_rate, air_gain=0.08)
 
         # リーマン多様体トポロジカル測地線復調器 (特異点位相スリップ幾何学遮断)
         self.riemann_demodulator = RiemannianTopologicalDemodulator(sample_rate=self.if_rate)
 
-        # 最尤位相軌道ビタビ復調器 (低CNR位相スリップ・クリックスパイク大域消去)
-        self.viterbi_demodulator = ViterbiPhaseDemodulator(sample_rate=self.if_rate, dev_limit_hz=75000.0, audio_max_hz=53000.0)
-
-        # シンプレクティック幾何学 非線形FM位相空間復調器 (相空間測度保構造・特異点クリックスパイク幾何学的遮断)
-        self.symplectic_demodulator = SymplecticHamiltonianDemodulator(sample_rate=self.if_rate, dev_limit_hz=75000.0, cutoff_hz=65000.0)
-
         # 超空間独立成分ステレオ復調器 (BSS / FastICA ステレオ逆相三角ヒスノイズ直交消去)
         self.bss_separator = SuperSpatialBssStereoSeparator(sample_rate=self.audio_rate)
-
-        # 部分空間超解像マルチパス等化器 (Constant Modulus Subspace 遅延波ブラインド同定＆Zero-Forcing逆フィルタ)
-        self.subspace_equalizer = SubspaceMultipathEqualizer(sample_rate=self.if_rate)
-
-        # 最適輸送理論 複数マルチパス等化器 (Wasserstein-2 計量＆シンクホーン双対正規方程式一括求解)
-        self.wasserstein_equalizer = WassersteinMultipathEqualizer(sample_rate=self.if_rate)
-
-        # 圧縮センシング 副搬送波超解像抽出器 (l1正則化 FISTA 高速近接勾配法)
-        self.sparse_subcarrier_extractor = SparseSubcarrierExtractor(sample_rate=self.if_rate)
 
         # ランダム行列特異値切除ノイズクリーナー (Random Matrix Theory & Marchenko-Pastur Law ノイズ切除)
         self.rmt_denoiser = RmtHankelDenoiser(sample_rate=self.audio_rate, embed_dim=24)
@@ -470,6 +446,7 @@ class SdrDspPipeline:
 
         # 音声/音楽 認知型オートチルトEQ (トーク了解度 / 音楽フラットHi-Fi 自動追従)
         self.cognitive_eq = CognitiveSpeechMusicTracker(sample_rate=self.audio_rate)
+        self._cog_wide = None  # トラッカー用広帯域タップ (_post_process_wfmが更新)
         # 38kHz 直交副搬送波マルチパス適応キャンセラ (サ行シピシピ歪み・混濁の逆位相相殺)
         self.mpx_canceller = QuadratureMpxCanceller(sample_rate=self.audio_rate)
         # 深宇宙通信級 拡張カルマンフィルタ (Deep-Space EKF) FM復調エンジン
@@ -595,22 +572,15 @@ class SdrDspPipeline:
             self.ultra_squelch.reset()
         if hasattr(self, "cognitive_eq"):
             self.cognitive_eq.reset()
+        self._cog_wide = None
         if hasattr(self, "dc_servo"):
             self.dc_servo.reset()
         if hasattr(self, "dither"):
             self.dither.reset()
-        if hasattr(self, "viterbi_demodulator"):
-            self.viterbi_demodulator.reset()
-        if hasattr(self, "symplectic_demodulator"):
-            self.symplectic_demodulator.reset()
         if hasattr(self, "bss_separator"):
             self.bss_separator.reset()
-        if hasattr(self, "subspace_equalizer"):
-            self.subspace_equalizer.reset()
-        if hasattr(self, "wasserstein_equalizer"):
-            self.wasserstein_equalizer.reset()
-        if hasattr(self, "sparse_subcarrier_extractor"):
-            self.sparse_subcarrier_extractor.reset()
+        if hasattr(self, "riemann_demodulator"):
+            self.riemann_demodulator.reset()
         if hasattr(self, "rmt_denoiser"):
             self.rmt_denoiser.reset()
         if hasattr(self, "sic_canceller"):
@@ -967,18 +937,6 @@ class SdrDspPipeline:
         else:
             self.cma_active = False
 
-        # 最適輸送理論 複数マルチパス等化器 (Wasserstein-2 計量＆シンクホーン双対正規方程式一括求解)
-        if (getattr(self, "wasserstein_equalizer", None) is not None
-                and self.wasserstein_equalizer.enabled
-                and (self.cognitive_enabled or getattr(self, "subspace_always", False))):
-            iq_if = self.wasserstein_equalizer.process(iq_if)
-
-        # 部分空間超解像マルチパス等化器 (Constant Modulus Subspace 遅延波ブラインド同定＆Zero-Forcing逆フィルタ)
-        if (getattr(self, "subspace_equalizer", None) is not None
-                and self.subspace_equalizer.enabled
-                and (self.cognitive_enabled or getattr(self, "subspace_always", False))):
-            iq_if = self.subspace_equalizer.process(iq_if)
-
         limited = self._apply_hard_limiter(iq_if)
 
         # 2. FM復調: ハイブリッド宇宙通信級復調エンジン
@@ -1024,25 +982,6 @@ class SdrDspPipeline:
             if len(demod_riemann) == len(demod):
                 demod = ((1.0 - w_riemann) * demod + w_riemann * demod_riemann).astype(np.float32)
 
-        # シンプレクティック幾何学 非線形FM位相空間復調器 (弱電界・フェージング時: 特異点クリックスパイク幾何学的遮断)
-        if (getattr(self, "symplectic_demodulator", None) is not None
-                and self.symplectic_demodulator.enabled
-                and (self.cognitive_enabled or getattr(self, "symplectic_always", False))
-                and self.s_meter_dbfs < -32.0):
-            w_symp = float(np.clip((-32.0 - self.s_meter_dbfs) / 10.0, 0.0, 0.85))
-            demod_symp = self.symplectic_demodulator.process(limited)
-            if len(demod_symp) == len(demod):
-                demod = ((1.0 - w_symp) * demod + w_symp * demod_symp).astype(np.float32)
-
-        # 最尤位相軌道ビタビ復調器 (弱電界・フェージング時: 低CNR位相スリップ・クリックスパイク大域消去)
-        if (getattr(self, "viterbi_demodulator", None) is not None
-                and self.viterbi_demodulator.enabled
-                and self.cognitive_enabled
-                and self.s_meter_dbfs < -30.0):
-            demod_viterbi = self.viterbi_demodulator.demodulate(iq_if)
-            if len(demod_viterbi) == len(demod):
-                demod = demod_viterbi
-
         # 超音波三角ノイズ比追従型 コグニティブ・オートスケルチ
         ultra_gain = 1.0
         if getattr(self, "ultra_squelch", None) is not None and self.ultra_squelch.enabled:
@@ -1072,15 +1011,9 @@ class SdrDspPipeline:
         mono = self.decimate_with_history(demod_scaled, self.fir_if_audio,
                                           self.audio_decim, "history_if_audio")
 
-        # 5a. 圧縮センシング (Compressive Sensing & l1正則化 FISTA) による 38kHz / 57kHz 副搬送波超解像抽出
-        # (高域三角ノイズフロアをl1軟しきい値収縮でゼロ切除し、ステレオS/NとRDS感度限界を極大化)
-        if (getattr(self, "sparse_subcarrier_extractor", None) is not None
-                and self.sparse_subcarrier_extractor.enabled
-                and (self.cognitive_enabled or getattr(self, "sparse_cs_always", False))
-                and self.s_meter_dbfs < -32.0):
-            demod_mpx = self.sparse_subcarrier_extractor.process(demod_scaled, self.s_meter_dbfs)
-        else:
-            demod_mpx = demod_scaled
+        # 5a. 副搬送波清浄化は廃止 (固定LPに劣る適応軟しきい値だった。
+        # 既知周波数の搬送波に適応は不要という結論。素通し)
+        demod_mpx = demod_scaled
 
         # 5b. ステレオMPXデコード (19kHzパイロットPLL + 38kHz同期検波)
         self._update_stereo_pilot(demod_mpx)
@@ -1583,6 +1516,12 @@ class SdrDspPipeline:
             fir_final = self.fir_audio_clean
 
         # decimate_with_history (factor=1) を用いることで、フィルタ長変更時にもサンプル数の一致を保証
+        # ホログラフィック用の広帯域ソースをカット前にタップ (カット後に種を取ると
+        # 8〜14k成分が無くエア生成がno-opになる。生成した16〜22kはカット後に足す)
+        wide_src = np.asarray(audio).astype(np.float32)
+        if ch in ("", "_l"):
+            # トラッカー用の広帯域タップ (Lのみで十分。process末尾でanalyzeする)
+            self._cog_wide = wide_src
         audio = self.decimate_with_history(audio, fir_final, 1, f"history_final{ch}")
 
         # DCハイパスフィルタ
@@ -1594,19 +1533,14 @@ class SdrDspPipeline:
         elif self.filter_mode == "narrow":
             audio = self._apply_noise_expander(audio, threshold=0.09)
 
-        # MAP-BCJR 時間反転最尤系列ターボ平滑化 (Hyper自律最適化時: ゼロ位相・過渡アタック完全保存)
-        if (getattr(self, "turbo_equalizer", None) is not None
-                and self.turbo_equalizer.enabled
-                and (self.cognitive_enabled or getattr(self, "turbo_eq_always", False))):
-            audio = self.turbo_equalizer.process(audio, ch=ch)
-
         # ホログラフィック・ハイレゾ倍音外挿 (Hyper自律最適化時: 15kHz〜22kHz エアバンド再合成)
         if (getattr(self, "holographic_enhancer", None) is not None
                 and self.holographic_enhancer.enabled
                 and (self.cognitive_enabled or getattr(self, "holographic_always", False))):
-            speech_p = getattr(getattr(self, "cognitive_tracker", None), "current_speech_prob", 0.0)
+            speech_p = getattr(getattr(self, "cognitive_eq", None), "speech_prob", 0.0)
             s_meter = getattr(self, "s_meter_dbfs", -20.0)
-            audio = self.holographic_enhancer.process(audio, ch=ch, speech_prob=speech_p, s_meter_dbfs=s_meter)
+            audio = self.holographic_enhancer.process(audio, ch=ch, speech_prob=speech_p, s_meter_dbfs=s_meter,
+                                                      source=wide_src)
 
         # ランダム行列特異値切除ノイズクリーナー (Marchenko-Pastur則による弱電界ランダム雑音切除)
         if (getattr(self, "rmt_denoiser", None) is not None
@@ -2222,8 +2156,13 @@ class SdrDspPipeline:
             audio_clean = audio_synced
 
         # 音声/音楽 認知型オートチルトEQ (トーク了解度 / 音楽フラットHi-Fi 自動追従)
+        # 解析はハイカット前の広帯域で (カット後だとrolloff>8500の音楽分岐に
+        # 到達不能になる)。_post_process_wfmがタップしたwide_srcを使う。
         if self.cognitive_enabled and getattr(self, "cognitive_eq", None) is not None and self.cognitive_eq.enabled:
-            self.cognitive_eq.analyze(audio_clean)
+            wide = getattr(self, "_cog_wide", None)
+            if mode != "WFM" or wide is None or len(wide) < 128:
+                wide = audio_clean
+            self.cognitive_eq.analyze(wide)
             audio_clean = self.cognitive_eq.process(audio_clean)
 
         # 局間音量レベリング用スローAGC (選局時の音量差を吸収。L/R連動で音像保存。

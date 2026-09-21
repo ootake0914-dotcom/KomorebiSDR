@@ -3,9 +3,7 @@ RF frontend adaptive modules (extracted from adaptive_dsp.py).
 
 RFフロントエンド系の適応モジュール群の正準の保持場所:
 - AdaptiveIqCorrector (IQインバランス補正)
-- DynamicIfBandwidthTracker (ダイナミックIF帯域)
-- UltrasonicSquelchTracker (超音波スケルチ)
-- CyclostationaryFeatureDetector (周期定常性スペクトル相関検出器)
+- UltrasonicSquelchTracker (クワイエティング比スケルチ)
 - DigitalSelfInterferenceCanceller (デジタル自己干渉消去器: SIC)
 
 `adaptive_dsp.py` は後方互換のため同名を再エクスポートする。
@@ -111,59 +109,6 @@ class AdaptiveIqCorrector:
         return float(20.0 * np.log10(np.clip(self.coeff_g, 1e-3, 100.0)))
 
 
-class DynamicIfBandwidthTracker:
-    """
-    カーソン則 (Carson's Rule: B = 2*(Δf + fm)) に基づく
-    FM変調度適応型 ダイナミックIF帯域幅トラッカー。
-
-    瞬時の周波数偏移（変調深度）をピークホールド＋リーク積分で監視し、
-    静かなトーク時・休符時は帯域を狭めてノイズフロア・隣接混信を大幅に低減し、
-    音楽フォルテシモ（大音量）時は帯域を自動全開にして歪みを防ぐ。
-
-    数学的根拠: 1922年 John Carson 変調理論 (パブリックドメイン)。
-    """
-
-    def __init__(self, min_bw_hz: float = 85000.0, max_bw_hz: float = 190000.0,
-                 max_audio_freq_hz: float = 15000.0):
-        self.min_bw_hz = float(min_bw_hz)
-        self.max_bw_hz = float(max_bw_hz)
-        self.fm_max = float(max_audio_freq_hz)
-
-        # ピーク周波数偏移のエンベロープ状態
-        self.dev_peak_hz = 25000.0
-        self.current_bw_hz = 140000.0
-
-        # 時定数: アタックは極めて速く (5ms)、リリースは聴感を保ち緩やかに (350ms)
-        self.attack_alpha = 0.35
-        self.release_alpha = 0.02
-        self.safety_margin_hz = 15000.0
-
-    def update(self, demod_freq_hz: np.ndarray) -> float:
-        """
-        復調された周波数偏移サンプル (Hz) から瞬時ピークを検出し、
-        最適なIF帯域幅 (Hz) を算出して滑らかに返す。
-        """
-        if len(demod_freq_hz) == 0:
-            return self.current_bw_hz
-
-        # 直流バイアスを除いた瞬時周波数偏移のピーク値
-        block_peak = float(np.percentile(np.abs(demod_freq_hz - np.mean(demod_freq_hz)), 99.5))
-
-        # アタック・リリースのエンベロープ追従
-        if block_peak > self.dev_peak_hz:
-            self.dev_peak_hz += self.attack_alpha * (block_peak - self.dev_peak_hz)
-        else:
-            self.dev_peak_hz += self.release_alpha * (block_peak - self.dev_peak_hz)
-
-        # カーソン則に基づく必要帯域幅の算出: B = 2 * (Δf + fm) + Margin
-        needed_bw = 2.0 * (self.dev_peak_hz + self.fm_max) + self.safety_margin_hz
-        target_bw = float(np.clip(needed_bw, self.min_bw_hz, self.max_bw_hz))
-
-        # 帯域幅の滑らかな遷移 (クリック音防止)
-        self.current_bw_hz += 0.15 * (target_bw - self.current_bw_hz)
-        return self.current_bw_hz
-
-
 class UltrasonicSquelchTracker:
     """
     FMクワイエティング効果 (Quieting Effect) と超音波三角ノイズ比率に基づく
@@ -184,6 +129,13 @@ class UltrasonicSquelchTracker:
         self.r = float(np.exp(-2.0 * np.pi * fc / self.sample_rate))
         self.hp_x1 = 0.0
         self.hp_y1 = 0.0
+        # 番組帯ローパス状態 (遮断 15kHz。クワイエティング比の分母用。
+        # 旧実装は超音波絶対値のみで判定したため、大音量高域 (10kHz正弦等) や
+        # ステレオの19k/38k搬送波漏れをノイズと誤認して誤ミュートした)
+        fc_lp = 15000.0
+        self.r_lp = float(np.exp(-2.0 * np.pi * fc_lp / self.sample_rate))
+        self.lp_y1 = 0.0
+        self.prog_db = -20.0
 
         # 平滑化されたノイズパワー (dB)
         self.noise_db = -20.0
@@ -202,11 +154,15 @@ class UltrasonicSquelchTracker:
         self.is_open = True
         self.current_gain = 1.0   # クリックレス・ソフトフェードゲイン (0.0〜1.0)
         self.enabled = True
+        self._primed = False  # 初ブロック過渡プライム済みフラグ
 
     def reset(self):
         self.hp_x1 = 0.0
         self.hp_y1 = 0.0
+        self.lp_y1 = 0.0
+        self._primed = False
         self.noise_db = -20.0
+        self.prog_db = -20.0
         self.floor_db = -20.0
         self.threshold_effective = float(self.threshold_db)
         self.is_open = True
@@ -244,14 +200,27 @@ class UltrasonicSquelchTracker:
         diff = hp.astype(np.float32)
 
         # 超音波パワーの瞬時計算
-        # 差分エネルギーをベースに超音波高域パワーを推定
         ultra_power = float(np.mean(diff * diff)) + 1e-15
         ultra_db = 10.0 * np.log10(ultra_power)
+
+        # 1b. 番組帯 (15kHz以下) パワー (1次LPF再帰)
+        r_lp = float(self.r_lp)
+        lp_prev = float(self.lp_y1)
+        lp = np.empty(n, dtype=np.float64)
+        for i in range(n):
+            xi = float(x[i])
+            y = r_lp * lp_prev + (1.0 - r_lp) * xi
+            lp[i] = y
+            lp_prev = y
+        self.lp_y1 = float(lp_prev)
+        prog_power = float(np.mean(lp * lp)) + 1e-15
+        prog_db = 10.0 * np.log10(prog_power)
 
         # 2. リーク積分追従 (アタック 10ms, リリース 40ms)
         dt = n / self.sample_rate
         alpha = float(1.0 - np.exp(-dt / 0.025))
         self.noise_db += alpha * (ultra_db - self.noise_db)
+        self.prog_db += alpha * (prog_db - self.prog_db)
 
         # 2b. ノイズフロア追従と自動閾値 (フロア低下には速く2秒、下振れ防止の
         # 上昇は遅く30秒。番組の一時的な静寂で閾値が暴れないようにする)
@@ -267,13 +236,22 @@ class UltrasonicSquelchTracker:
             self.threshold_effective = float(self.threshold_db)
 
         # 3. ヒステリシス付きシュミットトリガー判定
-        # クワイエティングにより超音波ノイズが閾値未満に落ちたらキャリア捕捉と判定
-        thr = float(self.threshold_effective)
-        if self.is_open:
-            if self.noise_db > thr + self.hysteresis_db:
+        # 旧: 超音波絶対値のみ → 大音量高域・19k/38k搬送波漏れで誤ミュート。
+        # 新: クワイエティング比 (番組帯−超音波) で判定。レベル無依存。
+        # キャリア捕捉で三角ノイズが潰れると比が開く → オープン。
+        # 閾値根拠 (1次HPF 45k + 1次LPF 15k @288k): 10kHz正弦 Q≈7.8、
+        # 12kHz Q≈5.7、白色/三角ノイズ Q<0。close 3.0 / open 8.0 で
+        # 楽音は開維持、局間ノイズのみ閉じる。初ブロックはフィルタ過渡の
+        # ため判定を素通しし、 instant値で状態をプライムする (過渡で閉じて
+        # 開閾値に届かず固着するヒステリシストラップを防止)。
+        quieting_db = float(self.prog_db - self.noise_db)
+        if not getattr(self, "_primed", False):
+            self._primed = True
+        elif self.is_open:
+            if quieting_db < 3.0:
                 self.is_open = False  # 局間ノイズへ突入 -> ミュート
         else:
-            if self.noise_db < thr:
+            if quieting_db > 8.0:
                 self.is_open = True   # 本物の局を発見 -> オープン
 
         # 4. クリックレス・ソフトフェード (アタック: 素早く開く, リリース: 滑らかに閉じる)
@@ -284,94 +262,6 @@ class UltrasonicSquelchTracker:
             self.current_gain = target_gain
 
         return float(self.current_gain), bool(self.is_open)
-
-
-class CyclostationaryFeatureDetector:
-    """
-    周期定常性信号解析 (Cyclostationary Feature Detection) に基づく
-    極弱電界ブラインド電波検出エンジン。
-
-    【数理的背景: 2次周期定常性とスペクトル相関密度 SCD】
-    自然界の熱雑音 (ホワイトノイズ) は統計的に時間定常ですが、人工的な変調電波
-    (FM/AM/パイロット/副搬送波/デジタル変調) は、変調周期に応じた統計変動 (周期定常性) を持ちます。
-    巡回自己相関関数 (Cyclic Autocorrelation Function: CAF):
-        R_x^alpha(tau) = < x(t + tau/2) * x*(t - tau/2) * e^(-j * 2pi * alpha * t) >
-    は、雑音に対しては alpha != 0 で恒等的にゼロに収束しますが、
-    電波が存在する場合、特定の巡回周波数 alpha (キャリア周波数、パイロット周波数等) に
-    孤立した強固な線スペクトル (特異ピーク) を生じます。
-
-    【効果】
-    - 従来の FFT パワースペクトルではノイズフロアに完全に埋もれて見えない信号
-      (SNR < 0dB、最大 -15dB〜-20dB) の存在をブラインドで超高感度に確定判定。
-    - パイロット周波数 (19kHz) や変調レートの高精度検出。
-    """
-
-    def __init__(self, sample_rate: float = 288000.0, detection_thresh_db: float = 3.0):
-        self.fs = float(sample_rate)
-        self.thresh_db = float(detection_thresh_db)
-        self.enabled = True
-
-    def compute_cyclic_spectrum(self, samples: np.ndarray, alpha_target_hz: float = 19000.0,
-                                n_fft: int = 2048) -> tuple[float, float, bool]:
-        """
-        指定された周波数 (alpha_target_hz) における共役巡回自己相関 (Conjugate Cyclic Autocorrelation)
-        強度を計算し、(cyclic_snr_db, peak_power, is_detected) を返す。
-        - ガウスホワイトノイズは円対称性 E[n^2] = 0 により完全に相殺される。
-        - 微弱電波は自乗により 2 * alpha_target_hz に強い線スペクトルを生じる。
-        """
-        if not self.enabled or len(samples) < n_fft:
-            return 0.0, 0.0, False
-
-        n = min(len(samples), n_fft * 4)
-        x = samples[:n]
-
-        # 1. 複素共役なし自乗信号: y(t) = x(t)^2
-        # (変調波の 2次周期定常性を 2 * f0 に集約)
-        y = (x.astype(np.complex64) ** 2)
-
-        # 2. FFT パワースペクトル
-        win = np.hanning(n).astype(np.float32)
-        fft_y = np.abs(np.fft.fft(y * win)) ** 2
-        freqs = np.fft.fftfreq(n, 1.0 / self.fs)
-
-        # 巡回ピーク目標周波数 (2 * alpha_target_hz)
-        target_f = 2.0 * alpha_target_hz
-        idx_target = int(np.argmin(np.abs(freqs - target_f)))
-
-        # 近傍ノイズフロア (ターゲット周辺 ±20ビンを除外したメディアン)
-        win_size = 40
-        left_idx = max(0, idx_target - win_size)
-        right_idx = min(len(fft_y), idx_target + win_size + 1)
-        sub_band = fft_y[left_idx:right_idx]
-        mask_tone = np.abs(np.arange(len(sub_band)) - (idx_target - left_idx)) <= 3
-        noise_floor = float(np.median(sub_band[~mask_tone])) if np.any(~mask_tone) else float(np.median(fft_y)) + 1e-12
-
-        peak_pow = float(fft_y[idx_target])
-        cyclic_snr_db = float(10.0 * np.log10(max(1e-12, peak_pow / (noise_floor + 1e-12))))
-        is_detected = bool(cyclic_snr_db >= self.thresh_db)
-
-        return cyclic_snr_db, peak_pow, is_detected
-
-    def scan_cyclic_frequencies(self, samples: np.ndarray, alpha_range_hz: tuple[float, float],
-                                step_hz: float = 250.0, n_fft: int = 2048) -> list[tuple[float, float]]:
-        """
-        巡回周波数範囲をスキャンし、検出された有意なピーク周波数と SNR のリスト [(alpha_hz, snr_db), ...] を返す。
-        """
-        if not self.enabled or len(samples) < n_fft:
-            return []
-
-        results = []
-        f_start, f_end = alpha_range_hz
-        alphas = np.arange(f_start, f_end, step_hz)
-
-        for a in alphas:
-            snr_db, _, det = self.compute_cyclic_spectrum(samples, alpha_target_hz=float(a), n_fft=n_fft)
-            if det:
-                results.append((float(a), snr_db))
-
-        # SNR 降順でソート
-        results.sort(key=lambda item: item[1], reverse=True)
-        return results
 
 
 class DigitalSelfInterferenceCanceller:

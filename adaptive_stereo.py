@@ -3,10 +3,8 @@ Stereo/subcarrier adaptive modules (extracted from adaptive_dsp.py).
 
 ステレオ・副搬送波系の適応モジュール群の正準の保持場所:
 - QuadratureMpxCanceller (MPX直交キャンセラ)
-- SuperSpatialBssStereoSeparator (BSSステレオ分離)
-- SparseSubcarrierExtractor (副搬送波超解像抽出)
+- SuperSpatialBssStereoSeparator (Side調性保護付きステレオ分離)
 - QuaternionMpxDecoupler (四元数MPX直交デカップラー)
-- BistableStochasticResonator (非平衡統計力学・双安定確率的共鳴器)
 
 `adaptive_dsp.py` は後方互換のため同名を再エクスポートする。
 """
@@ -120,11 +118,13 @@ class SuperSpatialBssStereoSeparator:
         # 境界保持用ヒストリ
         self.hist_s = np.zeros(self.ntaps - 1, dtype=np.float32)
         self.hist_m = np.zeros(self.ntaps - 1, dtype=np.float32)
+        self._tonal = 0.0  # Side調性フラグ平滑状態
 
     def reset(self):
         """内部状態リセット"""
         self.hist_s.fill(0)
         self.hist_m.fill(0)
+        self._tonal = 0.0
 
     def process(self, l_audio: np.ndarray, r_audio: np.ndarray, stereo_blend: float = 1.0) -> tuple:
         """
@@ -189,6 +189,20 @@ class SuperSpatialBssStereoSeparator:
         # 逆相三角ヒスノイズのみの時は coh -> 0 となり gain -> 0.25 (強力抑圧)
         gain_hf = float(np.clip(coh * 2.2, 0.25, 1.0))
 
+        # 3b. Side調性保護: 旧実装はブロック大域ゲインのため、純粋なSide定位
+        # 楽音 (midに成分なし→coh≈0) をノイズと誤認して-12dB削った。
+        # Side高域スペクトルの尖度 (peak/mean) で調性を判定し、調性区間は
+        # ゲインを1へ逃がす。ノイズは平坦 (尖度~5)、楽音は尖る (>8)。
+        try:
+            spec = np.abs(np.fft.rfft(s_hp * np.hanning(n))) + 1e-12
+            peakiness = float(np.max(spec) / (np.mean(spec) + 1e-12))
+        except Exception:
+            peakiness = 0.0
+        tonal = 1.0 if peakiness > 8.0 else (0.0 if peakiness < 6.0 else float(getattr(self, "_tonal", 0.0)))
+        a_t = 1.0 - float(np.exp(-(n / self.fs) / 0.15))
+        self._tonal = float(getattr(self, "_tonal", 0.0)) + a_t * (tonal - float(getattr(self, "_tonal", 0.0)))
+        gain_hf = float(1.0 - (1.0 - self._tonal) * (1.0 - gain_hf))
+
         # ブレンド量と連動
         effective_gain = 1.0 - float(stereo_blend) * (1.0 - gain_hf)
 
@@ -201,98 +215,6 @@ class SuperSpatialBssStereoSeparator:
         r_out = (m_d - s_clean).astype(np.float32)
 
         return l_out, r_out
-
-
-class SparseSubcarrierExtractor:
-    """圧縮センシング (Compressive Sensing & l1正則化 FISTA) に基づく副搬送波超解像抽出器。
-
-    FM復調後の高域三角ノイズ（周波数の2乗で増大するヒスノイズ）に埋もれた
-    38kHzステレオ副搬送波 (L-R) および 57kHz RDS副搬送波を、
-    周波数直交辞書上のスパース性 (Sparsity) を利用して超解像抽出・復元する。
-    ベック・テブール高速近接勾配法 (FISTA) による l1 軟しきい値収縮最適伝達関数を、
-    厳密対称ゼロ位相 FIR 空間核フィルタ (129タップ) へ解析的縮約。
-    Overlap-Lookahead による連続畳み込みにより、ブロック境界誤差ゼロ (0.00e+00) と
-    0.05ms 未満の超高速リアルタイム処理を両立する。
-
-    - 38kHz / 57kHz 副搬送波 SNR改善度: +4.0dB 〜 +10.0dB
-    - 0〜22kHz 主音声 (L+R) および 19kHz パイロットを完全忠実保護
-    - 準定常適応 (4フレームに1回 FISTA 更新 & 0.05ms FIR 畳み込み)
-    - 強電界クリーン信号時の完全バイパス (差分 0.00e+00)
-    - Overlap-Lookahead によるブロック境界段差ゼロ (0.00e+00)
-    """
-
-    def __init__(self, sample_rate: float = 288000.0, taps: int = 129):
-        self.fs = float(sample_rate)
-        self.taps = int(taps)
-        self.half_taps = self.taps // 2
-        self._hist_len = self.taps - 1
-        self.enabled = True
-
-        self._hist = np.zeros(self._hist_len, dtype=np.float32)
-        self._cached_kernel = None
-        self._frame_count = 0
-
-    def reset(self):
-        """内部状態リセット"""
-        self._hist.fill(0)
-        self._cached_kernel = None
-        self._frame_count = 0
-
-    def process(self, mpx: np.ndarray, s_meter_dbfs: float = -20.0) -> np.ndarray:
-        """MPX実数配列を受け取り、圧縮センシングにより副搬送波ノイズを除去したMPX配列を返す"""
-        if not self.enabled or len(mpx) < self.taps * 2:
-            return mpx
-
-        # 強電界 (S-Meter > -32.0 dBFS) はクリーンとみなし完全バイパス (ビット一致・負荷 0.00ms)
-        if s_meter_dbfs > -32.0:
-            if len(self._hist) == self._hist_len:
-                self._hist[:] = mpx[-self._hist_len:]
-            return mpx
-
-        n = len(mpx)
-        self._frame_count += 1
-
-        # 4フレームに1回、局所ブロックから FISTA スパース最適核を更新
-        if self._frame_count % 4 == 1 or self._cached_kernel is None:
-            N_fft = 512
-            sub_len = min(n, N_fft)
-            b = mpx[:sub_len] * np.hanning(sub_len)
-            if sub_len < N_fft:
-                b = np.pad(b, (0, N_fft - sub_len))
-            Y = np.fft.rfft(b)
-            freqs = np.fft.rfftfreq(N_fft, 1.0 / self.fs)
-
-            mask_base = freqs < 22000.0
-            mask_band = (freqs >= 22000.0) & (freqs <= 60000.0)
-
-            sigma_est = float(np.median(np.abs(Y[mask_band]))) / 0.6745
-            lambda_l1 = 1.6 * sigma_est
-
-            mag = np.abs(Y)
-            gain = np.where(mag > lambda_l1, 1.0 - lambda_l1 / np.maximum(mag, 1e-12), 0.0)
-
-            H_cs = np.zeros_like(mag)
-            H_cs[mask_base] = 1.0
-            H_cs[mask_band] = gain[mask_band]
-            H_cs[~mask_base & ~mask_band] = 0.0
-
-            # 逆rFFTにより厳密対称ゼロ位相FIRカーネルへ縮約
-            h_full = np.fft.irfft(H_cs, n=N_fft)
-            h_symm = np.fft.fftshift(h_full)
-            center = N_fft // 2
-            k = h_symm[center - self.half_taps : center + self.half_taps + 1] * np.hanning(self.taps)
-            # 通過域エネルギー等価補正
-            k *= 2.0
-            self._cached_kernel = k.astype(np.float32)
-
-        kernel = self._cached_kernel
-
-        # Overlap-Lookahead による完全連続FIR畳み込み (境界段差ゼロ)
-        buf = np.concatenate((self._hist, mpx))
-        self._hist = buf[-self._hist_len:].astype(np.float32)
-
-        out = np.convolve(buf, kernel, mode='valid')
-        return out[:n].astype(np.float32)
 
 
 class QuaternionMpxDecoupler:
@@ -381,90 +303,5 @@ class QuaternionMpxDecoupler:
         self.cancellation_db = float(10.0 * np.log10(max(1.0, canc_ratio)))
 
         return m, di_clean.astype(np.float32)
-
-
-class BistableStochasticResonator:
-    """
-    非平衡統計力学・双安定確率的共鳴 (Bistable Stochastic Resonance: BSR) に基づく
-    微弱パイロット・副搬送波超感度検出器。
-
-    【数理的背景: クラマース遷移とノイズ協調共鳴】
-    極弱電界では、19kHz ステレオパイロット信号や 57kHz RDS 信号が
-    広帯域熱雑音フロア下に埋没し、従来の線形フィルタや PLL では位相同期が不能になります。
-    確率的共鳴は、非線形双安定ポテンシャル V(x) = -a/2 x^2 + b/4 x^4 において、
-    外部雑音エネルギーが閾値下の微弱信号と協調し、井戸間のクラマース (Kramers) 跳躍確率を
-    周期的に変調することで、出力の特定周波数スペクトル線エネルギーが逆説的に増大する現象です。
-
-    過減衰ランジュバン方程式:
-        dx / dt = a * x - b * x^3 + k * (s(t) + xi(t))
-    高周波信号に対する硬い方程式 (Stiff system) を回避するため、
-    正規化スケール変換 (Normalized Scale Transformation) を適用し、
-    4次ルンゲ＝クッタ法 (RK4) で数値安定・リアルタイムに離散積分を行います。
-
-    【効果】
-    - 負の入力 SNR (SNR < 0dB) において、パイロット周波数のスペクトルピークをブースト。
-    - 弱電界下でのステレオ PLL ロック外れを粘り強く防止。
-    """
-
-    def __init__(self, sample_rate: float = 48000.0, a: float = 1.0, b: float = 1.0,
-                 step_size: float = 0.2, coupling: float = 0.5):
-        self.fs = float(sample_rate)
-        self.a = float(a)
-        self.b = float(b)
-        self.h = float(step_size)
-        self.coupling = float(coupling)
-        self.enabled = True
-        self._x = 0.0
-
-    def reset(self):
-        """内部状態リセット"""
-        self._x = 0.0
-
-    def process(self, signal: np.ndarray) -> np.ndarray:
-        """
-        実数信号 (N,) を受け取り、双安定確率的共鳴 (RK4積分) を施した
-        強化実数信号 (N,) を返す。
-        """
-        if not self.enabled or len(signal) == 0:
-            return signal
-
-        n = len(signal)
-        x = float(self._x)
-        a = self.a
-        b = self.b
-        h = self.h
-        k = self.coupling
-
-        out = np.empty(n, dtype=np.float32)
-
-        # RK4 (Runge-Kutta 4th Order) 高速数値積分ループ
-        # f(x, s) = a * x - b * x^3 + k * s
-        s_arr = signal.astype(np.float64)
-
-        for i in range(n):
-            s0 = s_arr[i]
-            s_mid = (s0 + s_arr[i + 1]) * 0.5 if i + 1 < n else s0
-
-            # k1
-            k1 = a * x - b * (x ** 3) + k * s0
-            # k2
-            x2 = x + 0.5 * h * k1
-            k2 = a * x2 - b * (x2 ** 3) + k * s_mid
-            # k3
-            x3 = x + 0.5 * h * k2
-            k3 = a * x3 - b * (x3 ** 3) + k * s_mid
-            # k4
-            x4 = x + h * k3
-            k4 = a * x4 - b * (x4 ** 3) + k * s_mid
-
-            x_next = x + (h / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
-
-            # ポテンシャル井戸の物理的範囲内に制限 (数値発散保護)
-            limit = 3.0 * np.sqrt(max(1e-3, a / max(1e-3, b)))
-            x = float(np.clip(x_next, -limit, limit))
-            out[i] = x
-
-        self._x = x
-        return out
 
 

@@ -75,16 +75,16 @@ def main() -> int:
     # 複数ブロック比較は差分法に固定して厳密等価を確認する。
     # PLL自体の等価性は下記の単ブロック試験で確認する。
     d_native.fm_pll_enabled = False
-    # EKF/リーマン/シンプレクティック/ビタビ等のPython専用適応は
+    # EKF/リーマン等のPython専用適応は
     # ネイティブ等価の対象外のため無効化 (有効だと原理的に差分が出る)
-    for _attr in ("ekf_enabled", "cognitive_enabled", "riemann_always", "symplectic_always"):
+    for _attr in ("ekf_enabled", "cognitive_enabled", "riemann_always"):
         try:
             setattr(d_native, _attr, False)
         except Exception:
             pass
     try:
-        for _obj in ("riemann_demodulator", "symplectic_demodulator", "viterbi_demodulator",
-                     "ultra_squelch", "cognitive_eq"):
+        for _obj in ("riemann_demodulator",
+                      "ultra_squelch", "cognitive_eq"):
             _o = getattr(d_native, _obj, None)
             if _o is not None and hasattr(_o, "enabled"):
                 _o.enabled = False
@@ -99,14 +99,14 @@ def main() -> int:
     d_py.rds_enabled = False
     d_py.afc_enabled = False
     d_py.fm_pll_enabled = False
-    for _attr in ("ekf_enabled", "cognitive_enabled", "riemann_always", "symplectic_always"):
+    for _attr in ("ekf_enabled", "cognitive_enabled", "riemann_always"):
         try:
             setattr(d_py, _attr, False)
         except Exception:
             pass
     try:
-        for _obj in ("riemann_demodulator", "symplectic_demodulator", "viterbi_demodulator",
-                     "ultra_squelch", "cognitive_eq"):
+        for _obj in ("riemann_demodulator",
+                      "ultra_squelch", "cognitive_eq"):
             _o = getattr(d_py, _obj, None)
             if _o is not None and hasattr(_o, "enabled"):
                 _o.enabled = False

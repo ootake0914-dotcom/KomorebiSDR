@@ -208,6 +208,9 @@ class HyperController:
         if spectrum_db is None or len(spectrum_db) < 128:
             return None, None
         spec = np.asarray(spectrum_db, dtype=np.float64)
+        # 非有限スペクトル (NaN混入等) は計測不能扱い。NaNをC/Nに混ぜると
+        # カルマン状態が永久汚染され int(round(nan)) でワーカーが死ぬ。
+        spec = np.nan_to_num(spec, nan=-120.0, posinf=0.0, neginf=-120.0)
         lin = np.power(10.0, spec / 10.0)
         n = len(lin)
         c = n // 2
@@ -252,6 +255,8 @@ class HyperController:
         peak_snr = 10.0 * np.log10((sig_peak + 1e-12) / (noise_p + 1e-12))
         # 弱電界で平均法が潰れる実機特性に合わせ、搬送波尖頭優勢で融合
         snr_db = max(mean_snr, 0.35 * mean_snr + 0.65 * peak_snr)
+        if not (np.isfinite(snr_db) and np.isfinite(noise_db)):
+            return None, None
         return float(snr_db), float(noise_db)
 
     def _profile_antenna(self, clip_pct: float, iq_std: float, noise_floor: float, mode: str):
@@ -318,6 +323,8 @@ class HyperController:
         prog = band_mean(300.0, 3000.0)
         hiss = band_mean(5500.0, 11000.0)
         snr_db = 10.0 * np.log10((prog + 1e-12) / (hiss + 1e-12))
+        if not np.isfinite(snr_db):
+            return None
         return float(np.clip(snr_db, -20.0, 60.0))
 
     # ================================================================
@@ -636,6 +643,13 @@ class HyperController:
             audio_snr = None
 
         # ---- カルマン状態推定 ----
+        # 非有限計測は捨てる (混ぜると状態が永久NaN汚染される)
+        if chan_snr is not None and not np.isfinite(chan_snr):
+            chan_snr = None
+        if audio_snr is not None and not np.isfinite(audio_snr):
+            audio_snr = None
+        if noise_floor is not None and not np.isfinite(noise_floor):
+            noise_floor = None
         if chan_snr is None and audio_snr is not None:
             chan_snr = audio_snr + 6.0
         if chan_snr is not None:
