@@ -14,6 +14,19 @@ from adaptive_dsp import (
     CognitiveSpeechMusicTracker,
     DynamicIfBandwidthTracker,
     UltrasonicSquelchTracker,
+    QuadratureMpxCanceller,
+    DeepSpaceEkfDemodulator,
+    KalmanPilotTracker,
+    TimeReversalTurboEqualizer,
+    HolographicAudioEnhancer,
+    RiemannianTopologicalDemodulator,
+    ViterbiPhaseDemodulator,
+    SuperSpatialBssStereoSeparator,
+    SubspaceMultipathEqualizer,
+    WassersteinMultipathEqualizer,
+    SymplecticHamiltonianDemodulator,
+    SparseSubcarrierExtractor,
+    RmtHankelDenoiser,
 )
 
 
@@ -174,9 +187,710 @@ def test_cognitive_speech_music_tracker():
     print("[OK] 音声/音楽 認知型オートチルトEQテスト成功")
 
 
+def test_quadrature_mpx_canceller():
+    print("\n===== test_quadrature_mpx_canceller =====")
+    sr = 48000.0
+    canceller = QuadratureMpxCanceller(sample_rate=sr, taps=5, mu=0.05)
+
+    # 1. クリーン信号テスト (直交軸ゼロ): 原音ビットパーフェクト維持
+    t = np.arange(2048) / sr
+    clean_i = (0.5 * np.sin(2 * np.pi * 1000.0 * t)).astype(np.float32)
+    zero_q = np.zeros_like(clean_i)
+    out_clean = canceller.process(clean_i, zero_q)
+    assert np.allclose(out_clean, clean_i, atol=1e-5), "クリーン時に原音が維持されていません"
+    print("[OK] クリーン信号ビットパーフェクト通過確認")
+
+    # 2. マルチパス干渉シミュレーション
+    # 直交軸 Q に非線形歪み成分が存在し、同相軸 I へ 0.35 倍で漏れ込んでいる状態
+    dist_q = (0.4 * np.sin(2 * np.pi * 3500.0 * t) + 0.2 * np.cos(2 * np.pi * 7000.0 * t)).astype(np.float32)
+    leak_target = 0.35 * dist_q
+    distorted_i = (clean_i + leak_target).astype(np.float32)
+
+    # 複数ブロック適応反復
+    out = distorted_i
+    for _ in range(60):
+        out = canceller.process(distorted_i, dist_q)
+
+    # 残留歪み測定
+    res_err = float(np.mean((out - clean_i) ** 2))
+    orig_err = float(np.mean((distorted_i - clean_i) ** 2))
+    suppression_db = 10.0 * np.log10(orig_err / (res_err + 1e-12))
+    assert suppression_db > 12.0, f"マルチパス直交歪みが十分に抑圧されていません: {suppression_db:.1f} dB"
+    print("[OK] 38kHz直交副搬送波マルチパス適応キャンセラテスト成功")
+
+
+def test_deep_space_ekf_demodulator():
+    print("\n===== test_deep_space_ekf_demodulator =====")
+    fs = 288000.0
+    duration = 0.05
+    t = np.arange(int(fs * duration)) / fs
+
+    # 1. 1kHz 変調波 (偏移 ±50kHz) の生成
+    mod_signal = np.sin(2 * np.pi * 1000.0 * t).astype(np.float32)
+    dev_hz = 50000.0
+    phase = np.cumsum(2.0 * np.pi * dev_hz * mod_signal / fs)
+    clean_iq = np.exp(1j * phase).astype(np.complex64)
+
+    ekf = DeepSpaceEkfDemodulator(sample_rate=fs)
+    demod_clean = ekf.demodulate(clean_iq)
+    
+    # 瞬時周波数の追従精度 (相関 > 0.98)
+    ref_norm = (2.0 * np.pi * dev_hz / fs) * mod_signal
+    # 位相遅延を考慮した相互相関
+    corr = np.corrcoef(demod_clean[200:], ref_norm[200:])[0, 1]
+    print(f"[*] クリーンFM波のEKF復調相関度: {corr:.4f} (期待値 > 0.95)")
+    assert corr > 0.95, f"EKF復調の追従精度が不十分です: {corr:.4f}"
+
+    # 2. 低CNR極限環境 (強いガウス雑音 + インパルスノイズ) でのクリックスパイク抑圧テスト
+    np.random.seed(42)
+    noise = (np.random.normal(0, 0.45, len(clean_iq)) + 1j * np.random.normal(0, 0.45, len(clean_iq))).astype(np.complex64)
+    noisy_iq = clean_iq + noise
+
+    # 通常の位相差分法 (ナイーブ復調)
+    diff_demod = np.angle(noisy_iq[1:] * np.conj(noisy_iq[:-1]))
+    diff_spikes = int(np.sum(np.abs(np.diff(diff_demod)) > 0.8))
+
+    # 深宇宙EKF復調 (Huber M推定によるクリックスパイク消去)
+    ekf.reset()
+    ekf_demod = ekf.demodulate(noisy_iq)
+    ekf_spikes = int(np.sum(np.abs(np.diff(ekf_demod)) > 0.8))
+
+    print(f"[*] 低CNR環境におけるクリックスパイク数: ナイーブ差分法={diff_spikes}個 -> 深宇宙EKF={ekf_spikes}個")
+    assert ekf_spikes < diff_spikes // 3, f"EKFによるクリックスパイク抑圧が不十分です: EKF {ekf_spikes} vs 差分 {diff_spikes}"
+    print("[OK] 深宇宙通信級 拡張カルマンフィルタ (EKF) FM復調テスト成功")
+
+
+def test_kalman_pilot_tracker():
+    print("\n===== test_kalman_pilot_tracker =====")
+    fs = 288000.0
+    tracker = KalmanPilotTracker(sample_rate=fs, fn_min=3.0, fn_max=24.0, zeta=0.85)
+
+    # 1. 弱電界・高ジッター環境シミュレーション (低品質・残差大)
+    for _ in range(15):
+        kp, ki, alpha = tracker.update_gains(lock_quality=0.10, pilot_rms=0.005, ef_state=0.35)
+
+    print(f"[*] 弱電界適応後: fn={tracker.current_fn:.2f} Hz (期待値 < 10 Hz), CNR={tracker.current_cnr_db:.1f} dB, Ki={ki:.4e}")
+    assert tracker.current_fn < 10.0, f"弱電界で帯域幅が十分に絞られていません: {tracker.current_fn}"
+    assert ki < 5e-8, f"積分ゲインが十分に抑制されていません: {ki}"
+
+    # 2. 強電界・クリーン環境シミュレーション (高品質・残差極小)
+    for _ in range(25):
+        kp, ki, alpha = tracker.update_gains(lock_quality=0.85, pilot_rms=0.15, ef_state=0.005)
+
+    print(f"[*] 強電界適応後: fn={tracker.current_fn:.2f} Hz (期待値 > 20 Hz), CNR={tracker.current_cnr_db:.1f} dB, Ki={ki:.4e}")
+    assert tracker.current_fn > 20.0, f"強電界で帯域幅が十分に拡大されていません: {tracker.current_fn}"
+    assert ki > 1.8e-7, f"積分ゲインが十分に俊敏になっていません: {ki}"
+
+    # 3. パラメータの連続性 (急峻なステップ変化によるクリック音の不在)
+    # 1フレームでいきなり弱電界になった場合の1回更新での変化率
+    old_fn = tracker.current_fn
+    tracker.update_gains(lock_quality=0.05, pilot_rms=0.001, ef_state=0.5)
+    delta_fn = abs(tracker.current_fn - old_fn)
+    assert delta_fn < 5.0, f"パラメータが1フレームで急激に跳躍しました (クリック音リスク): delta={delta_fn}"
+    print("[OK] NASA DSN方式 自律適応カルマン・パイロット搬送波追従テスト成功")
+
+
+def test_time_reversal_turbo_equalizer():
+    print("\n===== test_time_reversal_turbo_equalizer =====")
+    fs = 48000.0
+    n = 2048
+    t = np.arange(n) / fs
+
+    # 1. ゼロ位相対称性検証 (インパルス応答が完全に対称であることを検証)
+    turbo = TimeReversalTurboEqualizer(sample_rate=fs, taps=33, fc_default=14500.0)
+    kernel = turbo._kernel
+    diff_symmetry = float(np.max(np.abs(kernel - kernel[::-1])))
+    print(f"[*] カーネル完全対称性 (ゼロ位相歪み): {diff_symmetry:.2e} (期待値: 0.00e+00)")
+    assert diff_symmetry < 1e-6, "カーネルが対称でなく位相歪みがあります"
+
+    # 2. FM三角雑音パワー抑圧と1kHz通過帯域保持の検証
+    np.random.seed(42)
+    white = np.random.normal(0, 0.05, n)
+    tri_noise = (np.diff(white, prepend=white[0]) * 3.0).astype(np.float32)
+
+    turbo._histories[""] = np.zeros(turbo._hist_len, dtype=np.float32)
+    smoothed_noise = turbo.process(tri_noise)
+
+    pwr_orig = float(np.mean(tri_noise ** 2))
+    pwr_smooth = float(np.mean(smoothed_noise ** 2))
+    noise_reduc_db = 10.0 * np.log10(pwr_orig / pwr_smooth)
+    print(f"[*] FM高域ノイズパワー抑圧比: +{noise_reduc_db:.2f} dB (期待値 > 2.0 dB)")
+    assert noise_reduc_db > 2.0, f"ノイズパワーが十分に減衰していません: {noise_reduc_db:.2f} dB"
+
+    # 1kHz可聴域の信号保持率 (通過域損失ゼロ検証)
+    clean = (0.5 * np.sin(2.0 * np.pi * 1000.0 * t)).astype(np.float32)
+    turbo._histories[""] = np.zeros(turbo._hist_len, dtype=np.float32)
+    out_1k = turbo.process(clean)
+    amp_ratio = float(np.max(np.abs(out_1k[100:500])) / np.max(np.abs(clean[100:500])))
+    print(f"[*] 1kHz可聴帯域振幅保持率: {amp_ratio * 100:.2f}% (期待値 > 98%)")
+    assert amp_ratio > 0.98, f"可聴帯域が過剰に減衰しています: {amp_ratio}"
+
+    # 3. 分割処理 vs 一括処理の完全一致性検証 (Overlap-Lookahead 境界誤差ゼロ)
+    b1 = clean[:1024]
+    b2 = clean[1024:]
+    turbo_split = TimeReversalTurboEqualizer(sample_rate=fs, taps=33, fc_default=14500.0)
+    o1 = turbo_split.process(b1)
+    o2 = turbo_split.process(b2)
+    stitched = np.concatenate((o1, o2))
+
+    turbo_bulk = TimeReversalTurboEqualizer(sample_rate=fs, taps=33, fc_default=14500.0)
+    bulk = turbo_bulk.process(clean)
+
+    split_error = float(np.max(np.abs(stitched - bulk)))
+    print(f"[*] 分割処理 vs 一括処理の最大誤差: {split_error:.2e} (期待値: 0.00e+00)")
+    assert split_error < 1e-6, f"ブロック境界で不連続・誤差が発生しています: {split_error}"
+    print("[OK] MAP-BCJR 時間反転最尤系列ターボ平滑化テスト成功")
+
+
+def test_holographic_audio_enhancer():
+    print("\n===== test_holographic_audio_enhancer =====")
+    fs = 48000.0
+    enhancer = HolographicAudioEnhancer(sample_rate=fs, air_gain=0.08)
+    n = 2048
+    t = np.arange(n) / fs
+
+    # 10kHzの倍音を持つ音楽信号 (15kHz以上は帯域制限で完全ゼロ)
+    sig = (0.4 * np.sin(2 * np.pi * 1000.0 * t) + 0.2 * np.sin(2 * np.pi * 10000.0 * t)).astype(np.float32)
+
+    # 1. 音楽再生時 (ハイレゾ外挿発動)
+    out_music = enhancer.process(sig, ch="_l", speech_prob=0.0, s_meter_dbfs=-20.0)
+
+    # 2. トーク時 (コグニティブ保護バイパス)
+    enhancer._histories["_l"] = np.zeros(len(enhancer.fir_hp15k) - 1, dtype=np.float32)
+    out_talk = enhancer.process(sig, ch="_l", speech_prob=0.9, s_meter_dbfs=-20.0)
+
+    freqs = np.fft.rfftfreq(n, 1.0 / fs)
+    mask_air = freqs >= 15000.0
+
+    spec_in = np.abs(np.fft.rfft(sig))
+    spec_music = np.abs(np.fft.rfft(out_music))
+    spec_talk = np.abs(np.fft.rfft(out_talk))
+
+    air_in = float(np.max(spec_in[mask_air]))
+    air_music = float(np.max(spec_music[mask_air]))
+    air_talk = float(np.max(spec_talk[mask_air]))
+
+    print(f"[*] 15kHz以上エアバンド最大振幅: 入力={air_in:.4f} -> 音楽外挿={air_music:.4f} -> トーク保護={air_talk:.4f}")
+    assert air_music > air_in * 10.0, f"15kHz以上のエアバンド倍音が十分に外挿されていません: {air_music}"
+    assert np.allclose(out_talk, sig, atol=1e-5), "トーク時に完全バイパスされていません"
+
+    # 3. 弱電界ノイズ保護 (弱電界で外挿抑制)
+    enhancer._histories["_l"] = np.zeros(len(enhancer.fir_hp15k) - 1, dtype=np.float32)
+    out_weak = enhancer.process(sig, ch="_l", speech_prob=0.0, s_meter_dbfs=-50.0)
+    assert np.allclose(out_weak, sig, atol=1e-5), "弱電界ノイズ環境で保護バイパスされていません"
+    print("[OK] ホログラフィック・ハイレゾ倍音外挿テスト成功")
+
+
+def test_riemannian_topological_demodulator():
+    print("\n===== test_riemannian_topological_demodulator =====")
+    fs = 288000.0
+    duration = 0.05
+    n = int(fs * duration)
+    t = np.arange(n) / fs
+
+    dev_hz = 50000.0
+    mod_audio = np.sin(2.0 * np.pi * 1000.0 * t).astype(np.float32)
+    phase = np.cumsum(2.0 * np.pi * dev_hz * mod_audio / fs)
+    clean_iq = np.exp(1j * phase).astype(np.complex64)
+
+    demodulator = RiemannianTopologicalDemodulator(sample_rate=fs, dev_limit_hz=75000.0)
+
+    # 1. クリーン信号でのビット整合性検証
+    demod_clean = demodulator.demodulate(clean_iq)
+    ref_norm = (2.0 * np.pi * dev_hz / fs) * mod_audio
+    corr_clean = float(np.corrcoef(demod_clean[100:], ref_norm[100:])[0, 1])
+    print(f"[*] クリーンFM波のリーマン測地線復調相関度: {corr_clean:.6f} (期待値 > 0.999)")
+    assert corr_clean > 0.999, f"クリーン波形の追従精度が不十分です: {corr_clean}"
+
+    # 2. 低CNR極限環境 (CNR = 4dB) での特異点発散・クリックスパイク抑圧検証
+    np.random.seed(42)
+    noise = (np.random.normal(0, 0.45, n) + 1j * np.random.normal(0, 0.45, n)).astype(np.complex64)
+    noisy_iq = clean_iq + noise
+
+    # ナイーブ差分検波
+    naive_cross = noisy_iq[1:] * np.conj(noisy_iq[:-1])
+    naive_demod = np.angle(naive_cross)
+    naive_clicks = int(np.sum(np.abs(np.diff(naive_demod)) > 0.8))
+
+    # リーマン多様体正則化検波
+    demodulator.last_sample = 0.0 + 0.0j
+    riemann_demod = demodulator.demodulate(noisy_iq)
+    riemann_clicks = int(np.sum(np.abs(np.diff(riemann_demod)) > 0.8))
+
+    corr_naive = float(np.corrcoef(naive_demod[200:], ref_norm[201:])[0, 1])
+    corr_riemann = float(np.corrcoef(riemann_demod[201:], ref_norm[201:])[0, 1])
+
+    print(f"[*] 低CNR環境におけるクリックスパイク数: ナイーブ={naive_clicks}個 -> リーマン正則化={riemann_clicks}個 (抑圧率: {(1 - riemann_clicks / naive_clicks) * 100:.1f}%)")
+    print(f"[*] ノイズ下波形相関度: ナイーブ={corr_naive:.4f} -> リーマン正則化={corr_riemann:.4f} (改善: +{(corr_riemann - corr_naive):.4f})")
+
+    assert riemann_clicks < naive_clicks * 0.90, "特異点クリックスパイクが十分に抑圧されていません"
+    assert corr_riemann > corr_naive, "リーマン正則化による相関度改善が見られません"
+    print("[OK] リーマン多様体トポロジカル測地線復調テスト成功")
+
+
+def test_viterbi_phase_demodulator():
+    print("===== test_viterbi_phase_demodulator =====")
+    fs = 288000.0
+    duration = 0.05
+    n = int(fs * duration)
+    t = np.arange(n) / fs
+
+    dev_hz = 50000.0
+    mod_audio = np.sin(2.0 * np.pi * 1000.0 * t).astype(np.float32)
+    phase = np.cumsum(2.0 * np.pi * dev_hz * mod_audio / fs)
+    clean_iq = np.exp(1j * phase).astype(np.complex64)
+
+    viterbi = ViterbiPhaseDemodulator(sample_rate=fs, dev_limit_hz=75000.0, audio_max_hz=15000.0)
+
+    # 1. クリーン信号でのビットパーフェクト整合性
+    demod_clean = viterbi.demodulate(clean_iq)
+    ref_norm = (2.0 * np.pi * dev_hz / fs) * mod_audio
+    corr_clean = float(np.corrcoef(demod_clean[100:], ref_norm[100:])[0, 1])
+    print(f"[*] クリーンFM波のビタビ最尤復調相関度: {corr_clean:.6f} (期待値 > 0.999)")
+    assert corr_clean > 0.999, f"クリーン波形の追従精度が不十分です: {corr_clean}"
+
+    # 2. 低CNR極限環境 (CNR = 4dB) での位相スリップ・クリックスパイク大域消去
+    np.random.seed(42)
+    noise = (np.random.normal(0, 0.45, n) + 1j * np.random.normal(0, 0.45, n)).astype(np.complex64)
+    noisy_iq = clean_iq + noise
+
+    # ナイーブ差分検波
+    naive_cross = noisy_iq[1:] * np.conj(noisy_iq[:-1])
+    naive_demod = np.angle(naive_cross)
+    naive_clicks = int(np.sum(np.abs(np.diff(naive_demod)) > 0.8))
+
+    # ビタビ最尤復調
+    viterbi.reset()
+    viterbi_demod = viterbi.demodulate(noisy_iq)
+    viterbi_clicks = int(np.sum(np.abs(np.diff(viterbi_demod)) > 0.8))
+
+    corr_naive = float(np.corrcoef(naive_demod[200:], ref_norm[201:])[0, 1])
+    corr_viterbi = float(np.corrcoef(viterbi_demod[201:], ref_norm[201:])[0, 1])
+
+    print(f"[*] 低CNR環境におけるクリックスパイク数: ナイーブ={naive_clicks}個 -> ビタビ最尤軌道={viterbi_clicks}個 (抑圧率: {(1 - viterbi_clicks / naive_clicks) * 100:.1f}%)")
+    print(f"[*] ノイズ下波形相関度: ナイーブ={corr_naive:.4f} -> ビタビ最尤軌道={corr_viterbi:.4f} (改善: +{(corr_viterbi - corr_naive):.4f})")
+
+    assert viterbi_clicks < naive_clicks * 0.70, f"クリックスパイクが十分に抑圧されていません: {viterbi_clicks} vs {naive_clicks}"
+    assert corr_viterbi > corr_naive, "ビタビ最尤系列復調による相関度改善が見られません"
+
+    # 3. 分割処理 (ストリーミング) と一括処理の境界整合性
+    viterbi.reset()
+    c1 = clean_iq[:n // 2]
+    c2 = clean_iq[n // 2:]
+    out_split = np.concatenate([viterbi.demodulate(c1), viterbi.demodulate(c2)])
+    viterbi.reset()
+    out_batch = viterbi.demodulate(clean_iq)
+    max_split_err = float(np.max(np.abs(out_split - out_batch)))
+    print(f"[*] 分割処理 vs 一括処理の最大誤差: {max_split_err:.2e} (期待値 < 1e-5)")
+    assert max_split_err < 1e-5, f"境界不連続が生じています: {max_split_err}"
+
+    print("[OK] 最尤位相軌道ビタビ復調テスト成功")
+
+
+def test_super_spatial_bss_stereo_separator():
+    print("===== test_super_spatial_bss_stereo_separator =====")
+    fs = 48000.0
+    duration = 0.1
+    n = int(fs * duration)
+    t = np.arange(n) / fs
+
+    # 1. 理想ステレオ信号 (L: 1kHz + 4kHz, R: 1kHz - 4kHz)
+    l_true = (0.5 * np.sin(2 * np.pi * 1000.0 * t) + 0.3 * np.sin(2 * np.pi * 4000.0 * t)).astype(np.float32)
+    r_true = (0.5 * np.sin(2 * np.pi * 1000.0 * t) - 0.2 * np.sin(2 * np.pi * 4000.0 * t)).astype(np.float32)
+
+    bss = SuperSpatialBssStereoSeparator(sample_rate=fs, crossover_hz=7500.0)
+
+    # クリーン信号のビット通過性 (遅延整合のため delay=24 サンプル≒0.5ms遅延を補正して比較)
+    l_clean, r_clean = bss.process(l_true, r_true, stereo_blend=1.0)
+    dly = int(getattr(bss, "delay", 0))
+    if dly > 0 and len(l_clean) > dly:
+        corr_l_clean = float(np.corrcoef(l_clean[dly:], l_true[:-dly] if dly else l_true)[0, 1])
+        corr_r_clean = float(np.corrcoef(r_clean[dly:], r_true[:-dly] if dly else r_true)[0, 1])
+    else:
+        corr_l_clean = float(np.corrcoef(l_clean, l_true)[0, 1])
+        corr_r_clean = float(np.corrcoef(r_clean, r_true)[0, 1])
+    print(f"[*] クリーンステレオ波形の忠実度相関: L={corr_l_clean:.6f}, R={corr_r_clean:.6f} (期待値 > 0.999)")
+    assert corr_l_clean > 0.999 and corr_r_clean > 0.999, "クリーン信号が変形しています"
+
+    # 2. 38kHz副搬送波FM逆相三角ノイズの重畳
+    np.random.seed(42)
+    white = np.random.normal(0, 0.03, n).astype(np.float32)
+    tri_noise = (np.diff(white, prepend=white[0]) * 3.5).astype(np.float32)
+
+    l_noisy = l_true + tri_noise
+    r_noisy = r_true - tri_noise
+
+    bss.reset()
+    l_out, r_out = bss.process(l_noisy, r_noisy, stereo_blend=1.0)
+
+    # 遅延補正して評価 (出力は delay だけ遅れるため)
+    dly2 = int(getattr(bss, "delay", 0))
+    if dly2 > 0 and len(l_out) > dly2:
+        l_true_a = l_true[:-dly2]
+        l_noisy_a = l_noisy[dly2:]
+        l_out_a = l_out[dly2:]
+    else:
+        l_true_a, l_noisy_a, l_out_a = l_true, l_noisy, l_out
+    noise_before = float(np.mean((l_noisy_a - l_true_a) ** 2))
+    noise_after = float(np.mean((l_out_a - l_true_a) ** 2))
+    snr_gain = 10.0 * np.log10(noise_before / (noise_after + 1e-12))
+    corr_noisy = float(np.corrcoef(l_noisy_a, l_true_a)[0, 1])
+    corr_out = float(np.corrcoef(l_out_a, l_true_a)[0, 1])
+
+    print(f"[*] FM三角逆相ヒスノイズ低減比: +{snr_gain:.2f} dB (期待値 > +3.0 dB)")
+    print(f"[*] ノイズ下波形相関度: 前={corr_noisy:.4f} -> BSS後={corr_out:.4f} (改善: +{(corr_out - corr_noisy):.4f})")
+
+    assert snr_gain > 3.0, f"ノイズ低減効果が不十分です: {snr_gain:.2f} dB"
+    assert corr_out > corr_noisy, "BSSによる波形相関度改善が見られません"
+
+    print("[OK] 超空間独立成分ステレオ復調テスト成功")
+
+
+def test_subspace_multipath_equalizer():
+    print("\n===== test_subspace_multipath_equalizer =====")
+    fs = 288000.0
+    duration = 0.05
+    n = int(fs * duration)
+    t = np.arange(n) / fs
+
+    # 1. クリーンFM信号 (1kHz変調, 偏移 ±50kHz)
+    mod_sig = np.sin(2 * np.pi * 1000.0 * t).astype(np.float32)
+    dev_hz = 50000.0
+    phase = np.cumsum(2.0 * np.pi * dev_hz * mod_sig / fs)
+    clean_iq = np.exp(1j * phase).astype(np.complex64)
+
+    eq = SubspaceMultipathEqualizer(sample_rate=fs, max_delay_taps=32)
+
+    # クリーン通過テスト (包絡線分散 < 0.025 で即座にバイパス、ビット一致)
+    out_clean = eq.process(clean_iq)
+    max_clean_diff = float(np.max(np.abs(out_clean - clean_iq)))
+    print(f"[*] クリーンFM波の通過差分: {max_clean_diff:.2e} (完全ビット一致)")
+    assert max_clean_diff == 0.0, "クリーンFM波が変形しています"
+
+    # 2. マルチパス反射波の重畳シミュレーション
+    # 直接波 + 遅延 tau=12 サンプル、減衰 alpha=0.45 * exp(1j * 0.8) のビル反射波
+    tau_true = 12
+    alpha_true = 0.45 * np.exp(1j * 0.8)
+    reflected = np.zeros_like(clean_iq)
+    reflected[tau_true:] = alpha_true * clean_iq[:-tau_true]
+    multipath_iq = (clean_iq + reflected).astype(np.complex64)
+
+    var_before = float(np.var(np.abs(multipath_iq)))
+
+    # 等化器処理
+    eq.reset()
+    out_eq = eq.process(multipath_iq)
+    var_after = float(np.var(np.abs(out_eq)))
+    suppression_db = 10.0 * np.log10(var_before / (var_after + 1e-12))
+
+    print(f"[*] マルチパス反射波同定: 推定tau={eq.opt_tau} (真値={tau_true}), 推定|alpha|={abs(eq.opt_alpha):.3f} (真値={abs(alpha_true):.3f})")
+    print(f"[*] 包絡線分散歪み抑圧比: +{suppression_db:.2f} dB (期待値 > +2.5 dB)")
+
+    assert eq.opt_tau == tau_true, f"遅延tauの同定が不一致です: {eq.opt_tau} vs {tau_true}"
+    assert suppression_db > 2.5, f"包絡線歪みの抑圧効果が不十分です: {suppression_db:.2f} dB"
+
+    # 3. 分割処理 (ストリーミング) と一括処理の境界整合性
+    eq.reset()
+    c1 = multipath_iq[:n // 2]
+    c2 = multipath_iq[n // 2:]
+    out_split = np.concatenate([eq.process(c1), eq.process(c2)])
+    eq.reset()
+    out_batch = eq.process(multipath_iq)
+    diff_split = float(np.max(np.abs(out_split[32:] - out_batch[32:])))
+    print(f"[*] 分割処理 vs 一括処理の最大差分: {diff_split:.2e} (シームレス境界)")
+    assert diff_split < 1e-4, f"境界不連続が生じています: {diff_split}"
+
+    print("[OK] 部分空間超解像マルチパス等化器テスト成功")
+
+
+def test_rmt_hankel_denoiser():
+    print("\n===== test_rmt_hankel_denoiser =====")
+    fs = 48000.0
+    duration = 0.05
+    n = int(fs * duration)
+    t = np.arange(n) / fs
+
+    # 1. クリーンな音声・音楽信号 (1kHz + 2.5kHz + 4kHz)
+    clean = (0.4 * np.sin(2 * np.pi * 1000.0 * t) +
+             0.2 * np.sin(2 * np.pi * 2500.0 * t) +
+             0.15 * np.cos(2 * np.pi * 4000.0 * t)).astype(np.float32)
+
+    rmt = RmtHankelDenoiser(sample_rate=fs, embed_dim=24)
+
+    # クリーン通過テスト (S-Meter > -28dBFS 強電界で完全バイパス)
+    out_clean = rmt.process(clean, ch="", s_meter_dbfs=-15.0)
+    max_clean_diff = float(np.max(np.abs(out_clean - clean)))
+    print(f"[*] 強電界クリーン波形の通過差分: {max_clean_diff:.2e} (完全ビット一致)")
+    assert max_clean_diff == 0.0, "クリーン信号が変形しています"
+
+    # 2. 弱電界ノイズ (FM三角ノイズ + ガウス雑音)
+    np.random.seed(42)
+    white = np.random.normal(0, 0.08, n).astype(np.float32)
+    noisy = clean + white
+
+    rmt.reset()
+    # 弱電界 (S-Meter -38dBFS)
+    out_denoised = rmt.process(noisy, ch="", s_meter_dbfs=-38.0)
+
+    # 群遅延 (half_taps) を考慮した定常区間での評価
+    half = rmt.half_taps
+    eval_slice = slice(half * 2, -half)
+    ref = np.concatenate((np.zeros(half, dtype=np.float32), clean))[:n]
+
+    err_before = float(np.mean((noisy[eval_slice] - clean[eval_slice]) ** 2))
+    err_after = float(np.mean((out_denoised[eval_slice] - ref[eval_slice]) ** 2))
+    snr_gain = 10.0 * np.log10(err_before / (err_after + 1e-12))
+    corr_before = float(np.corrcoef(noisy[eval_slice], clean[eval_slice])[0, 1])
+    corr_after = float(np.corrcoef(out_denoised[eval_slice], ref[eval_slice])[0, 1])
+
+    print(f"[*] RMTマルチェンコ・パスツール特異値切除 SNR改善度: +{snr_gain:.2f} dB (期待値 > +4.5 dB)")
+    print(f"[*] ノイズ下波形相関度: 前={corr_before:.4f} -> RMT後={corr_after:.4f} (改善: +{(corr_after - corr_before):.4f})")
+
+    assert snr_gain > 4.5, f"RMTによるノイズ低減効果が不十分です: {snr_gain:.2f} dB"
+    assert corr_after > corr_before, "RMTによる相関度改善が見られません"
+
+    # 3. 分割処理 (ストリーミング) と一括処理の完全一致性検証 (境界誤差ゼロ)
+    rmt_split = RmtHankelDenoiser(sample_rate=fs, embed_dim=24)
+    rmt_split._cached_kernel = rmt._cached_kernel.copy()
+    rmt_split._cached_sigma2 = rmt._cached_sigma2
+    rmt_split._frame_count = 1
+    c1 = noisy[:n // 2]
+    c2 = noisy[n // 2:]
+    out_split = np.concatenate([
+        rmt_split.process(c1, ch="", s_meter_dbfs=-38.0),
+        rmt_split.process(c2, ch="", s_meter_dbfs=-38.0)
+    ])
+    rmt_bulk = RmtHankelDenoiser(sample_rate=fs, embed_dim=24)
+    rmt_bulk._cached_kernel = rmt._cached_kernel.copy()
+    rmt_bulk._cached_sigma2 = rmt._cached_sigma2
+    rmt_bulk._frame_count = 1
+    out_bulk = rmt_bulk.process(noisy, ch="", s_meter_dbfs=-38.0)
+
+    diff_split = float(np.max(np.abs(out_split - out_bulk)))
+    print(f"[*] 分割処理 vs 一括処理の最大差分: {diff_split:.2e} (完全一致)")
+    assert diff_split < 1e-6, f"境界不連続が生じています: {diff_split}"
+
+    print("[OK] ランダム行列特異値切除ノイズクリーナーテスト成功")
+
+
+def test_wasserstein_multipath_equalizer():
+    print("\n===== test_wasserstein_multipath_equalizer =====")
+    fs = 288000.0
+    duration = 0.05
+    n = int(fs * duration)
+    t = np.arange(n) / fs
+
+    # 1. クリーンなFM変調波 (定包絡線, 偏移 ±50kHz)
+    mod_sig = np.sin(2 * np.pi * 1000.0 * t).astype(np.float32)
+    dev_hz = 50000.0
+    phase = np.cumsum(2.0 * np.pi * dev_hz * mod_sig / fs)
+    clean_iq = np.exp(1j * phase).astype(np.complex64)
+
+    eq = WassersteinMultipathEqualizer(sample_rate=fs, max_delay_taps=32, max_multipath_taps=4)
+
+    # クリーン信号の完全通過テスト (包絡線分散 < 0.025 で完全バイパス)
+    out_clean = eq.process(clean_iq)
+    clean_diff = float(np.max(np.abs(out_clean - clean_iq)))
+    print(f"[*] クリーンFM波の通過差分: {clean_diff:.2e} (完全ビット一致)")
+    assert clean_diff == 0.0, "クリーンFM波が変形しています"
+
+    # 2. 複数ビル反射波 (2波のマルチパス干渉: tau1=8, tau2=18)
+    tau1_true = 8
+    alpha1_true = 0.35 * np.exp(1j * 0.6)
+    tau2_true = 18
+    alpha2_true = 0.18 * np.exp(-1j * 1.1)
+
+    multipath_iq = clean_iq.copy()
+    multipath_iq[tau1_true:] += (alpha1_true * clean_iq[:-tau1_true]).astype(np.complex64)
+    multipath_iq[tau2_true:] += (alpha2_true * clean_iq[:-tau2_true]).astype(np.complex64)
+
+    var_before = float(np.var(np.abs(multipath_iq)))
+
+    eq.reset()
+    out_eq = eq.process(multipath_iq)
+    var_after = float(np.var(np.abs(out_eq)))
+    suppression_db = 10.0 * np.log10(var_before / (var_after + 1e-12))
+
+    print(f"[*] 複数マルチパス反射波同定:")
+    print(f"    推定遅延タップ={eq.opt_delays} (真値=[{tau1_true}, {tau2_true}])")
+    alphas_str = [f"|a|={abs(a):.3f}" for a in eq.opt_alphas]
+    print(f"    推定複素係数={alphas_str} (真値=[|a1|={abs(alpha1_true):.3f}, |a2|={abs(alpha2_true):.3f}])")
+    print(f"[*] 最適輸送 W_2 包絡線分散歪み抑圧比: +{suppression_db:.2f} dB (期待値 > +3.0 dB)")
+
+    # 離散サンプリンググリッドにおける ±1 サンプル以内の同定精度を検証
+    found_tau1 = any(abs(d - tau1_true) <= 1 for d in eq.opt_delays)
+    found_tau2 = any(abs(d - tau2_true) <= 1 for d in eq.opt_delays)
+    assert found_tau1, f"第1遅延tau1={tau1_true}が同定されていません: {eq.opt_delays}"
+    assert found_tau2, f"第2遅延tau2={tau2_true}が同定されていません: {eq.opt_delays}"
+    assert suppression_db > 3.0, f"複数マルチパスの抑圧効果が不十分です: {suppression_db:.2f} dB"
+
+    # 3. 分割処理 (ストリーミング) と一括処理の境界整合性
+    eq.reset()
+    c1 = multipath_iq[:n // 2]
+    c2 = multipath_iq[n // 2:]
+    out_split = np.concatenate([eq.process(c1), eq.process(c2)])
+    eq.reset()
+    out_batch = eq.process(multipath_iq)
+    diff_split = float(np.max(np.abs(out_split[32:] - out_batch[32:])))
+    print(f"[*] 分割処理 vs 一括処理の最大差分: {diff_split:.2e} (シームレス境界)")
+    assert diff_split < 1e-4, f"境界不連続が生じています: {diff_split}"
+
+    print("[OK] 最適輸送理論複数マルチパス等化器テスト成功")
+
+
+def test_symplectic_hamiltonian_demodulator():
+    print("\n===== test_symplectic_hamiltonian_demodulator =====")
+    fs = 288000.0
+    duration = 0.05
+    n = int(fs * duration)
+    t = np.arange(n) / fs
+
+    # 1. クリーンFM変調波 (1kHz変調, 偏移 ±50kHz)
+    mod_sig = np.sin(2 * np.pi * 1000.0 * t).astype(np.float32)
+    dev_hz = 50000.0
+    phase = np.cumsum(2.0 * np.pi * dev_hz * mod_sig / fs)
+    clean_iq = np.exp(1j * phase).astype(np.complex64)
+
+    symp = SymplecticHamiltonianDemodulator(sample_rate=fs, dev_limit_hz=75000.0, cutoff_hz=65000.0)
+
+    # クリーンFM復調の忠実度検証
+    out_clean = symp.process(clean_iq)
+    scale = fs / (2.0 * np.pi * dev_hz)
+    clean_demod_norm = out_clean * scale
+
+    corr_clean = float(np.corrcoef(clean_demod_norm[200:], mod_sig[200:])[0, 1])
+    print(f"[*] クリーンFM波のシンプレクティック復調相関度: {corr_clean:.6f} (期待値 > 0.999)")
+    assert corr_clean > 0.999, f"シンプレクティック復調の線形忠実度が不足しています: {corr_clean}"
+
+    # 2. 低CNRフェージング環境 (CNR ≈ 4dB: クリックスパイク頻発)
+    np.random.seed(42)
+    noise = (np.random.normal(0, 0.55, n) + 1j * np.random.normal(0, 0.55, n)).astype(np.complex64)
+    noisy_iq = clean_iq + noise
+
+    # ナイーブ差分法
+    diff_naive = np.angle(noisy_iq[1:] * np.conj(noisy_iq[:-1])) * scale
+    naive_clicks = int(np.sum(np.abs(diff_naive) > 2.0))
+
+    # シンプレクティック復調器
+    symp.reset()
+    out_noisy = symp.process(noisy_iq) * scale
+    symp_clicks = int(np.sum(np.abs(out_noisy[1:]) > 2.0))
+
+    corr_naive = float(np.corrcoef(diff_naive[500:], mod_sig[501:])[0, 1])
+    corr_symp = float(np.corrcoef(out_noisy[500:], mod_sig[500:])[0, 1])
+    suppression_ratio = 100.0 * (naive_clicks - symp_clicks) / max(naive_clicks, 1)
+
+    print(f"[*] 低CNR環境クリックスパイク数: ナイーブ差分={naive_clicks}個 -> シンプレクティック幾何={symp_clicks}個 (抑圧率: {suppression_ratio:.1f}%)")
+    print(f"[*] 低CNR波形相関度: ナイーブ={corr_naive:.4f} -> シンプレクティック={corr_symp:.4f} (改善: +{(corr_symp - corr_naive):.4f})")
+
+    assert suppression_ratio > 90.0, f"クリックスパイク抑圧率が不十分です: {suppression_ratio:.1f}%"
+    assert corr_symp > corr_naive, "シンプレクティック復調による相関度改善が見られません"
+
+    # 3. 分割処理 (ストリーミング) と一括処理の境界整合性
+    symp.reset()
+    c1 = clean_iq[:n // 2]
+    c2 = clean_iq[n // 2:]
+    out_split = np.concatenate([symp.process(c1), symp.process(c2)])
+    symp.reset()
+    out_batch = symp.process(clean_iq)
+    diff_split = float(np.max(np.abs(out_split[10:] - out_batch[10:])))
+    print(f"[*] 分割処理 vs 一括処理の最大差分: {diff_split:.2e} (シームレス境界)")
+    assert diff_split < 1e-4, f"境界不連続が生じています: {diff_split}"
+
+    print("[OK] シンプレクティック幾何学非線形FM位相空間復調器テスト成功")
+
+
+def test_sparse_subcarrier_extractor():
+    print("\n===== test_sparse_subcarrier_extractor =====")
+    fs = 288000.0
+    duration = 0.05
+    n = int(fs * duration)
+    t = np.arange(n) / fs
+
+    # 1. 理想的なMPX複合信号
+    # 主音声 (L+R: 1kHz), パイロット (19kHz), 副搬送波 (L-R: 38kHz), RDS (57kHz)
+    audio_lr = 0.4 * np.sin(2 * np.pi * 1000.0 * t).astype(np.float32)
+    pilot = 0.1 * np.sin(2 * np.pi * 19000.0 * t).astype(np.float32)
+    subcarrier = (0.3 * np.sin(2 * np.pi * 1000.0 * t) * np.sin(2 * np.pi * 38000.0 * t)).astype(np.float32)
+    rds = (0.05 * np.cos(2 * np.pi * 57000.0 * t)).astype(np.float32)
+    mpx_clean = audio_lr + pilot + subcarrier + rds
+
+    extractor = SparseSubcarrierExtractor(sample_rate=fs, taps=129)
+
+    # クリーン通過テスト (S-Meter > -32.0 dBFS で完全バイパス)
+    out_clean = extractor.process(mpx_clean, s_meter_dbfs=-20.0)
+    max_clean_diff = float(np.max(np.abs(out_clean - mpx_clean)))
+    print(f"[*] 強電界クリーン波形の通過差分: {max_clean_diff:.2e} (完全ビット一致)")
+    assert max_clean_diff == 0.0, "クリーンMPX波形が変形しています"
+
+    # 2. 弱電界ノイズ (FM高域三角ノイズ)
+    np.random.seed(42)
+    white = np.random.normal(0, 0.25, n).astype(np.float32)
+    tri_noise = np.diff(white, prepend=white[0]) * 1.5
+    mpx_noisy = mpx_clean + tri_noise
+
+    extractor.reset()
+    out_cs = extractor.process(mpx_noisy, s_meter_dbfs=-38.0)
+
+    half = extractor.half_taps
+    eval_slice = slice(half * 2, -half)
+    ref = np.concatenate((np.zeros(half, dtype=np.float32), mpx_clean))[:n]
+
+    err_before = float(np.mean((mpx_noisy[eval_slice] - mpx_clean[eval_slice]) ** 2))
+    err_after = float(np.mean((out_cs[eval_slice] - ref[eval_slice]) ** 2))
+    snr_gain = 10.0 * np.log10(err_before / (err_after + 1e-12))
+    corr_before = float(np.corrcoef(mpx_noisy[eval_slice], mpx_clean[eval_slice])[0, 1])
+    corr_after = float(np.corrcoef(out_cs[eval_slice], ref[eval_slice])[0, 1])
+
+    print(f"[*] 圧縮センシング FISTA 副搬送波SNR改善度: +{snr_gain:.2f} dB (期待値 > +3.0 dB)")
+    print(f"[*] MPX波形相関度: 前={corr_before:.4f} -> CS後={corr_after:.4f} (改善: +{(corr_after - corr_before):.4f})")
+
+    assert snr_gain > 3.0, f"圧縮センシングによるノイズ改善が不十分です: {snr_gain:.2f} dB"
+    assert corr_after > corr_before, "圧縮センシングによる相関度改善が見られません"
+
+    # 3. 分割処理 (ストリーミング) と一括処理の境界整合性
+    extractor_split = SparseSubcarrierExtractor(sample_rate=fs, taps=129)
+    extractor_split._cached_kernel = extractor._cached_kernel.copy()
+    extractor_split._frame_count = 1
+    c1 = mpx_noisy[:n // 2]
+    c2 = mpx_noisy[n // 2:]
+    out_split = np.concatenate([
+        extractor_split.process(c1, s_meter_dbfs=-38.0),
+        extractor_split.process(c2, s_meter_dbfs=-38.0)
+    ])
+    extractor_bulk = SparseSubcarrierExtractor(sample_rate=fs, taps=129)
+    extractor_bulk._cached_kernel = extractor._cached_kernel.copy()
+    extractor_bulk._frame_count = 1
+    out_batch = extractor_bulk.process(mpx_noisy, s_meter_dbfs=-38.0)
+
+    diff_split = float(np.max(np.abs(out_split - out_batch)))
+    print(f"[*] 分割処理 vs 一括処理の最大差分: {diff_split:.2e} (完全一致)")
+    assert diff_split < 1e-5, f"境界不連続が生じています: {diff_split}"
+
+    print("[OK] 圧縮センシング副搬送波超解像抽出器テスト成功")
+
+
 if __name__ == "__main__":
     test_iq_imbalance_correction()
     test_dynamic_if_bandwidth()
     test_ultrasonic_squelch()
     test_cognitive_speech_music_tracker()
+    test_quadrature_mpx_canceller()
+    test_deep_space_ekf_demodulator()
+    test_kalman_pilot_tracker()
+    test_time_reversal_turbo_equalizer()
+    test_holographic_audio_enhancer()
+    test_riemannian_topological_demodulator()
+    test_viterbi_phase_demodulator()
+    test_super_spatial_bss_stereo_separator()
+    test_subspace_multipath_equalizer()
+    test_wasserstein_multipath_equalizer()
+    test_symplectic_hamiltonian_demodulator()
+    test_sparse_subcarrier_extractor()
+    test_rmt_hankel_denoiser()
     print("\nALL ADAPTIVE DSP TESTS PASSED!")
+
+
+
+
+

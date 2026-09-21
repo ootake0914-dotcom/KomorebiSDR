@@ -41,6 +41,10 @@ class RtlSdrDriver:
         self.is_open = False
         self.sample_rate = 2048000
         self.center_freq = 80000000
+        # PPM較正値 (ドングル水晶の個体誤差。HW APIがあればドングル側、
+        # 無ければset_center_freq時のソフトウェア周波数オフセットで補正)
+        self.ppm = 0
+        self._ppm_hw = False
 
         # 非同期ストリームのライフサイクル管理 (同期読み込みとの競合・ハング防止)
         self._async_lock = threading.Lock()
@@ -110,6 +114,15 @@ class RtlSdrDriver:
         self._dll.rtlsdr_cancel_async.argtypes = [c_void_p]
         self._dll.rtlsdr_cancel_async.restype = c_int
 
+        # PPM周波数較正 (古いDLLに無い場合はHW経路を使わずSWフォールバック)
+        self._has_ppm_api = all(hasattr(self._dll, n) for n in
+                                ("rtlsdr_set_freq_correction", "rtlsdr_get_freq_correction"))
+        if self._has_ppm_api:
+            self._dll.rtlsdr_set_freq_correction.argtypes = [c_void_p, c_int]
+            self._dll.rtlsdr_set_freq_correction.restype = c_int
+            self._dll.rtlsdr_get_freq_correction.argtypes = [c_void_p]
+            self._dll.rtlsdr_get_freq_correction.restype = c_int
+
     def get_device_count(self) -> int:
         return self._dll.rtlsdr_get_device_count()
 
@@ -119,13 +132,28 @@ class RtlSdrDriver:
 
     def open(self, index: int = 0):
         if self.is_open:
-            return
+            # closeガードでskipされた死ハンドルの場合は再オープンを試みる
+            if getattr(self, "_close_pending", False) and not self._async_active.is_set():
+                try:
+                    self.dev = c_void_p(0)
+                    self.is_open = False
+                    self._close_pending = False
+                except Exception:
+                    pass
+            else:
+                return
         res = self._dll.rtlsdr_open(byref(self.dev), index)
         if res != 0 or not self.dev:
             raise RuntimeError(f"RTL-SDRデバイス (index {index}) のオープンに失敗しました (code: {res})")
         self.is_open = True
         # 前デバイス/close時の設定キャッシュを無効化 (新デバイスには未設定状態から適用する)
         self._direct_sampling_mode = None
+        # デバイスリセットでPPM補正は消えるため、保持値を再適用する
+        if self.ppm != 0:
+            try:
+                self._apply_ppm_hw(self.ppm)
+            except Exception:
+                pass
         self.reset_buffer()
 
     def close(self):
@@ -135,11 +163,13 @@ class RtlSdrDriver:
                 # ハンドルはリークするが、クラッシュより安全。復帰は次回open時。
                 print("[WARN] async loop still active; skip rtlsdr_close "
                       "(handle kept, will retry on next open)", file=sys.stderr)
+                self._close_pending = True
                 return
         if self.is_open and self.dev:
             self._dll.rtlsdr_close(self.dev)
             self.dev = c_void_p(0)
             self.is_open = False
+            self._close_pending = False
             self._direct_sampling_mode = None
 
     def reset_buffer(self):
@@ -159,13 +189,46 @@ class RtlSdrDriver:
             return self.sample_rate
         return self._dll.rtlsdr_get_sample_rate(self.dev)
 
+    def compensated_freq(self, freq_hz: int) -> int:
+        """SWフォールバック時の同調周波数 (HW補正中は素通し)。テスト容易性のため分離。"""
+        if self._ppm_hw or self.ppm == 0:
+            return int(freq_hz)
+        return int(round(freq_hz * (1.0 - self.ppm / 1e6)))
+
     def set_center_freq(self, freq_hz: int):
         if not self.is_open:
             return
-        res = self._dll.rtlsdr_set_center_freq(self.dev, freq_hz)
+        tune_hz = self.compensated_freq(int(freq_hz))
+        res = self._dll.rtlsdr_set_center_freq(self.dev, tune_hz)
         if res != 0:
             raise RuntimeError(f"中心周波数 {freq_hz} Hz の設定に失敗しました")
-        self.center_freq = freq_hz
+        self.center_freq = int(freq_hz)
+
+    def _apply_ppm_hw(self, ppm: int) -> bool:
+        """HWのPPM補正を試みる。成功=True。open前やAPI欠落時はFalse。"""
+        if not self._has_ppm_api or not self.is_open or not self.dev:
+            self._ppm_hw = False
+            return False
+        res = self._dll.rtlsdr_set_freq_correction(self.dev, int(ppm))
+        self._ppm_hw = (res == 0)
+        return self._ppm_hw
+
+    def set_ppm_correction(self, ppm: int) -> bool:
+        """ドングルPPM較正値を設定する。戻り値True=HW補正、False=SWフォールバック。
+        未open時は保持のみ行い、open時に再適用する。"""
+        self.ppm = int(ppm)
+        if not self.is_open:
+            self._ppm_hw = False
+            return False
+        try:
+            return self._apply_ppm_hw(self.ppm)
+        except Exception:
+            self._ppm_hw = False
+            return False
+
+    def get_ppm_correction(self) -> int:
+        """現在のPPM較正値 (保持値。HW読戻しではない)"""
+        return int(self.ppm)
 
     def get_center_freq(self) -> int:
         if not self.is_open:

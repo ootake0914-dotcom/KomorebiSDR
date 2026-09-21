@@ -25,6 +25,13 @@ live_test*.png
 luckyfm_*.png
 spectrum*.png
 test_long_term_analysis.png
+noise_*.png
+received_audio.wav
+long_term_analy*.png
+
+# Experiments / diagnostics (本番混入防止)
+scratch_*.py
+diagnose_*.py
 
 # OS
 Thumbs.db

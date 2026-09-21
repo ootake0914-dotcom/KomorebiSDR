@@ -52,6 +52,8 @@ def match_station_name(freq_hz: int) -> str:
 class AutoTuner:
     """全自動帯域探査＆微弱局（DX）発掘エンジン"""
 
+    SCAN_TTL_SEC = 600.0  # 局リスト鮮度TTL (10分超過で再スキャン)
+
     def __init__(self, driver: RtlSdrDriver = None):
         self.driver = driver if driver is not None else RtlSdrDriver()
         self.owns_driver = driver is None
@@ -363,6 +365,7 @@ class AutoTuner:
         """
         現在周波数から次の局へ自動ジャンプ (direction: +1 で上へ、-1 で下へ)。
         use_sw=True のときは短波(HF)スキャン結果から探す (AM/短波モード用)。
+        局リストがTTL超過で古い場合は再スキャンする。
         """
         stations = self.discovered_sw if use_sw else self.discovered_stations
         if not stations:
@@ -372,20 +375,42 @@ class AutoTuner:
             else:
                 self.scan_band()
                 stations = self.discovered_stations
+        elif float(self.last_scan_time) != 0.0 and (time.time() - float(self.last_scan_time)) > self.SCAN_TTL_SEC:
+            # 鮮度切れ: バンドプラン/地域変更後も古い局へ飛ぶのを防止
+            # (last_scan_time==0 はテスト用fake等で時刻未設定のため再スキャンしない)
+            try:
+                if use_sw:
+                    self.scan_band_hf()
+                    stations = self.discovered_sw
+                else:
+                    # デフォルト帯域で再スキャン (呼出側が帯域指定済みの場合は上書きされる)
+                    self.scan_band()
+                    stations = self.discovered_stations
+            except Exception:
+                pass
         if not stations:
             return None
 
         freqs = [s["freq_hz"] for s in stations]
+        # 短波は5kHzグリッドのためFM用±50kHz窓では隣接局を飛ばす/自局ラップする。
+        # SW時は±2kHz窓に狭め、ラップ時は自局を除外する。
+        margin_hz = 2000 if use_sw else 50000
         if direction > 0:
             for s in stations:
-                if s["freq_hz"] > current_freq_hz + 50000:
+                if s["freq_hz"] > current_freq_hz + margin_hz:
                     return s
-            return stations[0]  # 先頭へループ
+            for s in stations:
+                if abs(s["freq_hz"] - current_freq_hz) > margin_hz:
+                    return s
+            return None  # 自局しかない場合は動かない
         else:
             for s in reversed(stations):
-                if s["freq_hz"] < current_freq_hz - 50000:
+                if s["freq_hz"] < current_freq_hz - margin_hz:
                     return s
-            return stations[-1]  # 末尾へループ
+            for s in reversed(stations):
+                if abs(s["freq_hz"] - current_freq_hz) > margin_hz:
+                    return s
+            return None
 
     def get_dx_stations(self) -> list[dict]:
         """通常聞こえない微弱なDX局のみを抽出"""

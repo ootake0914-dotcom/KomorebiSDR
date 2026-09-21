@@ -57,6 +57,11 @@ class AudioOutput:
         self._preroll_default = self.preroll_threshold
         self._signbuf = np.empty_like(self._scratch)
         self._compbuf = np.empty_like(self._scratch)
+        # ステレオ連動ソフトリミッター作業域 (事前確保、アロケーションゼロ)
+        self._peakbuf = np.empty(len(self._scratch), dtype=np.float32)
+        self._mask1d = np.empty(len(self._scratch), dtype=bool)
+        self._comp1d = np.empty(len(self._scratch), dtype=np.float32)
+        self._gainbuf = np.empty(len(self._scratch), dtype=np.float32)
 
         # ルックアヘッドリミッタ (ワーカー側put_audioで実行。1.5ms先読みで
         # 過変調クリップを歪みなく抑止。コールバック側の瞬時リミッタは安全網として残す)
@@ -74,6 +79,7 @@ class AudioOutput:
         self.total_callbacks = 0
         self.total_frames_played = 0
         self.callback_us_max = 0.0
+        self._fpu_initialized = False
 
     def _callback_core(self, outdata, frames, time_info, status):
         """深層ジッターバッファによる完全安定オーディオ再生コールバック。
@@ -84,6 +90,13 @@ class AudioOutput:
         sounddevice/PortAudio環境では避けられないため、例外防壁(外側)と
         状態スナップショットで影響を最小化する。
         """
+        if not self._fpu_initialized:
+            self._fpu_initialized = True
+            try:
+                from dsp import enable_fast_fpu
+                enable_fast_fpu()
+            except Exception:
+                pass
         t0 = time.perf_counter()
         frames = int(frames)
         if frames > len(self._scratch):
@@ -94,6 +107,10 @@ class AudioOutput:
             self._signbuf = np.empty_like(self._scratch)
             self._compbuf = np.empty_like(self._scratch)
             self._vol_ramp = np.empty(len(self._scratch), dtype=np.float32)
+            self._peakbuf = np.empty(len(self._scratch), dtype=np.float32)
+            self._mask1d = np.empty(len(self._scratch), dtype=bool)
+            self._comp1d = np.empty(len(self._scratch), dtype=np.float32)
+            self._gainbuf = np.empty(len(self._scratch), dtype=np.float32)
 
         # プレロール判定: バッファが深層クッション(約400ms)まで蓄積されるまで待機
         if not self.is_prerolled:
@@ -161,8 +178,12 @@ class AudioOutput:
 
         # フェード源は音量適用前の生サンプルを保存 (次回アンダーラン時、音量を
         # 二重に掛けて -6dB 段差になるのを防ぐ)。n==0では前回保存値を使う。
-        raw_last = (scratch[n - 1].copy() if n > 0 else
-                    self.last_out_samples.copy())
+        # 事前確保域へcopytoし、コールバック内確保を避ける。
+        if n > 0:
+            np.copyto(self.last_out_samples, scratch[n - 1])
+            raw_last = self.last_out_samples
+        else:
+            raw_last = self.last_out_samples
 
         # 無音からの復帰時は短いフェードイン (先頭クリック防止)
         if self._needs_fade_in:
@@ -200,25 +221,36 @@ class AudioOutput:
             np.multiply(data, vol, out=data)
             self._vol_current = vol
 
-        # ソフトリミッター (0.85超のみ圧縮。全て事前確保域＋out=で確保なし。
-        # fancy-indexは確保を伴うため全フレーム演算＋where書戻し方式)
+        # ステレオ連動（Linked Stereo）ソフトリミッター (0.85超のみ圧縮)
+        # 左右チャンネル独立圧縮による音像定位の揺れ・偏りを完全根絶し、左右の音量比を厳密保存。
+        # 全て事前確保域で計算しアロケーションゼロ。
         threshold = 0.85
-        absf = self._absbuf[:frames]
-        maskf = self._mask[:frames]
-        np.absolute(data, out=absf)
-        np.greater(absf, threshold, out=maskf)
-        if maskf.any():
-            signf = self._signbuf[:frames]
-            compf = self._compbuf[:frames]
+        abs_l = self._absbuf[:frames, 0]
+        abs_r = self._absbuf[:frames, 1]
+        np.absolute(data[:, 0], out=abs_l)
+        np.absolute(data[:, 1], out=abs_r)
+        peak = self._peakbuf[:frames]
+        np.maximum(abs_l, abs_r, out=peak)
+        mask = self._mask1d[:frames]
+        np.greater(peak, threshold, out=mask)
+        if mask.any():
             inv = 1.0 - threshold
-            np.sign(data, out=signf)
-            np.subtract(absf, threshold, out=compf)
-            np.divide(compf, inv, out=compf)
-            np.tanh(compf, out=compf)
-            compf *= inv
-            compf += threshold
-            np.multiply(signf, compf, out=compf)
-            np.copyto(data, compf, where=maskf)
+            comp = self._comp1d[:frames]
+            np.subtract(peak, threshold, out=comp)
+            np.divide(comp, inv, out=comp)
+            np.tanh(comp, out=comp)
+            comp *= inv
+            comp += threshold
+            gain = self._gainbuf[:frames]
+            np.divide(comp, np.maximum(peak, 1e-12), out=gain)
+            # 左右両チャンネルに同一の減衰ゲインを適用 (L/R比率・音像を100%完全保存)
+            # fancy-index (data[mask]*=) は一時配列を確保するため、where書戻しで確保回避
+            np.copyto(self._compbuf[:frames, 0], data[:, 0])
+            np.copyto(self._compbuf[:frames, 1], data[:, 1])
+            self._compbuf[:frames, 0] *= gain
+            self._compbuf[:frames, 1] *= gain
+            np.copyto(data[:, 0], self._compbuf[:frames, 0], where=mask)
+            np.copyto(data[:, 1], self._compbuf[:frames, 1], where=mask)
 
         # ステレオ出力 (outdata は C-contiguous な (frames,2))
         outdata[:, 0] = data[:, 0]
@@ -349,9 +381,9 @@ class AudioOutput:
 
     def _reopen_for_device(self, device_idx):
         """デバイス変更 (イヤホン挿抜等) でストリームを開き直す。
-        キューとリミッタ状態は保持し、再プレロールで滑らかに再接続する。
-        開き直し失敗に備え、複数候補 (一致インデックス→PortAudio既定→全出力
-        デバイス) を順に試し、最後はPortAudio再初期化も行う。失敗しても
+        古いキューの滞留音(最大11秒)を破棄してライブから再開し、再プレロールで滑らかに再接続する。
+        開き直し失敗に備え、指定→PortAudio既定の順に試す。意図外デバイスへの無言フォールバックを
+        避けるため全デバイス掃引は行わず、フォールバック先はログ表示する。
         _want_running が立っていれば監視ループが毎秒リトライする。"""
         if self.stream is not None:
             try:
@@ -361,17 +393,21 @@ class AudioOutput:
                 pass
             self.stream = None
         self.is_prerolled = False
+        # stale音の破棄 (再オープン前の最大200ch≒11秒の古音を再生しない)
+        try:
+            while True:
+                self.audio_queue.get_nowait()
+        except queue.Empty:
+            pass
+        try:
+            self.remainder = np.empty((0, 2), dtype=np.float32)
+        except Exception:
+            pass
 
         candidates = []
         if device_idx is not None:
             candidates.append(int(device_idx))
         candidates.append(None)  # PortAudio既定
-        try:
-            for d in sd.query_devices():
-                if d.get("max_output_channels", 0) > 0:
-                    candidates.append(int(d["index"]))
-        except Exception:
-            pass
         # 重複除去
         seen = set()
         uniq = []
@@ -383,10 +419,18 @@ class AudioOutput:
         for c in uniq:
             try:
                 if self._open_stream(c):
+                    try:
+                        print(f"[*] audio reopen -> device {c}")
+                    except Exception:
+                        pass
                     return True
                 # _want_running=False (stop済み) の場合は開かず終了
                 return False
-            except Exception:
+            except Exception as e:
+                try:
+                    print(f"[WARN] audio open failed device={c}: {e}", file=sys.stderr)
+                except Exception:
+                    pass
                 self.stream = None
                 continue
         # 最後の手段: PortAudioを再初期化して再試行 (デバイス抜き差しで
@@ -408,20 +452,29 @@ class AudioOutput:
         - 抜き差し後のPortAudioデバイス再列挙による番号ずれ
         - ストリーム死 (再オープン失敗)
         のいずれかを0.5秒間隔で検出し、複数候補へフォールバックしながら復帰する。"""
-        # 既存の監視スレッドが生きていれば停止 (start多重呼び出しでの増殖防止)
+        # 世代ごとにEventを新規発行し、旧スレッドの停止要求が新スレッドに波及/取消されないようにする
+        # (旧共有Event使い回しでは join失敗時に旧・新2スレッドが並行reopenした)
         if self._device_watch_thread is not None and self._device_watch_thread.is_alive():
-            self._device_watch_stop.set()
-            self._device_watch_thread.join(timeout=1.0)
-        self._device_watch_stop.clear()
+            try:
+                self._device_watch_stop.set()
+                self._device_watch_thread.join(timeout=1.0)
+            except Exception:
+                pass
+            if self._device_watch_thread.is_alive():
+                # 旧スレッド残留: 新スレッドを立てず旧スレッドに任せる (二重reopen防止)
+                return
+        self._device_watch_stop = threading.Event()
         try:
             from win_audio import _win_default_output_name
             self._last_default_name = _win_default_output_name()
         except Exception:
             self._last_default_name = None
 
-        def loop():
+        def loop(stop_ev=None):
+            if stop_ev is None:
+                stop_ev = self._device_watch_stop
             last = self._last_default_name
-            while not self._device_watch_stop.is_set():
+            while not stop_ev.is_set():
                 try:
                     if self._want_running:
                         try:
@@ -461,9 +514,10 @@ class AudioOutput:
                 except Exception:
                     pass
                 # 0.5秒間隔 (Core Audioクエリ約10ms。抜き差し検出の遅延を最小化)
-                self._device_watch_stop.wait(0.5)
+                stop_ev.wait(0.5)
 
-        t = threading.Thread(target=loop, daemon=True, name="audio-device-watch")
+        t = threading.Thread(target=loop, daemon=True, name="audio-device-watch",
+                             args=(self._device_watch_stop,))
         self._device_watch_thread = t
         t.start()
 

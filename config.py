@@ -9,9 +9,11 @@ Application configuration & region profiles.
 import json
 import locale
 import os
+import threading
 
 
 APP_NAME = "AntigravitySDR"
+_CONFIG_LOCK = threading.Lock()
 
 
 def config_dir() -> str:
@@ -189,11 +191,13 @@ DEFAULT_CONFIG = {
     "presets_fm": [],         # [{"name": str, "freq_hz": int}, ...]
     "presets_am": [],
     "presets_region": None,   # プリセットを生成した地域 (地域変更で無効化)
+    "ppm": None,              # ドングルPPM較正値 (None = 未較正)。PpmCalibratorが自動更新
 }
 
 
 def _clean_preset_list(v, default_mode: str) -> list:
     """プリセット配列を検証・正規化 (破損エントリは除去)。"""
+    valid_modes = {"WFM", "AM", "NFM", "USB", "LSB", "CW"}
     out = []
     if not isinstance(v, list):
         return out
@@ -203,9 +207,14 @@ def _clean_preset_list(v, default_mode: str) -> list:
         f = p.get("freq_hz")
         if isinstance(f, bool) or not isinstance(f, (int, float)):
             continue
+        fi = int(f)
+        if not (100000 <= fi <= 1750000000):
+            continue
         m = p.get("mode", default_mode)
-        out.append({"name": str(p.get("name", "?")), "freq_hz": int(f),
-                    "mode": m if isinstance(m, str) else default_mode})
+        if not isinstance(m, str) or m not in valid_modes:
+            m = default_mode
+        out.append({"name": str(p.get("name", "?")), "freq_hz": fi,
+                    "mode": m})
     return out
 
 
@@ -235,6 +244,13 @@ def load_config() -> dict:
                 elif k in ("country", "language", "presets_region"):
                     if v is None or isinstance(v, str):
                         cfg[k] = v
+                elif k == "ppm":
+                    if v is None:
+                        cfg[k] = None
+                    elif isinstance(v, bool):
+                        pass
+                    elif isinstance(v, (int, float)) and -200.0 <= float(v) <= 200.0:
+                        cfg[k] = int(v)
                 # 型不一致は既定値を維持 (破損値でのクラッシュ防止)
     except FileNotFoundError:
         pass
@@ -244,10 +260,15 @@ def load_config() -> dict:
 
 
 def save_config(cfg: dict):
-    try:
-        tmp = CONFIG_PATH + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(cfg, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, CONFIG_PATH)
-    except Exception:
-        pass
+    with _CONFIG_LOCK:
+        tmp = f"{CONFIG_PATH}.{os.getpid()}.{threading.get_ident()}.tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(cfg, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, CONFIG_PATH)
+        except Exception:
+            if os.path.exists(tmp):
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass

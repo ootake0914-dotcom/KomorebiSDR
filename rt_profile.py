@@ -24,7 +24,12 @@ class RtProfile:
         self.avg_ms = 0.0
 
     def add(self, ms: float):
-        ms = float(ms)
+        try:
+            ms = float(ms)
+        except Exception:
+            return
+        if not np.isfinite(ms):
+            return
         self.last_ms = ms
         self._buf[self._idx] = ms
         self._idx += 1

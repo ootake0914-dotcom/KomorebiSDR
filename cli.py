@@ -94,7 +94,10 @@ def main():
 
     # 1. ハードウェア初期化
     driver = RtlSdrDriver()
-    driver.open(0)
+    try:
+        driver.open(0)
+    except RuntimeError as e:
+        raise SystemExit(f"デバイスが見つかりません: {e} (ZadigでWinUSB導入を確認)")
 
     tuner = AutoTuner(driver)
 

@@ -14,6 +14,9 @@ import numpy as np
 class CognitiveJointOptimizer:
     """MIMO コグニティブ共同最適化エンジン"""
 
+    MIN_SAFE_GAIN_DB = 19.7  # 無音化を防ぐ安全最低ゲイン
+    FLOOR_GAIN_DB = 12.5  # 過大入力時の非常用下限
+
     def __init__(self, driver, dsp, audio):
         self.driver = driver
         self.dsp = dsp
@@ -91,6 +94,18 @@ class CognitiveJointOptimizer:
             self.current_gain_idx = idx
             self.driver.set_gain(self.available_gains[self.current_gain_idx])
 
+    def _min_safe_idx(self) -> int:
+        if not self.available_gains:
+            return 0
+        return min(range(len(self.available_gains)),
+                   key=lambda i: abs(self.available_gains[i] - self.MIN_SAFE_GAIN_DB))
+
+    def _floor_idx(self) -> int:
+        if not self.available_gains:
+            return 0
+        return min(range(len(self.available_gains)),
+                   key=lambda i: abs(self.available_gains[i] - self.FLOOR_GAIN_DB))
+
     def process_frame(self, raw_bytes: np.ndarray, spectrum_db: np.ndarray = None) -> dict:
         """
         毎フレームの観測ベクトルから多次元状態空間を推定し、目的関数 J を最大化する操作量を一括決定
@@ -147,9 +162,11 @@ class CognitiveJointOptimizer:
             self.last_update_time = now
 
             # 緊急サチュレーション保護: クリップ発生時は無条件で急減衰
+            # (FLOOR下限を設け、0dBまでの無音化転落を防止。持続クリップ時のみFLOORまで許可)
             if clip_pct > 0.05:
                 step_down = 2 if clip_pct > 0.5 else 1
-                self.current_gain_idx = max(0, self.current_gain_idx - step_down)
+                floor = self._floor_idx() if clip_pct > 0.5 else self._min_safe_idx()
+                self.current_gain_idx = max(floor, self.current_gain_idx - step_down)
                 self.driver.set_gain(self.available_gains[self.current_gain_idx])
             elif self.state_iq_std >= 18.0:
                 # 強電界: ダイナミックレンジ最大化（目標分散32付近）

@@ -47,12 +47,15 @@ def make_raw(stereo: bool, snr_db: float = None, seed: int = 7) -> np.ndarray:
     return raw
 
 
-def decode(raw: np.ndarray, nr: bool = True):
+def decode(raw: np.ndarray, nr: bool = True, agc: bool = False):
     dsp = SdrDspPipeline(RF, 48000)
     dsp.set_offset_freq(0.0)
     dsp.afc_enabled = False
     dsp.cognitive_enabled = False
     dsp.set_stereo_nr(nr)
+    # 既存テストはDSP素性 (分離度/NR量/行列レベル) を測るため、
+    # 出力レベルを均すスローAGCは隔離する (AGC自体は test_audio_enhance.py で検証)
+    dsp.slow_agc_enabled = bool(agc)
     chunks = []
     for k in range(NBLK):
         audio, _ = dsp.process(raw[k * BLOCK:(k + 1) * BLOCK], mode="WFM")
@@ -116,10 +119,12 @@ def main() -> int:
     print(f"[{'OK' if mono_ok else 'FAIL'}] mono station stays mono (blend={dsp_mono.stereo_blend:.2f})")
 
     # ステレオ/モノラル等音量テスト: 同一放送波でのモノラル切替時に旧実装の+6.7dB爆音段差を根絶
+    # (行列レベルの一致を測るためスローAGCはOFF。AGC有効時の均一化は別テストで検証)
     dsp_m_forced = SdrDspPipeline(RF, 48000)
     dsp_m_forced.set_offset_freq(0.0)
     dsp_m_forced.afc_enabled = False
     dsp_m_forced.cognitive_enabled = False
+    dsp_m_forced.slow_agc_enabled = False
     dsp_m_forced.set_stereo_enabled(False)
     chunks_m = []
     raw_s = make_raw(stereo=True)

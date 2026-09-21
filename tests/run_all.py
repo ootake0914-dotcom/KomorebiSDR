@@ -10,28 +10,12 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 
-TESTS = [
-    "test_regions.py",
-    "test_shortwave.py",
-    "test_am_sync.py",
-    "test_ssb.py",
-    "test_sw_schedule.py",
-    "test_rds.py",
-    "test_audio_output.py",
-    "test_rt_profile.py",
-    "test_native_equiv.py",
-    "test_stereo.py",
-    "test_adaptive_dsp.py",
-    "test_audiophile_dsp.py",
-    "test_cma_robustness.py",
-    "test_gui.py",
-    "test_live_peaks.py",
-    "test_station_list.py",
-    "test_server.py",
-    "test_resampler.py",
-    "test_audio_device.py",
-    "test_mock_worker.py",
-]
+# TESTSハードコードでは新規テストが無視されるため、test_*.pyを自動検出する
+import glob as _glob
+
+TESTS = sorted(
+    os.path.basename(p) for p in _glob.glob(os.path.join(HERE, "test_*.py"))
+)
 
 
 def main() -> int:
@@ -44,7 +28,12 @@ def main() -> int:
     for name in TESTS:
         path = os.path.join(HERE, name)
         print(f"\n===== {name} =====", flush=True)
-        result = subprocess.run([sys.executable, path], env=env)
+        try:
+            result = subprocess.run([sys.executable, path], env=env, timeout=300)
+        except subprocess.TimeoutExpired:
+            print(f"[TIMEOUT] {name} exceeded 300s")
+            failed.append(name)
+            continue
         if result.returncode != 0:
             failed.append(name)
 

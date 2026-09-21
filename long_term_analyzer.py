@@ -59,10 +59,11 @@ def run_long_term_analysis(
     driver.set_sample_rate(sample_rate)
 
     # 24MHz未満はダイレクトサンプリング (Q-branch = 2)
+    # DCスパイク回避のため main.py/cli.py と同様に+150kHzオフセットする
     if freq_hz < 24000000:
         driver.set_direct_sampling(2)
-        driver.set_center_freq(freq_hz)
-        offset = 0.0
+        offset = 150000.0
+        driver.set_center_freq(int(freq_hz + offset))
     else:
         driver.set_direct_sampling(0)
         offset = 150000.0

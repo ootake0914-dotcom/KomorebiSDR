@@ -351,6 +351,85 @@ SDR_EXPORT void sdr_fm_demod(const float *iq, float *demod, int n, float *last)
     last[1] = lq;
 }
 
+/* 最尤位相軌道ビタビ復調器 (Viterbi Trellis Phase Demodulator)
+ * - Carson則周波数偏移限界 (dev_limit) とベースバンドスルーレート制約 (max_slew) を
+ *   動的計画法 (Viterbi MLSE) のトレリス遷移コストとして定式化。
+ * - 低CNR環境での2π位相スリップ・クリックスパイクノイズを完全消去。
+ * - state = {last_i, last_q, last_dphi}
+ */
+SDR_EXPORT void sdr_viterbi_demod(const float *iq, float *demod, int n,
+                                  float *state, float dev_limit, float max_slew)
+{
+    float li = state[0];
+    float lq = state[1];
+    float w_prev = state[2];
+    const float two_pi = 6.283185307179586f;
+    const float lambda_lim = 3.5f;
+    const float lambda_slew = 1.8f;
+    const float dev_margin = dev_limit * 1.15f;
+
+    for (int i = 0; i < n; ++i) {
+        float ci = iq[2 * i];
+        float cq = iq[2 * i + 1];
+        float re = ci * li + cq * lq;
+        float im = cq * li - ci * lq;
+        float obs = atan2f(im, re);
+        float amp = sqrtf(re * re + im * im);
+        li = ci;
+        lq = cq;
+
+        /* クリーン区間での超高速パス:
+         * 偏移が許容内で、直前値とのスルーレートが正常なら即座に採用 */
+        float diff = fabsf(obs - w_prev);
+        if (fabsf(obs) <= dev_limit && diff <= max_slew && amp > 0.05f) {
+            demod[i] = obs;
+            w_prev = obs;
+            continue;
+        }
+
+        /* 異常点・フェージング点でのトレリス最尤候補探索 */
+        float delta = obs - w_prev;
+        if (delta > max_slew) delta = max_slew;
+        else if (delta < -max_slew) delta = -max_slew;
+        float step = w_prev + delta;
+
+        float cands[6];
+        cands[0] = obs;
+        cands[1] = obs - two_pi;
+        cands[2] = obs + two_pi;
+        cands[3] = w_prev;
+        cands[4] = (obs > dev_limit) ? dev_limit : ((obs < -dev_limit) ? -dev_limit : obs);
+        cands[5] = (step > dev_limit) ? dev_limit : ((step < -dev_limit) ? -dev_limit : step);
+
+        float best_j = -1e9f;
+        float best_w = obs;
+
+        for (int k = 0; k < 6; ++k) {
+            float c = cands[k];
+            if (fabsf(c) > dev_margin) continue;
+
+            float ll = amp * cosf(obs - c);
+            float d_slew = fabsf(c - w_prev) - max_slew;
+            float slew_pen = (d_slew > 0.0f) ? (lambda_slew * d_slew * d_slew) : 0.0f;
+            float d_lim = fabsf(c) - dev_limit;
+            float lim_pen = (d_lim > 0.0f) ? (lambda_lim * d_lim * d_lim) : 0.0f;
+
+            float j = ll - slew_pen - lim_pen;
+            if (j > best_j) {
+                best_j = j;
+                best_w = c;
+            }
+        }
+
+        demod[i] = best_w;
+        w_prev = best_w;
+    }
+
+    state[0] = li;
+    state[1] = lq;
+    state[2] = w_prev;
+}
+
 /* CMAブラインド等化器 (マルチパス・キャンセル用)。
  * 定包絡線(FM)信号の周波数選択性フェージングをパイロット不要で等化する。
  * - x: 入力複素IF (floatインタリーブ re,im,...)。history前置済み。

@@ -390,9 +390,12 @@ class HyperController:
                 base = self._nearest_idx(self.best_gain_db)
             else:
                 base = self.current_gain_idx
+            min_idx = self._min_safe_idx()
             for d in (1, -1, 2, -2):
                 i = base + d
                 if 0 <= i < len(self.available_gains):
+                    if i < min_idx:
+                        continue  # 安全下限未満は候補から除外 (coarseと同等)
                     if self.clip_upper_idx is not None and i >= self.clip_upper_idx:
                         continue  # 既知のクリップ領域はスキップ
                     g = self.available_gains[i]
@@ -490,9 +493,9 @@ class HyperController:
                 within = [g for g, q in self.gain_curve.items() if q >= best_q - self.LOCK_MARGIN_DB]
                 if within:
                     target = max(within)
-            if target is None or target < self.MIN_SAFE_GAIN_DB:
+            if target is None or target < self.available_gains[self._min_safe_idx()]:
                 target = self.SWEET_SPOT_DB
-            if self.locked_gain_db is not None and self.locked_gain_db >= self.MIN_SAFE_GAIN_DB:
+            if self.locked_gain_db is not None and self.locked_gain_db >= self.available_gains[self._min_safe_idx()]:
                 ref = self.gain_curve.get(self.locked_gain_db, -1e9)
                 if self.best_snr <= ref + self.switch_margin_db:
                     target = self.locked_gain_db
@@ -579,10 +582,19 @@ class HyperController:
 
         if self.filter_override == "wide":
             cutoff = 14000.0
+            hf = 1.0
+            if_bw = 190000.0
         elif self.filter_override == "clean":
             cutoff = 8500.0
+            hf = 1.0
+            if_bw = 150000.0
         elif self.filter_override == "narrow":
             cutoff = 5500.0
+            hf = 0.3
+            if_bw = 130000.0
+        # DXモード中に手動overrideがある場合は表示と音の乖離を避けるため
+        # DX狭帯域を維持しつつcutoffのみ上書き済みである旨を統計側で扱う
+        # (hf/ifはoverrideプリセットへ連動させ、表示=wideでも音がDXのままにならない)
 
         self.target_cutoff_hz = cutoff
         self.target_hf_gain = hf

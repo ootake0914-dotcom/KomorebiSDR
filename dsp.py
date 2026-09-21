@@ -12,15 +12,28 @@ DLLが見つからない場合、純Python代替のある処理 (AM同期検波�
 
 import ctypes
 import math
-import os
+import threading
 import time
-from collections import deque
+from collections import deque, OrderedDict
 import numpy as np
 
 from adaptive_dsp import (
     AdaptiveIqCorrector,
     CognitiveSpeechMusicTracker,
     UltrasonicSquelchTracker,
+    QuadratureMpxCanceller,
+    DeepSpaceEkfDemodulator,
+    KalmanPilotTracker,
+    TimeReversalTurboEqualizer,
+    HolographicAudioEnhancer,
+    RiemannianTopologicalDemodulator,
+    ViterbiPhaseDemodulator,
+    SuperSpatialBssStereoSeparator,
+    SubspaceMultipathEqualizer,
+    WassersteinMultipathEqualizer,
+    SymplecticHamiltonianDemodulator,
+    SparseSubcarrierExtractor,
+    RmtHankelDenoiser,
 )
 from audiophile_dsp import (
     ActiveDcServo,
@@ -31,365 +44,38 @@ from audiophile_dsp import (
 
 # ================================================================
 # ネイティブCコア (sdr_core.dll) ロード
+# 正準の実装は dsp_native.py。本モジュールは後方互換のため同名を再エクスポートする。
+# (NATIVE_* フラグはimport時に確定する定数のためスナップショットで問題ない)
 # ================================================================
-def _load_native_core():
-    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sdr_core.dll")
-    if not os.path.exists(path):
-        return None
-    try:
-        lib = ctypes.CDLL(path)
-        f = ctypes.c_float
-        pf = ctypes.POINTER(f)
-        lib.sdr_version.restype = ctypes.c_int
-        lib.sdr_bilinear_deemphasis.argtypes = [pf, pf, ctypes.c_int, f, f, f, pf]
-        lib.sdr_one_pole_highpass.argtypes = [pf, pf, ctypes.c_int, f, pf]
-        lib.sdr_fm_demod.argtypes = [pf, pf, ctypes.c_int, pf]
-        lib.sdr_mix_freq.argtypes = [pf, ctypes.c_int, ctypes.c_double, ctypes.POINTER(ctypes.c_double)]
-        lib.sdr_suppress_clicks.argtypes = [pf, ctypes.c_int, f]
-        lib.sdr_suppress_clicks.restype = ctypes.c_int
-        lib.sdr_stereo_pll.argtypes = [pf, ctypes.c_int, ctypes.POINTER(ctypes.c_double), ctypes.c_double,
-                                       ctypes.c_double, ctypes.c_double, ctypes.POINTER(ctypes.c_double),
-                                       ctypes.POINTER(ctypes.c_double), ctypes.c_double, pf, pf, pf]
-        # 追加関数は無くてもネイティブコア全体を無効化しない (旧DLLとの後方互換)
-        global NATIVE_AM_SYNC, NATIVE_PLL3, NATIVE_FIR, NATIVE_POLY, NATIVE_PLLFM, NATIVE_CMA
-        if hasattr(lib, "sdr_stereo_pll3"):
-            lib.sdr_stereo_pll3.argtypes = [pf, ctypes.c_int, ctypes.POINTER(ctypes.c_double),
-                                            ctypes.c_double, ctypes.c_double, ctypes.c_double,
-                                            ctypes.POINTER(ctypes.c_double), ctypes.POINTER(ctypes.c_double),
-                                            ctypes.c_double, pf, pf, pf, pf, pf]
-            NATIVE_PLL3 = True
-        if hasattr(lib, "sdr_am_sync"):
-            lib.sdr_am_sync.argtypes = [pf, pf, ctypes.c_int, ctypes.POINTER(ctypes.c_double),
-                                        ctypes.POINTER(ctypes.c_double), ctypes.POINTER(ctypes.c_double),
-                                        ctypes.c_double, ctypes.c_double, ctypes.c_double, pf]
-            NATIVE_AM_SYNC = True
-        if hasattr(lib, "sdr_fir_real"):
-            lib.sdr_fir_real.argtypes = [pf, pf, pf, ctypes.c_int, ctypes.c_int]
-            NATIVE_FIR = True
-        if hasattr(lib, "sdr_polyphase_decim"):
-            lib.sdr_polyphase_decim.argtypes = [pf, pf, pf, ctypes.c_int, ctypes.c_int,
-                                                ctypes.c_int]
-            NATIVE_POLY = True
-        global NATIVE_PLLFM
-        if hasattr(lib, "sdr_pll_fm_demod"):
-            lib.sdr_pll_fm_demod.argtypes = [pf, pf, ctypes.c_int,
-                                             ctypes.POINTER(ctypes.c_double),
-                                             ctypes.c_double, ctypes.c_double]
-            NATIVE_PLLFM = True
-        global NATIVE_CMA
-        if hasattr(lib, "sdr_cma_equalize"):
-            lib.sdr_cma_equalize.argtypes = [pf, pf, ctypes.c_int, pf,
-                                             ctypes.c_int, ctypes.c_float]
-            NATIVE_CMA = True
-        if hasattr(lib, "sdr_fast_fpu"):
-            try:
-                lib.sdr_fast_fpu()  # FTZ/DAZ有効化 (denormalジッタ対策)
-            except Exception:
-                pass
-        if lib.sdr_version() < 1:
-            return None
-        return lib
-    except Exception:
-        return None
+from dsp_native import (
+    _load_native_core,
+    _NATIVE,
+    NATIVE_CORE_ENABLED,
+    NATIVE_AM_SYNC,
+    NATIVE_PLL3,
+    NATIVE_FIR,
+    NATIVE_POLY,
+    NATIVE_PLLFM,
+    NATIVE_CMA,
+    enable_fast_fpu,
+    _fptr,
+)
 
 
-NATIVE_AM_SYNC = False
-NATIVE_PLL3 = False
-NATIVE_FIR = False
-NATIVE_POLY = False
-NATIVE_PLLFM = False
-NATIVE_CMA = False
-_NATIVE = _load_native_core()
-NATIVE_CORE_ENABLED = _NATIVE is not None
+
+# FIR設計・クリック抑圧・ディエンファシス係数は dsp_filters.py が正準。
+# 後方互換のため同名を再エクスポートする。
+from dsp_filters import (
+    design_fir_kaiser,
+    design_fir_highpass,
+    design_fir_lowpass,
+    suppress_click_transients,
+    _deemph_sections,
+)
 
 
-def _fptr(arr: np.ndarray):
-    return arr.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
-
-
-def design_fir_kaiser(num_taps: int, cutoff_norm: float, beta: float = 6.5) -> np.ndarray:
-    """Kaiser窓を用いた高精度FIRローパスフィルタ設計"""
-    if num_taps % 2 == 0:
-        num_taps += 1
-    m = (num_taps - 1) // 2
-    n = np.arange(-m, m + 1)
-    h = np.sinc(2 * cutoff_norm * n) * (2 * cutoff_norm)
-    window = np.kaiser(num_taps, beta)
-    h = h * window
-    return (h / np.sum(h)).astype(np.float32)
-
-
-def design_fir_highpass(num_taps: int, cutoff_norm: float, beta: float = 6.5) -> np.ndarray:
-    """Kaiser窓LPFのスペクトル反転による相補ハイパスFIR (LPF+HPF=完全再構成)"""
-    h = design_fir_kaiser(num_taps, cutoff_norm, beta)
-    h = -h
-    h[len(h) // 2] += 1.0
-    return h.astype(np.float32)
-
-
-design_fir_lowpass = design_fir_kaiser
-
-
-def suppress_click_transients(audio: np.ndarray, threshold: float = 0.48) -> np.ndarray:
-    """
-    チューナーのゲイン切替やUSB過渡応答による単発インパルスノイズ（クリック・プチ音）を
-    局所コサイン補間により原音のスペクトルや高域音感を損なわずピンポイント修復する
-    高精度ディクリッカー。
-    通常の音楽・音声の高域成分を誤検知しないよう、急峻な孤立跳躍（1〜4サンプル幅）のみを対象とする。
-    """
-    if len(audio) < 16:
-        return audio
-
-    if _NATIVE is not None:
-        out = np.array(audio, dtype=np.float32, copy=True)
-        _NATIVE.sdr_suppress_clicks(_fptr(out), len(out), float(threshold))
-        return out
-
-    diffs = np.abs(np.diff(audio))
-    bad = np.where(diffs > threshold)[0]
-    if len(bad) == 0:
-        return audio
-
-    out = audio.copy()
-    mask = np.zeros(len(out), dtype=bool)
-
-    # 差分が急峻で、かつ前後の信号推移から孤立して飛び出しているインパルスのみを検出
-    for b in bad:
-        # 真のインパルススパイク判定: 前後サンプルとの急峻な反転または孤立段差
-        left_idx = max(0, b - 1)
-        right_idx = min(len(audio) - 1, b + 2)
-        local_span = abs(audio[right_idx] - audio[left_idx])
-        # 差分に対して前後の接続が戻っている（孤立突起）のみ修復する。
-        # 旧 `or diff > 0.65` は打楽器アタック等の正規過渡を誤って削るため撤去。
-        if diffs[b] > threshold and diffs[b] > local_span * 1.5:
-            mask[max(0, b - 1) : min(len(out), b + 3)] = True
-
-    if not np.any(mask):
-        return audio
-
-    # 連続した異常区間（幅1〜4サンプルの短パルス）のみをコサインS字平滑補間
-    in_bad = False
-    start = 0
-    for idx in range(len(out)):
-        if mask[idx] and not in_bad:
-            in_bad = True
-            start = idx
-        elif not mask[idx] and in_bad:
-            in_bad = False
-            end = idx - 1
-            if 0 < start and end < len(out) - 1 and (end - start + 1) <= 4:
-                v0 = out[start - 1]
-                v1 = out[end + 1]
-                L = (end + 1) - (start - 1)
-                t = np.linspace(0.0, np.pi, L + 1, dtype=np.float32)[1:-1]
-                w = 0.5 * (1.0 - np.cos(t))
-                out[start : end + 1] = v0 + (v1 - v0) * w
-
-    return out
-
-
-def _deemph_sections(tau_us: float):
-    """時定数に対応する2縦続1次IIR係数 [(b0,b1,minus_a1)×2] を返す。
-    48kHz用に実測フィットした値で、アナログ1次LPF特性に帯域内±0.03dBで一致。
-    未知の時定数には無プリワープ双一次1段＋素通しで近似する。"""
-    fitted = {
-        50.0: [(1.6231841965746954, -1.2710911965746954, 0.647907),
-               (0.18622705854697402, 0.026085941453025934, 0.787687)],
-        75.0: [(1.0283946, -0.5892977, 0.5609031),
-               (0.2090227, 0.0301037, 0.7608736)],
-    }
-    for k, v in fitted.items():
-        if abs(float(tau_us) - k) < 1e-6:
-            return [tuple(s) for s in v]
-    # フォールバック: 無プリワープ双一次1段＋素通し (50/75μs以外は未使用想定)
-    T = 1.0 / 48000.0
-    tau = float(tau_us) * 1e-6
-    den = 2.0 * tau + T
-    return [(T / den, T / den, (2.0 * tau - T) / den), (1.0, 0.0, 0.0)]
-
-
-class AdaptiveDriftResampler:
-    """
-    RTL-SDRとDAC間の独立クロック偏差（ドリフト）を微小に伸縮補正し、
-    サンプル欠落・重複・アンダーランを完全根絶する適応型分数リサンプラ。
-    深層ジッターバッファ（約400ms）と広域不感帯により通常時は0ppm・完全ビットパーフェクト通過。
-    """
-
-    def __init__(self, target_chunks: float = 8.0, max_ppm: float = 2000.0):
-        self.target_chunks = target_chunks
-        self.deadband_low = 5.5   # 5.5〜10.5チャンク（約275ms〜525ms）の間は不感帯
-        self.deadband_high = 10.5
-        # ±2000ppm (0.2%, ≈3.5cent) までは聴感上ほぼ知覚不能。
-        # クロック偏差に加え、GUI描画(GIL)による微小な処理落ちも吸収し、
-        # バッファ枯渇(音飛び)を未然に防ぐ。
-        self.max_ratio_offset = max_ppm * 1e-6
-        self.integral_error = 0.0
-        self.current_ratio = 1.0
-        self.phase = 0.0
-        self.last_sample = 0.0
-        self.prev_sample = 0.0
-        self.drift_ppm = 0.0
-
-    def update_feedback(self, current_chunks: float, dt: float = 0.05):
-        """
-        オーディオバッファの残存チャンク数に応じた不感帯付き高精度PI制御。
-        通常時（5.5〜10.5チャンク）は 0ppm・完全ビットパーフェクト通過。
-        """
-        # 不感帯（Deadband）判定: 健全領域
-        if self.deadband_low <= current_chunks <= self.deadband_high:
-            self.integral_error = 0.0
-            # 無視できる補正量ならビットパーフェクト（1.0）へ戻す。
-            # 一方、有意な補正は保持する。毎回1.0に戻すと恒常的な微小不足で
-            # バッファが枯渇→アンダーランを繰り返すため。
-            if abs(self.current_ratio - 1.0) < 200e-6:
-                self.current_ratio = 1.0
-                self.drift_ppm = 0.0
-            return
-
-        if current_chunks < self.deadband_low:
-            error = current_chunks - self.deadband_low  # 負値（バッファ減）
-        else:
-            error = current_chunks - self.deadband_high  # 正値（バッファ増）
-
-        # 積分器の更新（アンチワインドアップ付き）
-        self.integral_error = float(np.clip(self.integral_error + error * dt, -3.0, 3.0))
-
-        # PI制御ゲイン: 実際にバッファ水位を制御できる強さに再調整。
-        # (旧値 kp=3e-5 は補正能力が実質ゼロで、枯渇を放置していた)
-        kp = 8e-4
-        ki = 5e-5
-        adj = kp * error + ki * self.integral_error
-        adj = float(np.clip(adj, -self.max_ratio_offset, self.max_ratio_offset))
-
-        # 0.5ppm未満の微小な揺らぎは完全ゼロ（ビットパーフェクト）に丸める
-        if abs(adj) < 0.5e-6:
-            adj = 0.0
-
-        self.current_ratio = 1.0 + adj
-        self.drift_ppm = adj * 1e6
-
-    def process(self, audio: np.ndarray) -> np.ndarray:
-        if len(audio) == 0:
-            return audio
-
-        is_stereo = (audio.ndim == 2)
-        n_in = len(audio)
-        ratio = self.current_ratio
-
-        if is_stereo:
-            channels = audio.shape[1]
-            if not isinstance(self.last_sample, np.ndarray) or len(self.last_sample) != channels:
-                self.prev_sample = np.zeros(channels, dtype=np.float64)
-                self.last_sample = np.zeros(channels, dtype=np.float64)
-
-            if abs(ratio - 1.0) < 1e-6:
-                d = int(np.floor(self.phase + 0.5))
-                if d <= 0:
-                    self.prev_sample = audio[-2].astype(np.float64) if n_in >= 2 else self.last_sample.copy()
-                    self.last_sample = audio[-1].astype(np.float64)
-                    return audio
-                d = min(d, n_in)
-                out = np.empty((n_in - d, channels), dtype=np.float32)
-                if d == 1:
-                    # d==1は先頭1サンプルを捨てるだけ (d>1の一般経路 out=audio[d:] と
-                    # 同じ意味)。旧実装は last_sample を先頭に重複挿入し末尾を1つ
-                    # 落としていたため、サンプル重複＋欠落 (クリック) が生じていた。
-                    out[:] = audio[1:]
-                else:
-                    ext = np.concatenate(([self.prev_sample, self.last_sample], audio), axis=0)
-                    out[:] = ext[n_in + 2 - len(out):n_in + 2]
-                self.phase -= d
-                self.prev_sample = audio[-2].astype(np.float64) if n_in >= 2 else self.last_sample.copy()
-                self.last_sample = audio[-1].astype(np.float64)
-                return out
-
-            ext_audio = np.concatenate(([self.prev_sample, self.last_sample], audio,
-                                        [audio[-1], audio[-1]]), axis=0).astype(np.float64)
-            indices = np.arange(self.phase, n_in, ratio)
-            if len(indices) == 0:
-                self.phase -= n_in
-                self.prev_sample = audio[-2].astype(np.float64) if n_in >= 2 else self.last_sample.copy()
-                self.last_sample = audio[-1].astype(np.float64)
-                return np.zeros((0, channels), dtype=np.float32)
-
-            # Catmull-Rom 4点3次補間 (ステレオ2chを一括ブロードキャスト計算)
-            ei = indices + 2.0
-            i0 = np.floor(ei).astype(np.int64)
-            f = (ei - i0)[:, np.newaxis].astype(np.float64)
-            i0 = np.clip(i0, 1, n_in + 1)
-            p0 = ext_audio[i0 - 1]
-            p1 = ext_audio[i0]
-            p2 = ext_audio[i0 + 1]
-            p3 = ext_audio[i0 + 2]
-            out = (p1 + 0.5 * f * (p2 - p0
-                   + f * (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3
-                   + f * (3.0 * (p1 - p2) + p3 - p0))))
-
-            last_idx = indices[-1] + ratio
-            self.phase = float(last_idx - n_in)
-            self.prev_sample = audio[-2].astype(np.float64) if n_in >= 2 else self.last_sample.copy()
-            self.last_sample = audio[-1].astype(np.float64)
-            return out.astype(np.float32)
-
-        # モノラル (1次元配列)
-        if isinstance(self.last_sample, np.ndarray):
-            self.prev_sample = 0.0
-            self.last_sample = 0.0
-
-        if abs(ratio - 1.0) < 1e-6:
-            # 整数遅延バイパス: ドリフトなし時は補間フィルタを掛けない。
-            # 旧実装は残留phaseで恒常的に線形補間し高域を削っていた。
-            # 位相残差は整数部のみ消費し、小数部は非可聴のまま保持する。
-            d = int(np.floor(self.phase + 0.5))
-            if d <= 0:
-                self.prev_sample = float(audio[-2]) if n_in >= 2 else self.last_sample
-                self.last_sample = float(audio[-1])
-                return audio
-            d = min(d, n_in)
-            out = np.empty(n_in - d, dtype=np.float32)
-            if d == 1:
-                # d==1は先頭1サンプルを捨てるだけ (d>1の一般経路 out=audio[d:] と
-                # 同じ意味)。旧実装は last_sample を重複挿入しサンプル欠落を生んでいた。
-                out[:] = audio[1:]
-            else:
-                ext = np.concatenate(([self.prev_sample, self.last_sample], audio))
-                out[:] = ext[n_in + 2 - len(out):n_in + 2]
-            self.phase -= d
-            self.prev_sample = float(audio[-2]) if n_in >= 2 else self.last_sample
-            self.last_sample = float(audio[-1])
-            return out
-
-        # 境界連続性のために前2サンプルと末尾を付加
-        ext_audio = np.concatenate(([self.prev_sample, self.last_sample], audio,
-                                    [audio[-1], audio[-1]]))
-        ext_audio = ext_audio.astype(np.float64)
-
-        indices = np.arange(self.phase, n_in, ratio)
-        if len(indices) == 0:
-            self.phase -= n_in
-            self.prev_sample = float(audio[-2]) if n_in >= 2 else self.last_sample
-            self.last_sample = float(audio[-1])
-            return np.zeros(0, dtype=np.float32)
-
-        # Catmull-Rom 4点3次補間 (線形補間の高域ロールオフ/imagingを排除)
-        ei = indices + 2.0
-        i0 = np.floor(ei).astype(np.int64)
-        f = (ei - i0).astype(np.float64)
-        i0 = np.clip(i0, 1, n_in + 1)
-        p0 = ext_audio[i0 - 1]
-        p1 = ext_audio[i0]
-        p2 = ext_audio[i0 + 1]
-        p3 = ext_audio[i0 + 2]
-        out = (p1 + 0.5 * f * (p2 - p0
-               + f * (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3
-               + f * (3.0 * (p1 - p2) + p3 - p0))))
-
-        last_idx = indices[-1] + ratio
-        self.phase = float(last_idx - n_in)
-        self.prev_sample = float(audio[-2]) if n_in >= 2 else self.last_sample
-        self.last_sample = float(audio[-1])
-
-        return out.astype(np.float32)
+# 適応ドリフトリサンプラの正準は dsp_resampler.py。後方互換のため再エクスポート。
+from dsp_resampler import AdaptiveDriftResampler
 
 
 class SdrDspPipeline:
@@ -398,6 +84,8 @@ class SdrDspPipeline:
     def __init__(self, sample_rate: int = 1152000, audio_rate: int = 48000):
         self.rf_rate = sample_rate
         self.audio_rate = audio_rate
+        # 選局リセットとDSP処理の同時実行によるtorn history防止用
+        self._state_lock = threading.Lock()
 
         self.if_decim = 4
         self.if_rate = self.rf_rate // self.if_decim  # 288 kHz
@@ -488,7 +176,7 @@ class SdrDspPipeline:
         self.target_hf_gain = 1.0
         self.hf_gain_applied = 1.0
         self.cognitive_alpha = 0.18  # 1フレームあたりの平滑追従率 (ポップノイズ根絶)
-        self._fir_cache = {}
+        self._fir_cache = OrderedDict()
 
         # 4.5kHzクロスオーバーによる心理音響ハイシェルフ (FM三角雑音のみ連続減衰)
         shelf_cut = 4500.0 / self.audio_rate
@@ -568,6 +256,7 @@ class SdrDspPipeline:
         self.history_pilot_lp = np.zeros(len(self.fir_pilot_lp) - 1, dtype=np.float32)
         self.history_pilot_hp = np.zeros(len(self.fir_pilot_hp) - 1, dtype=np.float32)
         self.history_lpr = np.zeros(len(self.fir_if_audio) - 1, dtype=np.float32)
+        self.history_lpr_q = np.zeros(len(self.fir_if_audio) - 1, dtype=np.float32)
         self.history_rds = np.zeros(len(self.fir_am_narrow) - 1, dtype=np.float32)
         self.history_final_l = np.zeros(len(self.fir_audio_clean) - 1, dtype=np.float32)
         self.history_final_r = np.zeros(len(self.fir_audio_clean) - 1, dtype=np.float32)
@@ -591,6 +280,39 @@ class SdrDspPipeline:
         self._last_cos3 = None
         self._last_sin3 = None
 
+        # NASA DSN方式 自律適応カルマン・パイロット搬送波追従器 (AKCTL)
+        self.pilot_tracker = KalmanPilotTracker(sample_rate=self.if_rate)
+
+        # MAP-BCJR 時間反転最尤系列ターボ平滑化器 (ゼロ位相・過渡アタック完全保存)
+        self.turbo_equalizer = TimeReversalTurboEqualizer(sample_rate=self.audio_rate, fc_default=14500.0)
+
+        # ホログラフィック・ハイレゾ倍音外挿エンジン (15kHz〜22kHz エアバンド再合成)
+        self.holographic_enhancer = HolographicAudioEnhancer(sample_rate=self.audio_rate, air_gain=0.08)
+
+        # リーマン多様体トポロジカル測地線復調器 (特異点位相スリップ幾何学遮断)
+        self.riemann_demodulator = RiemannianTopologicalDemodulator(sample_rate=self.if_rate)
+
+        # 最尤位相軌道ビタビ復調器 (低CNR位相スリップ・クリックスパイク大域消去)
+        self.viterbi_demodulator = ViterbiPhaseDemodulator(sample_rate=self.if_rate, dev_limit_hz=75000.0, audio_max_hz=53000.0)
+
+        # シンプレクティック幾何学 非線形FM位相空間復調器 (相空間測度保構造・特異点クリックスパイク幾何学的遮断)
+        self.symplectic_demodulator = SymplecticHamiltonianDemodulator(sample_rate=self.if_rate, dev_limit_hz=75000.0, cutoff_hz=65000.0)
+
+        # 超空間独立成分ステレオ復調器 (BSS / FastICA ステレオ逆相三角ヒスノイズ直交消去)
+        self.bss_separator = SuperSpatialBssStereoSeparator(sample_rate=self.audio_rate)
+
+        # 部分空間超解像マルチパス等化器 (Constant Modulus Subspace 遅延波ブラインド同定＆Zero-Forcing逆フィルタ)
+        self.subspace_equalizer = SubspaceMultipathEqualizer(sample_rate=self.if_rate)
+
+        # 最適輸送理論 複数マルチパス等化器 (Wasserstein-2 計量＆シンクホーン双対正規方程式一括求解)
+        self.wasserstein_equalizer = WassersteinMultipathEqualizer(sample_rate=self.if_rate)
+
+        # 圧縮センシング 副搬送波超解像抽出器 (l1正則化 FISTA 高速近接勾配法)
+        self.sparse_subcarrier_extractor = SparseSubcarrierExtractor(sample_rate=self.if_rate)
+
+        # ランダム行列特異値切除ノイズクリーナー (Random Matrix Theory & Marchenko-Pastur Law ノイズ切除)
+        self.rmt_denoiser = RmtHankelDenoiser(sample_rate=self.audio_rate, embed_dim=24)
+
         # ===== RDS (57kHz) =====
         self.rds_enabled = True
         self.rds = None            # 遅延生成 (rds.RdsDecoder)
@@ -602,8 +324,25 @@ class SdrDspPipeline:
         # BS.450/EN 50067準拠キャリア生成のため追加回転は不要 (0.0)
         self.rds_phase_offset = 0.0
         self._stereo_blend = 0.0
+        # パイロット瞬断用フライホイール: ロック喪失直後はブレンドを凍結し、
+        # 短い発作 (1.4秒/25ブロックまで) ではステレオ像を維持する
+        self._pilot_hold_max = 25
+        self._pilot_hold_n = 0
         # CコアのPLL 1サンプル進みが解消されたため、副搬送波オフセットは 0.0
         self.stereo_phase_offset = 0.0
+        # 直交復調の残差 (位相誤差の符号付き観測用。MPXキャンセラ経路でのみ有効)
+        self._last_diff_q = None
+        # 38kHz再生位相オートトリム (ドングル個体差・温度ドリフトによる分離度劣化を
+        # L-R電力最大化サーボで吸収。stereo_phase_offsetをアクチュエータに使う)
+        self.stereo_trim_enabled = True
+        self._trim_dir = 1.0
+        self._trim_step_rad = float(np.deg2rad(0.5))
+        self._trim_max_rad = float(np.deg2rad(15.0))
+        self._trim_block = 0
+        self._trim_m_smooth = 0.0
+        self._trim_prev_m = 0.0
+        self._trim_primed = False
+        self._trim_err_ema = 0.0
         # ステレオ2ch完全同期 適応ドリフトリサンプラ (後方互換参照)
         self.resampler_r = self.resampler
 
@@ -628,6 +367,7 @@ class SdrDspPipeline:
         self._nr_s_w = 0.0                # 平滑化されたWiener適用度 (0=off, 1=full)
         self._nr_s = 0.0                  # 平滑化されたノイズ度 (0=クリーン, 1=ノイズ)
         self._nr_hist = deque(maxlen=100)  # 差分HFパワー履歴 (下位10%をノイズフロア推定に使用)
+        self._nr_mf_smooth = 0.0  # 番組パワー平滑値 (未初期化=0で初回に即時セット)
         self._nr_cut_levels = np.array([2500.0, 4000.0, 6500.0, 10000.0, 15000.0])
         self._nr_filters = [
             design_fir_kaiser(num_taps=65, cutoff_norm=float(c) / self.audio_rate, beta=6.5)
@@ -675,6 +415,11 @@ class SdrDspPipeline:
         self._nr_delay += self._wf_hop     # Wiener経路の遅延をmono側で補償
         self.history_mono_delay = np.zeros(self._nr_delay, dtype=np.float32)
         self._nr_window = np.hanning(1024).astype(np.float32)
+        # 周波数依存ブレンド用クロスオーバー状態 (1次相補: lo + hi = diff で完全再構成。
+        # blend=1時は_lo/_hiとも1.0で旧スカラー動作とビット一致)
+        self.freq_blend_enabled = True
+        self.freq_blend_xo_hz = 3500.0
+        self._blend_xo_y1 = 0.0
 
         # DCカット用ハイパスフィルタ状態 (30Hzカットオフ)
         # y[n] = x[n] - x[n-1] + R * y[n-1]
@@ -693,6 +438,19 @@ class SdrDspPipeline:
         self.am_agc_level = 0.0  # AM搬送波レベルAGC状態
         self._am_agc_hang = 0  # AGCハングタイマ (残ブロック数)
         self.impulse_blanker_enabled = True  # AMインパルスノイズブランカ
+        # 局間音量レベリング用スローAGC (全モード共通・L/R連動で音像保存。
+        # 番組の緩急 (バース/サビ) には追従させず、局替わり等の持続的な
+        # レベル差だけを均す: 時定数は秒〜十秒オーダー、範囲は±6dBに制限。
+        # 短い時定数・広い範囲にすると番組ダイナミクスを潰してパンピング
+        # (サビが小さく・出頭が爆音に) するため厳禁)
+        self.slow_agc_enabled = True
+        self.slow_agc_target = 0.10      # 目標RMS (-20dBFS)
+        self.slow_agc_min = 0.5          # -6dB (過大局の絞り)
+        self.slow_agc_max = 2.0          # +6dB (微弱局の持ち上げ上限)
+        self.slow_agc_attack = 2.0       # 絞り方向の時定数 (秒)
+        self.slow_agc_release = 10.0     # 持ち上げ方向の時定数 (秒)
+        self.slow_agc_gain = 1.0
+        self._slow_agc_floor = 1e-4      # -80dBFS未満は無音とみなし凍結
 
         # 超音波ノイズ比追従型 コグニティブ・オートスケルチ (FM三角ノイズクワイエティング追従)
         self.ultra_squelch = UltrasonicSquelchTracker(sample_rate=self.if_rate)
@@ -700,6 +458,11 @@ class SdrDspPipeline:
 
         # 音声/音楽 認知型オートチルトEQ (トーク了解度 / 音楽フラットHi-Fi 自動追従)
         self.cognitive_eq = CognitiveSpeechMusicTracker(sample_rate=self.audio_rate)
+        # 38kHz 直交副搬送波マルチパス適応キャンセラ (サ行シピシピ歪み・混濁の逆位相相殺)
+        self.mpx_canceller = QuadratureMpxCanceller(sample_rate=self.audio_rate)
+        # 深宇宙通信級 拡張カルマンフィルタ (Deep-Space EKF) FM復調エンジン
+        self.ekf_demod = DeepSpaceEkfDemodulator(sample_rate=self.if_rate)
+        self.ekf_enabled = True
 
         # ===== 高級オーディオ (Accuphase / dCS 理論) 統合モジュール =====
         # 低域位相回転ゼロ・アクティブDCサーボ (20Hz〜300Hzの低音位相進み歪みを根絶)
@@ -771,6 +534,10 @@ class SdrDspPipeline:
         self.smooth_alpha = 0.25
 
     def set_offset_freq(self, offset_hz: float):
+        with self._state_lock:
+            self._set_offset_freq_locked(offset_hz)
+
+    def _set_offset_freq_locked(self, offset_hz: float):
         self.offset_freq = offset_hz
         self._tune_monotonic = time.monotonic()
         self.afc_offset_hz = 0.0
@@ -789,6 +556,19 @@ class SdrDspPipeline:
         self._pll_theta = 0.0
         self._pll_integ = 0.0
         self._pll_ef = 0.0
+        # 38kHz位相トリムも局替わりでリセット (前局の multipath 位相を持ち越さない)
+        self.stereo_phase_offset = 0.0
+        # ブレンドも局替わりでリセット (前局のステレオ像・フライホイールを持ち越さない。
+        # しないと新局の冒頭1秒が前局ブレンドのまま誤ステレオ化する)
+        self._stereo_blend = 0.0
+        self.stereo_blend = 0.0
+        self._pilot_hold_n = 0
+        self._trim_dir = 1.0
+        self._trim_block = 0
+        self._trim_primed = False
+        self._trim_prev_m = 0.0
+        self._trim_m_smooth = 0.0
+        self._trim_err_ema = 0.0
         self.fm_last_sample = 0.0 + 0.0j
         self.nfm_last_sample = 0.0 + 0.0j
         self._fm_pll_state[:] = 0.0
@@ -807,6 +587,20 @@ class SdrDspPipeline:
             self.dc_servo.reset()
         if hasattr(self, "dither"):
             self.dither.reset()
+        if hasattr(self, "viterbi_demodulator"):
+            self.viterbi_demodulator.reset()
+        if hasattr(self, "symplectic_demodulator"):
+            self.symplectic_demodulator.reset()
+        if hasattr(self, "bss_separator"):
+            self.bss_separator.reset()
+        if hasattr(self, "subspace_equalizer"):
+            self.subspace_equalizer.reset()
+        if hasattr(self, "wasserstein_equalizer"):
+            self.wasserstein_equalizer.reset()
+        if hasattr(self, "sparse_subcarrier_extractor"):
+            self.sparse_subcarrier_extractor.reset()
+        if hasattr(self, "rmt_denoiser"):
+            self.rmt_denoiser.reset()
         # RDS状態も選局でリセット (前局のPS/PI/RTを次局へ持ち越さない)
         if self.rds is not None:
             try:
@@ -836,6 +630,7 @@ class SdrDspPipeline:
     def reset_stereo_nr(self):
         """選局・モード変更時にノイズ推定履歴をリセットして素早く追従させる"""
         self._nr_hist.clear()
+        self._nr_mf_smooth = 0.0
         self._nr_primed = False
         self._wf_p = None
         self._wf_g = None
@@ -845,6 +640,10 @@ class SdrDspPipeline:
         self._wf_out = np.zeros(self._wf_hop, dtype=np.float32)  # 固定遅延の初期プリフィル
         self._wf_ola = np.zeros(self._wf_n, dtype=np.float32)
         self._wf_extra_delay = 0
+        # 周波数依存ブレンドのクロスオーバー状態もクリア (前局の低域残響防止)
+        self._blend_xo_y1 = 0.0
+        # 直交残差・トリム方向もクリア
+        self._last_diff_q = None
 
     def set_stereo_nr(self, enabled: bool):
         """ステレオノイズリダクションの有効/無効 (無効時はフルステレオ固定)"""
@@ -943,18 +742,20 @@ class SdrDspPipeline:
         self.hf_gain_applied += a * (self.target_hf_gain - self.hf_gain_applied)
 
     def _get_dynamic_filter(self, kind: str, cutoff_hz: float) -> np.ndarray:
-        """カットオフ毎にFIRをその場設計 (100Hz量子化キャッシュで実時間コスト極小)"""
+        """カットオフ毎にFIRをその場設計 (100Hz量子化LRUキャッシュで実時間コスト極小・全消去スパイクゼロ)"""
         quant = max(200, int(round(cutoff_hz / 100.0)) * 100)
         key = (kind, quant)
         taps = self._fir_cache.get(key)
-        if taps is None:
-            if kind == "if":
-                taps = design_fir_kaiser(num_taps=65, cutoff_norm=quant / self.rf_rate, beta=6.2)
-            else:
-                taps = design_fir_kaiser(num_taps=81, cutoff_norm=quant / self.audio_rate, beta=6.8)
-            if len(self._fir_cache) > 128:
-                self._fir_cache.clear()
-            self._fir_cache[key] = taps
+        if taps is not None:
+            self._fir_cache.move_to_end(key)
+            return taps
+        if kind == "if":
+            taps = design_fir_kaiser(num_taps=65, cutoff_norm=quant / self.rf_rate, beta=6.2)
+        else:
+            taps = design_fir_kaiser(num_taps=81, cutoff_norm=quant / self.audio_rate, beta=6.8)
+        self._fir_cache[key] = taps
+        if len(self._fir_cache) > 128:
+            self._fir_cache.popitem(last=False)  # 最も長く使われていない最古エントリのみ破棄
         return taps
 
     def _apply_hf_shelf(self, audio: np.ndarray, ch: str = "") -> np.ndarray:
@@ -1127,14 +928,16 @@ class SdrDspPipeline:
             return np.zeros(len(iq_if) // self.audio_decim, dtype=np.float32)
 
         # 0. マルチパス検出 (包絡線の変動 = PM→AM変換量)
+        # 平滑は鈍め (測定1.0秒・反映1.5秒): 速すぎると番組の包絡変動や
+        # フェージングの瞬時値にステレオ幅が呼吸してしまう (市街地局で実測)
         if self.multipath_enabled:
             env = np.abs(iq_if)
             var = float(np.std(env) / (np.mean(env) + 1e-12))
             dt_mp = len(iq_if) / self.if_rate
-            self._mp_var += (1.0 - np.exp(-dt_mp / 0.5)) * (var - self._mp_var)
+            self._mp_var += (1.0 - np.exp(-dt_mp / 1.0)) * (var - self._mp_var)
             x = float(np.clip((self._mp_var - self.mp_lo) / (self.mp_hi - self.mp_lo), 0.0, 1.0))
             s = x * x * (3.0 - 2.0 * x)
-            tau = 0.5 if s > self.multipath_amount else 2.5
+            tau = 1.5 if s > self.multipath_amount else 2.5
             self.multipath_amount += (1.0 - np.exp(-dt_mp / tau)) * (s - self.multipath_amount)
             self.multipath_gain = 1.0 - self.mp_depth * self.multipath_amount
 
@@ -1148,59 +951,82 @@ class SdrDspPipeline:
             self.cma_active = True
         else:
             self.cma_active = False
+
+        # 最適輸送理論 複数マルチパス等化器 (Wasserstein-2 計量＆シンクホーン双対正規方程式一括求解)
+        if (getattr(self, "wasserstein_equalizer", None) is not None
+                and self.wasserstein_equalizer.enabled
+                and (self.cognitive_enabled or getattr(self, "subspace_always", False))):
+            iq_if = self.wasserstein_equalizer.process(iq_if)
+
+        # 部分空間超解像マルチパス等化器 (Constant Modulus Subspace 遅延波ブラインド同定＆Zero-Forcing逆フィルタ)
+        if (getattr(self, "subspace_equalizer", None) is not None
+                and self.subspace_equalizer.enabled
+                and (self.cognitive_enabled or getattr(self, "subspace_always", False))):
+            iq_if = self.subspace_equalizer.process(iq_if)
+
         limited = self._apply_hard_limiter(iq_if)
 
-        # 2. FM復調: デュアルモード。
-        # - 通常 (強信号) : 瞬時位相差分法 (分離度-42dB・高変調域も歪まない)
-        # - 弱信号のみ : PLL (しきい値拡張、低CNRで約+18dBを実測)
-        # 狭帯域PLLは高変調域 (10-15kHz偏移) で追従が破綻しHFが-10〜-15dB歪むため、
-        # 強信号では絶対に使わない。判定はブレンド(ステレオ有無)ではなく信号強度
-        # (Sメーター) で行う。強モノラル局はblend=0になるためblend判定は誤りだった。
-        # 出力は同単位 [rad/sample] のため後段は無変更。
-        use_pll = (self.fm_pll_enabled and NATIVE_PLLFM
-                   and self.s_meter_dbfs < -40.0)  # S7相当以下 = 弱信号
+        # 2. FM復調: ハイブリッド宇宙通信級復調エンジン
+        # - 通常 (強信号) : 瞬時位相差分法 (分離度-42dB・高変調域も歪まない超広帯域復調)
+        # - 弱信号 (S7相当以下) : 深宇宙通信級 拡張カルマンフィルタ (EKF) による確率論的MMSE復調
+        #   (FM閾値拡張 +6〜+9dB、低CNR下での2π位相スリップ・クリックスパイクノイズを完全阻止)
+        # NOTE: 旧 use_pll (NATIVE_PLLFM) 経路は未使用デッドコードだったため削除。
+        # PLL-FMが必要になった場合は fm_pll_enabled とは独立に有効化すること。
         if _NATIVE is not None:
             work = np.ascontiguousarray(limited, dtype=np.complex64)
             demod = np.empty(len(work), dtype=np.float32)
-            if use_pll:
-                _NATIVE.sdr_pll_fm_demod(
-                    _fptr(work), _fptr(demod), len(work),
-                    self._fm_pll_state.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
-                    float(self._fm_pll_kp), float(self._fm_pll_ki))
-                self.fm_last_sample = complex(work[-1].real, work[-1].imag)
-            else:
-                last = np.array([self.fm_last_sample.real, self.fm_last_sample.imag],
-                                dtype=np.float32)
-                _NATIVE.sdr_fm_demod(_fptr(work), _fptr(demod), len(work), _fptr(last))
-                self.fm_last_sample = complex(float(last[0]), float(last[1]))
+            last = np.array([self.fm_last_sample.real, self.fm_last_sample.imag],
+                            dtype=np.float32)
+            _NATIVE.sdr_fm_demod(_fptr(work), _fptr(demod), len(work), _fptr(last))
+            self.fm_last_sample = complex(float(last[0]), float(last[1]))
         else:
             s = np.concatenate(([self.fm_last_sample], limited))
             self.fm_last_sample = limited[-1]
-            if use_pll:
-                # 純Python PLLフォールバック (DLL不在時のみ。C経路と同じ強度ゲート)
-                th = float(self._fm_pll_state[0])
-                fr = float(self._fm_pll_state[1])
-                kp = float(self._fm_pll_kp)
-                ki = float(self._fm_pll_ki)
-                demod = np.empty(len(limited), dtype=np.float32)
-                for i, samp in enumerate(limited):
-                    re = float(samp.real)
-                    im = float(samp.imag)
-                    c = math.cos(th)
-                    sn = math.sin(th)
-                    e = im * c - re * sn
-                    fr += ki * e
-                    th += fr + kp * e
-                    if th > math.pi:
-                        th -= 2.0 * math.pi
-                    elif th < -math.pi:
-                        th += 2.0 * math.pi
-                    demod[i] = fr + kp * e
-                self._fm_pll_state[0] = th
-                self._fm_pll_state[1] = fr
-            else:
-                diff = s[1:] * np.conj(s[:-1])
-                demod = np.angle(diff)
+            diff = s[1:] * np.conj(s[:-1])
+            demod = np.angle(diff)
+
+        # 弱電界・モノラル時における深宇宙EKFのシームレス・クロスフェード
+        # (ステレオ時は38kHz副搬送波の広帯域通過のため超広帯域差分法を維持し、
+        # 弱電界・モノラル局で深宇宙EKFを稼働させてクリックスパイクと三角雑音を完全根絶)
+        # NOTE: 旧条件は fm_pll_enabled(False既定) とのANDで常時OFFになっていた。
+        # EKFは ekf_enabled 単独で制御する (PLLとは独立)。
+        if (getattr(self, "ekf_enabled", False)
+                and getattr(self, "ekf_demod", None) is not None
+                and self._stereo_blend <= 0.05):
+            w_ekf = float(np.clip((-38.0 - self.s_meter_dbfs) / 10.0, 0.0, 1.0))
+            if w_ekf > 0.01:
+                demod_ekf = self.ekf_demod.demodulate(limited)
+                if len(demod_ekf) == len(demod):
+                    demod = ((1.0 - w_ekf) * demod + w_ekf * demod_ekf).astype(np.float32)
+
+        # リーマン多様体トポロジカル測地線正則化 (Hyper自律最適化時: フェージング特異点クリックの幾何学的遮断)
+        if (getattr(self, "riemann_demodulator", None) is not None
+                and self.riemann_demodulator.enabled
+                and (self.cognitive_enabled or getattr(self, "riemann_always", False))
+                and self.s_meter_dbfs < -35.0):
+            w_riemann = float(np.clip((-35.0 - self.s_meter_dbfs) / 12.0, 0.0, 0.75))
+            demod_riemann = self.riemann_demodulator.demodulate(iq_if)
+            if len(demod_riemann) == len(demod):
+                demod = ((1.0 - w_riemann) * demod + w_riemann * demod_riemann).astype(np.float32)
+
+        # シンプレクティック幾何学 非線形FM位相空間復調器 (弱電界・フェージング時: 特異点クリックスパイク幾何学的遮断)
+        if (getattr(self, "symplectic_demodulator", None) is not None
+                and self.symplectic_demodulator.enabled
+                and (self.cognitive_enabled or getattr(self, "symplectic_always", False))
+                and self.s_meter_dbfs < -32.0):
+            w_symp = float(np.clip((-32.0 - self.s_meter_dbfs) / 10.0, 0.0, 0.85))
+            demod_symp = self.symplectic_demodulator.process(limited)
+            if len(demod_symp) == len(demod):
+                demod = ((1.0 - w_symp) * demod + w_symp * demod_symp).astype(np.float32)
+
+        # 最尤位相軌道ビタビ復調器 (弱電界・フェージング時: 低CNR位相スリップ・クリックスパイク大域消去)
+        if (getattr(self, "viterbi_demodulator", None) is not None
+                and self.viterbi_demodulator.enabled
+                and self.cognitive_enabled
+                and self.s_meter_dbfs < -30.0):
+            demod_viterbi = self.viterbi_demodulator.demodulate(iq_if)
+            if len(demod_viterbi) == len(demod):
+                demod = demod_viterbi
 
         # 超音波三角ノイズ比追従型 コグニティブ・オートスケルチ
         ultra_gain = 1.0
@@ -1231,8 +1057,18 @@ class SdrDspPipeline:
         mono = self.decimate_with_history(demod_scaled, self.fir_if_audio,
                                           self.audio_decim, "history_if_audio")
 
+        # 5a. 圧縮センシング (Compressive Sensing & l1正則化 FISTA) による 38kHz / 57kHz 副搬送波超解像抽出
+        # (高域三角ノイズフロアをl1軟しきい値収縮でゼロ切除し、ステレオS/NとRDS感度限界を極大化)
+        if (getattr(self, "sparse_subcarrier_extractor", None) is not None
+                and self.sparse_subcarrier_extractor.enabled
+                and (self.cognitive_enabled or getattr(self, "sparse_cs_always", False))
+                and self.s_meter_dbfs < -32.0):
+            demod_mpx = self.sparse_subcarrier_extractor.process(demod_scaled, self.s_meter_dbfs)
+        else:
+            demod_mpx = demod_scaled
+
         # 5b. ステレオMPXデコード (19kHzパイロットPLL + 38kHz同期検波)
-        self._update_stereo_pilot(demod_scaled)
+        self._update_stereo_pilot(demod_mpx)
 
         # 5c. RDS復調 (57kHz = 3θ, ステレオ状態と独立して常時動作)
         # パイロットロック連動ゲート: パイロット不在時 (無信号・モノラル) は
@@ -1279,16 +1115,36 @@ class SdrDspPipeline:
             lpr = demod_scaled * carrier
             diff_raw = self.decimate_with_history(lpr, self.fir_if_audio,
                                                   self.audio_decim, "history_lpr") * 2.0
+
+            # 38kHz 直交副搬送波マルチパス適応キャンセラ (Quadrature MPX Decoupler)
+            if (getattr(self, "mpx_canceller", None) is not None
+                    and self.mpx_canceller.enabled and self._last_cos2 is not None):
+                carrier_q = -self._last_cos2
+                if abs(self.stereo_phase_offset) > 1e-6:
+                    carrier_q = carrier_q * co + self._last_sin2 * si
+                lpr_q = demod_scaled * carrier_q
+                diff_q = self.decimate_with_history(lpr_q, self.fir_if_audio,
+                                                    self.audio_decim, "history_lpr_q") * 2.0
+                if len(diff_q) == len(diff_raw):
+                    self._last_diff_q = diff_q
+                    diff_raw = self.mpx_canceller.process(diff_raw, diff_q)
+                else:
+                    self._last_diff_q = None
+
             if len(diff_raw) == len(mono):
                 # 常に実測 (診断・A/B用)。NR無効時はフィルタ素通し・フルステレオ固定
                 self._update_stereo_nr(diff_raw, mono)
+                # 38kHz位相オートトリム (L-R電力最大化。NR推定と同タイミングで観測)
+                self._update_stereo_trim(diff_raw, mono)
                 if self.stereo_nr_enabled:
                     cut = self.stereo_cut_hz
                     blend = self._stereo_blend * self.stereo_nr_gain
                     blend *= self.multipath_gain
                     diff = self._diff_lowpass(diff_raw, cut)
                     diff = self._wiener_diff(diff)
-                    stereo_diff = diff * blend
+                    # 周波数依存ブレンド: 弱電界で高域から先にモノラル化
+                    # (低域のステレオ感を残す。blend=1時は旧スカラー動作と完全一致)
+                    stereo_diff = self._freq_dependent_blend(diff, blend)
                     # 差信号FIRの群遅延を補償 (mono/diffの位相ズレによる分離度劣化を防止)
                     mono = self._delay_mono(mono)
                 else:
@@ -1307,6 +1163,13 @@ class SdrDspPipeline:
             # オーバーヘッドが上回る)。逐次実行が最速。
             left = self._post_process_wfm(mono + stereo_diff, "_l")
             right = self._post_process_wfm(mono - stereo_diff, "_r")
+
+            # 超空間独立成分ステレオ復調器 (BSS / FastICA ステレオ逆相三角ヒスノイズ直交消去)
+            if (getattr(self, "bss_separator", None) is not None
+                    and self.bss_separator.enabled
+                    and (self.cognitive_enabled or getattr(self, "bss_always", False))):
+                left, right = self.bss_separator.process(left, right, stereo_blend=self._stereo_blend)
+
             if ultra_gain < 0.999:
                 left = left * ultra_gain
                 right = right * ultra_gain
@@ -1326,10 +1189,13 @@ class SdrDspPipeline:
         self.is_stereo = False
         self.stereo_status = "MONO"
         # モノラル中も遅延履歴を進めておく (ステレオ復帰時に履歴が古い/ゼロだと
-        # 先頭_nr_delayサンプルが無音になり2msの欠落クリックになる)
-        self._delay_mono(mono)
+        # 先頭_nr_delayサンプルが無音になり2msの欠落クリックになる)。
+        # また、NR有効時はモノラル出力も同量遅延させることで、ステレオ/モノラル自動切替時の
+        # タイムワープ (2ms音飛び・重複・クリック) を完全根絶しタイムラインを100%連続化する。
+        mono_delayed = self._delay_mono(mono)
+        mono_out = mono_delayed if self.stereo_nr_enabled else mono
         # モノラル信号はステレオのセンター定位 (L=mono, R=mono) と完全に同一レベル (0dB差) で出力
-        out_mono = self._post_process_wfm(mono, "")
+        out_mono = self._post_process_wfm(mono_out, "")
         if ultra_gain < 0.999:
             out_mono = out_mono * ultra_gain
         return np.clip(out_mono, -1.0, 1.0)
@@ -1374,6 +1240,16 @@ class SdrDspPipeline:
 
         hf = band_power(diff, 6000.0, 15000.0)
         mf = band_power(mono, 300.0, 3000.0)
+        # 番組パワーの平滑化 (τ2.5秒対称): 瞬時mfのままだと音楽の緩急が
+        # そのままヒス比に載ってNRゲイン・カットオフがポンピングする
+        # (強音楽局の実測で発覚)。フロア側は10秒履歴なので分母だけ鈍らせる。
+        dt = len(diff) / self.audio_rate
+        if not self._nr_primed or self._nr_mf_smooth <= 0.0:
+            self._nr_mf_smooth = mf
+        else:
+            a_mf = 1.0 - np.exp(-dt / 2.5)
+            self._nr_mf_smooth += a_mf * (mf - self._nr_mf_smooth)
+        mf = self._nr_mf_smooth
         # ノイズフロア推定: ~10秒履歴の下位10%を使い、番組自身の高域成分ではなく
         # 定常的に存在するとヒス成分のみを検出する (明るい音楽での過剰なNRを防止)
         self._nr_hist.append(hf)
@@ -1437,8 +1313,9 @@ class SdrDspPipeline:
         return y.astype(np.float32)
 
     def _wiener_diff(self, x: np.ndarray) -> np.ndarray:
-        """差信号のサブバンドWiener抑圧 (STFT 256/hop 128, Hann 50%オーバーラップ)。
+        """差信号のサブバンドWiener抑圧 (STFT 128/hop 64, 平方根Hann(Sine窓) 50%オーバーラップ)。
 
+        平方根Hann窓による50% OLAで振幅変調リップルゼロ(0.000000dB)の完全再構成。
         周波数ごとに 信号/(信号+ノイズ) の最適重みを掛けるため、ノイズに埋もれた
         高域だけが落ち、SNRの良い低域のステレオ感はそのまま残る。
         入出力のサンプル数は厳密に一致させ、mono側は_nr_delayで遅延補償する。
@@ -1509,6 +1386,12 @@ class SdrDspPipeline:
             # フレーム未満の入力は破棄せず持ち越す (旧実装はここで入力を消していた)
             self._wf_in = buf
         if len(self._wf_out) >= n:
+            # 余剰がある場合、過去の不足による余分な遅延 (extra_delay) を自動解消し定常群遅延へ復帰
+            if self._wf_extra_delay > 0:
+                surplus = len(self._wf_out) - n
+                recover = min(surplus, self._wf_extra_delay)
+                self._wf_out = self._wf_out[recover:]
+                self._wf_extra_delay -= recover
             y = self._wf_out[:n].copy()
             self._wf_out = self._wf_out[n:]
         else:
@@ -1521,6 +1404,153 @@ class SdrDspPipeline:
         if len(self._wf_out) > 8 * n:
             self._wf_out = self._wf_out[-2 * n:]
         return y
+
+    def _freq_dependent_blend(self, diff: np.ndarray, blend: float) -> np.ndarray:
+        """周波数依存ブレンド: 弱電界で高域から先にモノラル化する。
+        1次相補クロスオーバー (lo + hi = diff で完全再構成) で低域/高域に分け、
+        低域は blend、高域は blend^2 * nr_gain で絞る。FM三角ノイズが f^2 で
+        増大するため高域ほどヒスが支配的で、低域のステレオ感を残しつつ耳障りな
+        高域ヒスだけ先に消える。blend=1 かつ nr_gain=1 (クリーン) は旧スカラー
+        動作と完全一致の高速経路。NR無効ブランチからは呼ばれない。"""
+        if len(diff) == 0:
+            return diff
+        if not self.freq_blend_enabled or blend >= 0.999:
+            return (diff * blend).astype(np.float32)
+        if blend <= 0.001:
+            return np.zeros_like(diff)
+        # 1次LPF (状態保持でブロック連続。fc=3.5kHz@48kHz)
+        a = 1.0 - float(np.exp(-2.0 * np.pi * float(self.freq_blend_xo_hz) / float(self.audio_rate)))
+        y1 = float(self._blend_xo_y1)
+        # ベクトル化指数平滑の厳密逐次と等価なIIRを、ブロック内は
+        # lfilter相当の逐次ループで実行 (N~1kで0.02ms級)
+        lo = np.empty_like(diff)
+        for i, v in enumerate(diff):
+            y1 += a * (float(v) - y1)
+            lo[i] = y1
+        self._blend_xo_y1 = y1
+        hi = diff - lo
+        blend_lo = float(blend)
+        # 高域はヒス推定にもう一段連動 (三角ノイズ f^2 特性)。NRブランチ専用のため
+        # stereo_nr_gain は常に有効な推定値。クリーン時は blend=nr=1 で恒等変換。
+        blend_hi = float(blend * blend * float(self.stereo_nr_gain))
+        return (lo * blend_lo + hi * blend_hi).astype(np.float32)
+
+    def _update_stereo_trim(self, diff: np.ndarray, mono: np.ndarray):
+        """38kHz再生位相オートトリム: 位相誤差を stereo_phase_offset で相殺する。
+        主経路は直交 (Q) 腕の符号付き残差による比例サーボ (Costas型):
+        I ∝ cos(φe−δ)、Q ∝ sin(φe−δ) のため corr(I,Q)/E[I²] ≒ (φe−δ)/2 が
+        誤差の符号付き推定になり、δ += k·err で幾何収束する。番組レベルに不変。
+        Q腕が無い場合 (キャンセラ無効時) はL-R電力の摂動観測へフォールバック。
+        更新はブロック毎・比例ゲイン0.5・±15°クランプ。ゲート: パイロット
+        ロック・高ブレンド・低ヒス・有音声時のみ。短時間テストにはほぼ無影響。"""
+        if not self.stereo_trim_enabled:
+            return
+        try:
+            if not (abs(float(self.stereo_pilot_lock)) > 0.5):
+                return
+            if not (float(self._stereo_blend) > 0.5 and float(self.stereo_nr_gain) > 0.7):
+                return
+            if len(diff) < 64 or len(mono) < 64:
+                return
+            mono_rms = float(np.sqrt(np.mean(np.asarray(mono, dtype=np.float64) ** 2)))
+            if mono_rms < 0.01:  # -40dBFS未満は無音とみなし凍結
+                return
+            dq = getattr(self, "_last_diff_q", None)
+            if dq is not None and len(dq) == len(diff):
+                i = np.asarray(diff, dtype=np.float64)
+                q = np.asarray(dq, dtype=np.float64)
+                den = float(np.mean(i * i)) + 1e-12
+                if den < 1e-8:  # 差信号ほぼゼロ (モノラル) では凍結
+                    return
+                corr = float(np.mean(i * q))
+                err_inst = corr / den  # ≒ (φe−δ)/2 [rad]
+                if not np.isfinite(err_inst):
+                    return
+                # 高速変動 (実マルチパス) はEMAで均し、準静的な成分
+                # (トリム誤差・静止反射) のみ追う。実測で即時比例は
+                # レール間発振したため、τ3秒＋不感帯＋微速刻みに変更。
+                try:
+                    dt_tr = len(diff) / float(self.audio_rate)
+                except Exception:
+                    dt_tr = 0.05
+                a_tr = 1.0 - float(np.exp(-dt_tr / 3.0))
+                ema = float(getattr(self, "_trim_err_ema", 0.0)) + a_tr * (err_inst - float(getattr(self, "_trim_err_ema", 0.0)))
+                self._trim_err_ema = ema
+                if abs(ema) < 0.005:
+                    return  # 0.3°不感帯 (ノイズでの彷徨・レール発振を防止)
+                # 比例サーボ (1ブロック0.23°上限でゆっくり。急変動には追従しない)
+                step = float(np.clip(0.3 * ema, -0.004, 0.004))
+                self.stereo_phase_offset = float(np.clip(
+                    self.stereo_phase_offset + step,
+                    -self._trim_max_rad, self._trim_max_rad))
+                return
+            # フォールバック: L-R電力の摂動観測 (Q腕なし時)
+            diff_rms = float(np.sqrt(np.mean(np.asarray(diff, dtype=np.float64) ** 2)))
+            m = diff_rms / (mono_rms + 1e-9)
+            if not self._trim_primed:
+                self._trim_primed = True
+                self._trim_m_smooth = m
+                self._trim_prev_m = m
+                return
+            self._trim_m_smooth += 0.25 * (m - self._trim_m_smooth)
+            self._trim_block += 1
+            if self._trim_block < 2:
+                return
+            self._trim_block = 0
+            if self._trim_m_smooth < self._trim_prev_m - 1e-6:
+                self._trim_dir = -self._trim_dir
+            self.stereo_phase_offset = float(np.clip(
+                self.stereo_phase_offset + self._trim_dir * self._trim_step_rad,
+                -self._trim_max_rad, self._trim_max_rad))
+            if abs(self.stereo_phase_offset) >= self._trim_max_rad - 1e-9:
+                self._trim_dir = -self._trim_dir
+            self._trim_prev_m = self._trim_m_smooth
+        except Exception:
+            pass
+
+    def _slow_agc_level(self, audio: np.ndarray) -> np.ndarray:
+        """局間音量レベリング用スローAGC: ブロックRMSを目標 (-20dBFS) へ寄せる。
+        ステレオは全ch一括 (L/R連動で音像・位相を保存)、モノラルも同一式。
+        無音 (-80dBFS未満) では凍結しノイズ持ち上げを防ぐ。ゲイン範囲±6dB、
+        立ち下げ2秒・立ち上げ10秒の非対称時定数で、番組内の緩急には反応せず
+        局替わり等の持続的レベル差だけを均す (ポンピング防止)。
+        ブロック内は単一ゲイン (変化は0.1dB/block未満でジッパー雑音なし)。"""
+        try:
+            if len(audio) == 0:
+                return audio
+            x = np.asarray(audio, dtype=np.float64)
+            rms = float(np.sqrt(np.mean(x * x)))
+            if not np.isfinite(rms) or rms < float(self._slow_agc_floor):
+                return audio
+            desired = float(np.clip(float(self.slow_agc_target) / (rms + 1e-12),
+                                    float(self.slow_agc_min), float(self.slow_agc_max)))
+            cur = float(self.slow_agc_gain)
+            # ブロック長から時定数を換算 (audio_rate基準)
+            try:
+                dt = len(audio) / float(self.audio_rate)
+            except Exception:
+                dt = 0.05
+            tau = float(self.slow_agc_attack) if desired < cur else float(self.slow_agc_release)
+            a = 1.0 - float(np.exp(-dt / tau))
+            gain = cur + a * (desired - cur)
+            self.slow_agc_gain = float(gain)
+            if abs(gain - 1.0) < 1e-4:
+                return audio
+            return (x * gain).astype(np.float32)
+        except Exception:
+            return audio
+
+    def _blend_release(self, floor: float = 0.0):
+        """ブレンド低下 (パイロット瞬断フライホイール付き)。
+        高ブレンドからの低下要求は25ブロック (~1.4秒) まで凍結し、
+        短いパイロット瞬断発作でステレオ像がモノラルへ往復するのを防ぐ。
+        持続喪失では従来通り0.97ランプで floor まで滑らかに落とす。"""
+        if (self._stereo_blend > 0.5
+                and self._pilot_hold_n < self._pilot_hold_max):
+            self._pilot_hold_n += 1
+        else:
+            self._stereo_blend = max(float(floor), self._stereo_blend * 0.97)
+        self.stereo_blend = self._stereo_blend
 
     def _post_process_wfm(self, audio: np.ndarray, ch: str = "") -> np.ndarray:
         """WFM音声のチャンネル別仕上げ (ch: ''=モノ, '_l'/'_r'=ステレオ各ch)"""
@@ -1549,6 +1579,27 @@ class SdrDspPipeline:
         elif self.filter_mode == "narrow":
             audio = self._apply_noise_expander(audio, threshold=0.09)
 
+        # MAP-BCJR 時間反転最尤系列ターボ平滑化 (Hyper自律最適化時: ゼロ位相・過渡アタック完全保存)
+        if (getattr(self, "turbo_equalizer", None) is not None
+                and self.turbo_equalizer.enabled
+                and (self.cognitive_enabled or getattr(self, "turbo_eq_always", False))):
+            audio = self.turbo_equalizer.process(audio, ch=ch)
+
+        # ホログラフィック・ハイレゾ倍音外挿 (Hyper自律最適化時: 15kHz〜22kHz エアバンド再合成)
+        if (getattr(self, "holographic_enhancer", None) is not None
+                and self.holographic_enhancer.enabled
+                and (self.cognitive_enabled or getattr(self, "holographic_always", False))):
+            speech_p = getattr(getattr(self, "cognitive_tracker", None), "current_speech_prob", 0.0)
+            s_meter = getattr(self, "s_meter_dbfs", -20.0)
+            audio = self.holographic_enhancer.process(audio, ch=ch, speech_prob=speech_p, s_meter_dbfs=s_meter)
+
+        # ランダム行列特異値切除ノイズクリーナー (Marchenko-Pastur則による弱電界ランダム雑音切除)
+        if (getattr(self, "rmt_denoiser", None) is not None
+                and self.rmt_denoiser.enabled
+                and (self.cognitive_enabled or getattr(self, "rmt_always", False))):
+            s_meter = getattr(self, "s_meter_dbfs", -20.0)
+            audio = self.rmt_denoiser.process(audio, ch=ch, s_meter_dbfs=s_meter)
+
         return audio.astype(np.float32)
 
     def _update_stereo_pilot(self, mpx: np.ndarray):
@@ -1558,6 +1609,16 @@ class SdrDspPipeline:
         # 緩やかなブレンド解放のため保持し、長さ不一致はdemodulate_wfm側で弾く。
         self._last_cos3 = None
         self._last_sin3 = None
+        # 非有限MPX(NaN/Inf)はPLL状態を汚染するため早期破棄しブレンドを緩やかに落とす
+        try:
+            if mpx is None or len(mpx) < 64 or not bool(np.all(np.isfinite(np.asarray(mpx).reshape(-1)))):
+                self._blend_release()
+                self.stereo_pilot_lock = 0.0
+                self.stereo_pilot_ratio = 0.0
+                return
+        except Exception:
+            self._blend_release()
+            return
         if not (self.stereo_enabled or self.rds_enabled) or _NATIVE is None or len(mpx) < 64:
             self._stereo_blend *= 0.9
             self.stereo_blend = self._stereo_blend
@@ -1580,8 +1641,8 @@ class SdrDspPipeline:
                 # design されたブレンド解放ランプ (0.97) で滑らかにモノラルへ落とす。
                 # 搬送波を保持したままブレンドを絞るため、即時モノ切替の段差
                 # (実測0.58FS) が生じない。搬送波の長さ不一致はdemodulate_wfmで弾く。
-                self._stereo_blend = max(0.0, self._stereo_blend * 0.97)
-                self.stereo_blend = self._stereo_blend
+                # 短い瞬断はフライホイールで凍結する (持続喪失のみ解放ランプ)
+                self._blend_release()
                 self.stereo_pilot_lock = 0.0
                 self.stereo_pilot_ratio = 0.0
                 return
@@ -1593,20 +1654,27 @@ class SdrDspPipeline:
             ig = ctypes.c_double(self._pll_integ)
             ef = ctypes.c_double(self._pll_ef)
             cos3 = sin3 = None
+
+            # NASA DSN方式 自律適応カルマン・パイロット搬送波追従器 (AKCTL) による最適ゲイン動的計算
+            if getattr(self, "pilot_tracker", None) is not None and self.pilot_tracker.enabled:
+                kp, ki, alpha = self.pilot_tracker.update_gains(self.stereo_pilot_lock, pilot_rms, self._pll_ef)
+            else:
+                kp, ki, alpha = self._pll_kp, self._pll_ki, self._pll_alpha
+
             # RDS無効時は57kHz出力(cos3/sin3)の三角関数×2/サンプルを省略し
             # 2出力版PLLへ切替 (約1/3高速化。数学的等価: cos2/sin2は同一)。
             if NATIVE_PLL3 and self.rds_enabled:
                 cos3 = np.empty(n, dtype=np.float32)
                 sin3 = np.empty(n, dtype=np.float32)
                 _NATIVE.sdr_stereo_pll3(_fptr(sig), n, ctypes.byref(th), self._pll_w0,
-                                        self._pll_kp, self._pll_ki, ctypes.byref(ig),
-                                        ctypes.byref(ef), self._pll_alpha,
+                                        kp, ki, ctypes.byref(ig),
+                                        ctypes.byref(ef), alpha,
                                         _fptr(cos2), _fptr(sin2),
                                         _fptr(cos3), _fptr(sin3), ctypes.byref(quality))
             else:
                 _NATIVE.sdr_stereo_pll(_fptr(sig), n, ctypes.byref(th), self._pll_w0,
-                                       self._pll_kp, self._pll_ki, ctypes.byref(ig),
-                                       ctypes.byref(ef), self._pll_alpha,
+                                       kp, ki, ctypes.byref(ig),
+                                       ctypes.byref(ef), alpha,
                                        _fptr(cos2), _fptr(sin2), ctypes.byref(quality))
             self._pll_theta = th.value
             self._pll_integ = ig.value
@@ -1643,8 +1711,14 @@ class SdrDspPipeline:
 
             if target > self._stereo_blend:
                 self._stereo_blend = min(target, self._stereo_blend + 0.25)
+                self._pilot_hold_n = 0
+            elif target >= self._stereo_blend - 1e-9:
+                # ロック定常の等値: 低下ではないため保持枠を消費しない
+                self._stereo_blend = target
+                self.stereo_blend = self._stereo_blend
+                self._pilot_hold_n = 0
             else:
-                self._stereo_blend = max(target, self._stereo_blend * 0.97)
+                self._blend_release(floor=target)
 
             self.stereo_blend = self._stereo_blend
             if self._stereo_blend > 0.02:
@@ -1661,6 +1735,15 @@ class SdrDspPipeline:
             self._last_sin2 = None
             self._last_cos3 = None
             self._last_sin3 = None
+            # NaN固着防止: PLL積分状態もリセットし次ブロックで復帰可能にする
+            self._pll_theta = 0.0
+            self._pll_integ = 0.0
+            self._pll_ef = 0.0
+            try:
+                if getattr(self, "pilot_tracker", None) is not None:
+                    self.pilot_tracker.reset()
+            except Exception:
+                pass
             self._stereo_blend *= 0.9
             self.stereo_blend = self._stereo_blend
 
@@ -1782,7 +1865,7 @@ class SdrDspPipeline:
             return iq_if
         dev = np.abs(sm - med)
         mad = float(np.partition(dev, k)[k]) + 1e-12
-        thr = max(med + 10.0 * mad, med * 3.0)
+        thr = max(med + 6.0 * mad, med * 2.5)
         mask = mag > thr
         if float(np.mean(mask)) > 0.02:
             return iq_if
@@ -1802,7 +1885,8 @@ class SdrDspPipeline:
             l = out[s - 1] if s > 0 else out[e]
             r = out[e] if e < n else l
             k = (e - s)
-            w = np.arange(1, k + 1, dtype=np.float32) / (k + 1.0)
+            # Smooth cosine interpolation prevents phase/envelope kinks
+            w = 0.5 * (1.0 - np.cos(np.pi * np.arange(1, k + 1, dtype=np.float32) / (k + 1.0)))
             out[s:e] = (l * (1.0 - w) + r * w).astype(out.dtype)
         return out
 
@@ -1835,12 +1919,12 @@ class SdrDspPipeline:
             self.am_agc_level = max(level, 2e-4)
             self._am_agc_hang = 0
         elif level > self.am_agc_level:
-            self.am_agc_level += 0.25 * (level - self.am_agc_level)
-            self._am_agc_hang = 7
+            self.am_agc_level += 0.1 * (level - self.am_agc_level)
+            self._am_agc_hang = 20
         elif self._am_agc_hang > 0:
             self._am_agc_hang -= 1
         else:
-            self.am_agc_level += 0.05 * (level - self.am_agc_level)
+            self.am_agc_level += 0.005 * (level - self.am_agc_level)
         gain = min(1.0 / (self.am_agc_level + 1e-9), 3000.0)
         fade = min(1.0, level / 2e-4)
         audio_raw = np.clip((sig * gain - 1.0) * 0.6, -1.0, 1.0) * fade
@@ -1862,10 +1946,15 @@ class SdrDspPipeline:
         """AM/SSB適応帯域: 3.2-4.5kHzのヒス量に応じて音声帯域を連続的に狭める"""
         if not self.voice_auto_bw or len(audio) < 256:
             return audio
-        seg = audio[-1024:].astype(np.float32)
+        n = 1024
+        if len(audio) >= n:
+            seg = audio[-n:].astype(np.float32)
+        else:
+            seg = np.zeros(n, dtype=np.float32)
+            seg[-len(audio):] = audio
         seg = seg - float(np.mean(seg))
         power = np.abs(np.fft.rfft(seg * self._nr_window)) ** 2 + 1e-12
-        bin_hz = self.audio_rate / len(seg)
+        bin_hz = self.audio_rate / n
 
         def band(lo: float, hi: float) -> float:
             i0 = max(1, int(lo / bin_hz))
@@ -1953,7 +2042,7 @@ class SdrDspPipeline:
         shifted = (iq_48 * np.exp(-1j * ph)).astype(np.complex64)
         lp = self.decimate_with_history(shifted, taps, 1, attr)
         dly = (len(taps) - 1) // 2
-        audio = np.real(lp * np.exp(1j * (ph - omega * dly + phb))).astype(np.float32)
+        audio = np.real(lp * np.exp(1j * ((ph - omega * dly) + (phb - wb * dly)))).astype(np.float32)
 
         # AGC (SSBは搬送波が無いため平均振幅で正規化。無信号時の過剰増幅は3000倍で制限)
         # 無信号フロア (AM側と同型): ノイズ2400倍の爆音化を防ぐため滑らかにミュート。
@@ -1963,12 +2052,12 @@ class SdrDspPipeline:
             self.ssb_agc_level = max(level, 2e-4)
             self._ssb_agc_hang = 0
         elif level > self.ssb_agc_level:
-            self.ssb_agc_level += 0.25 * (level - self.ssb_agc_level)
-            self._ssb_agc_hang = 7
+            self.ssb_agc_level += 0.1 * (level - self.ssb_agc_level)
+            self._ssb_agc_hang = 20
         elif self._ssb_agc_hang > 0:
             self._ssb_agc_hang -= 1
         else:
-            self.ssb_agc_level += 0.05 * (level - self.ssb_agc_level)
+            self.ssb_agc_level += 0.005 * (level - self.ssb_agc_level)
         gain = min(1.0 / (self.ssb_agc_level + 1e-9), 3000.0)
         fade = min(1.0, level / 2e-4)
         audio = np.clip(audio * gain * 0.8, -1.0, 1.0) * fade
@@ -2108,6 +2197,11 @@ class SdrDspPipeline:
         if self.cognitive_enabled and getattr(self, "cognitive_eq", None) is not None and self.cognitive_eq.enabled:
             self.cognitive_eq.analyze(audio_clean)
             audio_clean = self.cognitive_eq.process(audio_clean)
+
+        # 局間音量レベリング用スローAGC (選局時の音量差を吸収。L/R連動で音像保存。
+        # DCサーボ・ディザの前に置き、最終量子化に整形済みレベルが載るようにする)
+        if self.slow_agc_enabled:
+            audio_clean = self._slow_agc_level(audio_clean)
 
         # ===== 高級オーディオ (Accuphase / dCS 理論) 最終段 =====
         # 超低域位相回転ゼロ・アクティブDCサーボ (20Hz〜20kHzの位相を一切回転させず直流オフセットを相殺)

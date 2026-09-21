@@ -12,11 +12,17 @@ class CascadeController:
     """SDRカスケード自律最適化コントローラ"""
 
     MIN_SAFE_GAIN_DB = 19.7  # 実用最低安全ゲイン: 19.7dB未満(熱雑音沈没)への転落を完全防止
+    FLOOR_GAIN_DB = 12.5  # 持続クリップ時の非常用下限
 
     def _min_safe_idx(self) -> int:
         if not self.available_gains:
             return 0
         return int(min(range(len(self.available_gains)), key=lambda i: abs(self.available_gains[i] - self.MIN_SAFE_GAIN_DB)))
+
+    def _floor_idx(self) -> int:
+        if not self.available_gains:
+            return 0
+        return int(min(range(len(self.available_gains)), key=lambda i: abs(self.available_gains[i] - self.FLOOR_GAIN_DB)))
 
     def __init__(self, driver, dsp, audio):
         self.driver = driver
@@ -42,6 +48,8 @@ class CascadeController:
         self.search_direction = +1  # +1: ゲイン上げ探索, -1: ゲイン下げ探索
         self.weak_converged_count = 0
         self.hard_lock = False  # 収束後の完全決め打ち固定 (フェージング・無音での誤再探索を完全防止)
+        self.filter_override = None  # 手動フィルタ固定 (hyper互換: None=自動)
+        self._filter_hold_ticks = 0
 
         # 内部統計モニタ用
         self.last_stats = {
@@ -105,6 +113,12 @@ class CascadeController:
             self.weak_converged_count = 0
             self.gain_snr_history.clear()
 
+    def set_filter_override(self, mode):
+        """手動フィルタ固定 (hyper互換)。Noneで自動へ復帰。"""
+        self.filter_override = mode
+        # 数tickは自動切替を抑止して手動設定を定着させる
+        self._filter_hold_ticks = 10
+
     def process_frame(self, raw_bytes: np.ndarray, spectrum_db: np.ndarray = None):
         """
         毎フレームの生データとスペクトルから多段カスケードフィードバックを実行
@@ -148,10 +162,12 @@ class CascadeController:
             self.gain_snr_history[current_idx] = self.snr_smooth
 
             # --- A. 緊急サチュレーション回避 (本物のクリップ 1.2% 以上時のみ安全に減衰) ---
+            # 持続する強クリップ(>2.5%)ではFLOOR(12.5dB)までの非常減衰を許可し永久クリップを解消
             if clip_pct > 1.2:
-                # クリップ時は即座に1〜2段下げる (ただし安全最低ゲイン未満には下げない)
+                # クリップ時は即座に1〜2段下げる (通常は安全最低ゲイン未満には下げない)
                 step_down = 2 if clip_pct > 2.5 else 1
-                new_idx = max(min_idx, current_idx - step_down)
+                floor_idx = self._floor_idx() if clip_pct > 2.5 else min_idx
+                new_idx = max(floor_idx, current_idx - step_down)
                 if new_idx != current_idx:
                     self.current_gain_idx = new_idx
                     self.driver.set_gain(self.available_gains[self.current_gain_idx])
@@ -239,6 +255,14 @@ class CascadeController:
         else:
             target_filter = "clean"
 
+        # 手動フィルタ固定の尊重: GUIからの手動設定は次tickで上書きしない
+        # (main.py FILTERハンドラがdsp.filter_modeへ直書きするため、ここでは
+        #  自動切替を1tick見送ることで定着させる。hyperのfilter_override相当の簡易版)
+        if self.filter_override is not None:
+            target_filter = self.filter_override
+        if getattr(self, "_filter_hold_ticks", 0) > 0:
+            self._filter_hold_ticks -= 1
+            target_filter = self.dsp.filter_mode if hasattr(self.dsp, "filter_mode") else target_filter
         if hasattr(self.dsp, "filter_mode") and self.dsp.filter_mode != target_filter:
             self.dsp.filter_mode = target_filter
 

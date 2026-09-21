@@ -6,6 +6,7 @@ RTL-SDR受信スレッド、DSP復調パイプライン、オーディオ出力�
 """
 
 import sys
+import atexit
 import time
 import threading
 import queue
@@ -19,6 +20,8 @@ from gui import SdrGui, show_message_screen
 from cascade_controller import CascadeController
 from hyper_controller import HyperController
 from auto_tuner import AutoTuner, match_station_name
+from ppm_cal import PpmCalibrator, pick_ppm_stations
+from signal_logger import SignalLogger, is_settled as _sig_settled
 import sw_schedule
 from rt_profile import RtProfile
 from config import (load_config, save_config, detect_country, detect_language,
@@ -88,6 +91,15 @@ class SdrApp:
         self.use_controller = True
         # 自動選局・スキャンエンジン
         self.tuner = AutoTuner(self.driver)
+        # ドングルPPM自動較正器 (放送搬送波を基準に背景収集)
+        self.ppm_cal = PpmCalibrator()
+        self._ppm_last_tick = 0.0
+        # 信号健康ロガー (特定局の揺れ切り分け用)
+        self.sig_logger = SignalLogger()
+        self._siglog_last = 0.0
+        self._ppm_dwell_freq = None
+        self._ppm_dwell_since = 0.0
+        self._ppm_prev_afc = 0.0
 
         # スレッド間通信用
         self.cmd_queue = queue.Queue()
@@ -108,6 +120,7 @@ class SdrApp:
         self.gui.on_seek_change = lambda d: self.cmd_queue.put(("SEEK", d))
         self.gui.on_scan_request = lambda: self.cmd_queue.put(("SCAN", None))
         self.gui.on_sw_scan_request = lambda: self.cmd_queue.put(("SW_SCAN", None))
+        self.gui.on_ppm_cal_request = lambda: self.cmd_queue.put(("PPM_CAL", None))
         self.gui.on_stereo_toggle = lambda: self.cmd_queue.put(("STEREO_TOGGLE", None))
         self.gui.on_nr_toggle = lambda: self.cmd_queue.put(("NR_TOGGLE", None))
         self.gui.on_bfo_change = lambda d: self.cmd_queue.put(("BFO", d))
@@ -167,7 +180,8 @@ class SdrApp:
         if not fm:
             return
         fm_presets = [
-            {"name": f"{s['freq_mhz']:.1f}", "freq_hz": int(s["freq_hz"]), "mode": "WFM"}
+            {"name": f"{s['freq_mhz']:.1f}", "freq_hz": int(s["freq_hz"]),
+             "mode": s.get("mode", "WFM") if isinstance(s.get("mode"), str) else "WFM"}
             for s in fm
         ]
         fm_presets.sort(key=lambda p: p["freq_hz"])
@@ -193,7 +207,8 @@ class SdrApp:
                 pass
             if not name:
                 name = f"{shortwave_band_name(s['freq_hz'])} {s['freq_mhz']:.2f}"
-            am_presets.append({"name": name, "freq_hz": int(s["freq_hz"]), "mode": "AM"})
+            am_mode = s.get("mode", "AM") if isinstance(s.get("mode"), str) else "AM"
+            am_presets.append({"name": name, "freq_hz": int(s["freq_hz"]), "mode": am_mode})
         am_presets.sort(key=lambda p: p["freq_hz"])
         self.config["presets_am"] = am_presets
         self.config["presets_region"] = self.profile["region"]
@@ -213,6 +228,17 @@ class SdrApp:
 
         self.driver.set_sample_rate(self.sample_rate)
         self._apply_frequency_and_mode(self.freq, self.mode)
+
+        # 保存済みPPM較正値をドングルへ適用 (HW不可時はSWフォールバック)
+        # 旧式ドライバ (set_ppm_correction欠落) では何もしない
+        try:
+            saved_ppm = self.config.get("ppm")
+            apply = getattr(self.driver, "set_ppm_correction", None)
+            if callable(apply) and isinstance(saved_ppm, (int, float)) and saved_ppm != 0:
+                hw = apply(int(saved_ppm))
+                print(f"[*] PPM correction {int(saved_ppm)} applied ({'HW' if hw else 'SW fallback'})")
+        except Exception as e:
+            print(f"[WARN] PPM restore failed: {e}", file=sys.stderr)
 
         # コントローラ初期化
         self.controller.init_gains()
@@ -322,6 +348,72 @@ class SdrApp:
     def set_gain(self, auto_gain: bool, gain_val: float):
         self.cmd_queue.put(("GAIN", (auto_gain, gain_val)))
 
+    def _ppm_background_tick(self, now: float):
+        """PPM背景収集 (ワーカーから2秒毎)。強力FMステレオ局のAFC定常残差を
+        標本化し、3局以上たまれば中央値PPMを推定・適用・保存する。
+        選局・スキャン中は標本化しない (AFC収束前の残差は無効)。"""
+        try:
+            dsp = self.dsp
+            # 参照に使えるのはWFM放送帯の強力ステレオ局のみ
+            if self.mode != "WFM" or self.freq < 24000000:
+                self._ppm_dwell_freq = None
+                return
+            if not bool(getattr(dsp, "afc_enabled", False)):
+                self._ppm_dwell_freq = None
+                return
+            if not bool(getattr(dsp, "is_stereo", False)):
+                self._ppm_dwell_freq = None
+                return
+            if abs(float(getattr(dsp, "stereo_pilot_lock", 0.0))) < 0.6:
+                self._ppm_dwell_freq = None
+                return
+            if float(getattr(dsp, "s_units", 0.0)) < 6.0:
+                self._ppm_dwell_freq = None
+                return
+            afc = float(getattr(dsp, "afc_offset_hz", 0.0))
+            # 同一周波数への滞留・AFC定常を要求 (収束前残差の混入防止)
+            if self._ppm_dwell_freq != self.freq:
+                self._ppm_dwell_freq = self.freq
+                self._ppm_dwell_since = now
+                self._ppm_prev_afc = afc
+                return
+            if now - self._ppm_dwell_since < 10.0:
+                self._ppm_prev_afc = afc
+                return
+            if abs(afc - self._ppm_prev_afc) > 30.0:
+                # まだ収束途中: 今回は見送り、次tickへ
+                self._ppm_prev_afc = afc
+                return
+            self._ppm_prev_afc = afc
+            n = self.ppm_cal.collect(self.freq, afc)
+            self._ppm_try_apply(n, "background")
+        except Exception as e:
+            print(f"[WARN] PPM estimate failed: {e}", file=sys.stderr)
+
+    def _ppm_try_apply(self, n: int, source: str) -> bool:
+        """推定→適用→保存の共通後段。適用したらTrue (標本破棄・集め直し)。"""
+        ppm, _, confident = self.ppm_cal.estimate()
+        if not confident or ppm is None:
+            return False
+        get_ppm = getattr(self.driver, "get_ppm_correction", None)
+        set_ppm = getattr(self.driver, "set_ppm_correction", None)
+        if not callable(get_ppm) or not callable(set_ppm):
+            return False  # 旧式ドライバでは較正しない
+        cur = int(get_ppm())
+        new = int(round(ppm))
+        if abs(new - cur) < 1 or abs(new) > PpmCalibrator.MAX_PPM:
+            return False
+        hw = set_ppm(new)
+        self.config["ppm"] = new
+        save_config(self.config)
+        print(f"[*] PPM auto-calibrated ({source}): {cur} -> {new} "
+              f"({n} stations, {'HW' if hw else 'SW fallback'})")
+        self.gui.scan_status_text = t("ppm_done", ppm=new, n=n)
+        # 補正後は残差基準が変わるため標本を破棄して集め直す
+        self.ppm_cal.clear()
+        self._ppm_dwell_freq = None
+        return True
+
     def _sdr_worker(self):
         """SDRデータ受信 & DSP処理ワーカースレッド"""
         # FTZ/DAZ (denormalジッタ対策) はスレッド単位の設定のため、
@@ -394,30 +486,59 @@ class SdrApp:
             return True
 
         def restore_after_scan():
-            """帯域スキャンで変更された受信パラメータを通常受信状態へ復元"""
-            self.driver.set_sample_rate(self.sample_rate)
-            self._apply_frequency_and_mode(self.freq, self.mode)
-            if self.use_controller:
-                # 自動モード: コントローラの探索へ戻す
-                self.controller.init_gains()
-            elif self.manual_gain_db is not None:
-                # 手動モード: ユーザーが設定した手動ゲインを復元 (スキャン中の33.8dB固定から戻す)
-                try:
-                    self.driver.set_gain_mode(True)
-                    self.driver.set_gain(self.manual_gain_db)
-                except Exception:
-                    pass
+            """帯域スキャンで変更された受信パラメータを通常受信状態へ復元
+            各ステップをベストエフォートで復元し、一部の失敗で全体を諦めない。"""
+            try:
+                self.driver.set_sample_rate(self.sample_rate)
+            except Exception as e:
+                print(f"[ERROR] restore sample_rate failed: {e}", file=sys.stderr)
+            try:
+                self._apply_frequency_and_mode(self.freq, self.mode)
+            except Exception as e:
+                print(f"[ERROR] restore freq/mode failed: {e}", file=sys.stderr)
+            try:
+                if self.use_controller:
+                    # 自動モード: コントローラの探索へ戻す
+                    self.controller.init_gains()
+                elif self.manual_gain_db is not None:
+                    # 手動モード: ユーザーが設定した手動ゲインを復元 (スキャン中の33.8dB固定から戻す)
+                    try:
+                        self.driver.set_gain_mode(True)
+                        self.driver.set_gain(self.manual_gain_db)
+                    except Exception:
+                        pass
+            except Exception as e:
+                print(f"[ERROR] restore gains failed: {e}", file=sys.stderr)
+
+        def _drain_raw_queue():
+            """raw_queueに滞留したスキャン前周波数の古いIQを破棄する。
+            破棄しないと復帰後に数秒の遅延音声・誤スペクトルが出る。"""
+            drained = 0
+            try:
+                while True:
+                    raw_queue.get_nowait()
+                    drained += 1
+            except queue.Empty:
+                pass
+            return drained
 
         def safe_band_scan(status_label: str, auto_best: bool = False):
             """USBストリームを安全に停止して帯域スキャンを実行 (失敗しても必ず復帰)"""
             nonlocal t_usb
             self.gui.scan_status_text = status_label
             if not stop_usb_stream(t_usb):
-                # 旧ストリーム残留: 新スレッドを立てず、旧スレッドの回復に委ねる。
-                # cancel_asyncで_setした _async_stop を必ず解除しないと、
-                # async_usb_loopが即時復帰を繰り返し永久に受信が止まる。
-                self.driver.resume_async()
-                usb_running.set()
+                # 旧スレッドがjoin直後に抜けた可能性がある: 生死を再確認し、
+                # 死んでいれば立て直す。生きていれば回復に委ねる。
+                if not t_usb.is_alive():
+                    try:
+                        t_usb = start_usb_stream()
+                    except Exception as e:
+                        print(f"[ERROR] USB restart failed: {e}", file=sys.stderr)
+                else:
+                    # cancel_asyncで_setした _async_stop を必ず解除しないと、
+                    # async_usb_loopが即時復帰を繰り返し永久に受信が止まる。
+                    self.driver.resume_async()
+                    usb_running.set()
                 self.gui.scan_status_text = "USB busy - scan skipped"
                 return []
             stations = []
@@ -434,6 +555,7 @@ class SdrApp:
                     restore_after_scan()
                 except Exception as e:
                     print(f"[ERROR] Failed to restore receiver after scan: {e}", file=sys.stderr)
+                _drain_raw_queue()
                 t_usb = start_usb_stream()
 
             self.gui.scan_status_text = t("scan_done", n=len(stations))
@@ -463,8 +585,14 @@ class SdrApp:
             nonlocal t_usb
             self.gui.scan_status_text = status_label
             if not stop_usb_stream(t_usb):
-                self.driver.resume_async()
-                usb_running.set()
+                if not t_usb.is_alive():
+                    try:
+                        t_usb = start_usb_stream()
+                    except Exception as e:
+                        print(f"[ERROR] USB restart failed: {e}", file=sys.stderr)
+                else:
+                    self.driver.resume_async()
+                    usb_running.set()
                 self.gui.scan_status_text = "USB busy - scan skipped"
                 return []
             stations = []
@@ -479,6 +607,7 @@ class SdrApp:
                     restore_after_scan()
                 except Exception as e:
                     print(f"[ERROR] Failed to restore receiver after scan: {e}", file=sys.stderr)
+                _drain_raw_queue()
                 t_usb = start_usb_stream()
 
             if not auto_tune_best:
@@ -498,7 +627,92 @@ class SdrApp:
                 self.gui.scan_status_text = t("sw_scan_none")
             return stations
 
+        def safe_ppm_cal():
+            """PPM較正スキャン: 強局リストを順に巡回し、各局でAFC定常残差を
+            標本化して中央値PPMを推定・適用する。USBストリームは継続したまま
+            同調だけ切り替えるため受信は止まらない (音声は巡回局に追従する)。
+            終了後は元の選局へ復帰する。"""
+            # 局リストが無ければ先にFM帯スキャン (USB安全停止・復帰つき)
+            if not self.tuner.discovered_stations:
+                safe_band_scan(t("scanning", start=f"{self.profile['fm_start']:g}",
+                                 end=f"{self.profile['fm_end']:g}"))
+            cands = pick_ppm_stations(self.tuner.discovered_stations, n=5)
+            if len(cands) < PpmCalibrator.MIN_SAMPLES:
+                self.gui.scan_status_text = t("ppm_none")
+                return []
+            saved_freq, saved_mode = self.freq, self.mode
+            self.ppm_cal.clear()
+            self.gui.scan_status_text = t("ppm_scanning", n=len(cands))
+            # 高速収束のためAFC追従を一時的に強める (終了後に復元)
+            afc_was = bool(getattr(self.dsp, "afc_enabled", True))
+            alpha_was = float(getattr(self.dsp, "afc_alpha", 0.05))
+            self.dsp.afc_enabled = True
+            try:
+                self.dsp.afc_alpha = 0.20
+            except Exception:
+                pass
+            collected = 0
+            try:
+                for st in cands:
+                    if not self.running:
+                        break
+                    self._apply_frequency_and_mode(int(st["freq_hz"]), "WFM")
+                    self.gui.center_freq = self.freq
+                    afc_prev = None
+                    stable_since = None
+                    t_start = time.monotonic()
+                    settled = False
+                    while self.running and (time.monotonic() - t_start) < 6.0:
+                        try:
+                            raw_bytes = raw_queue.get(timeout=0.5)
+                        except queue.Empty:
+                            continue
+                        try:
+                            self.dsp.update_resampler_feedback(
+                                float(self.audio.get_queue_size()))
+                            t_dsp = time.perf_counter()
+                            audio_pcm, spectrum_db = self.dsp.process(
+                                raw_bytes, mode="WFM")
+                            self.rt_profile.add((time.perf_counter() - t_dsp) * 1000.0)
+                            self.audio.put_audio(audio_pcm)
+                            with self.spectrum_lock:
+                                self.latest_spectrum = spectrum_db
+                                self.latest_audio = audio_pcm
+                        except Exception:
+                            continue
+                        afc = float(getattr(self.dsp, "afc_offset_hz", 0.0))
+                        now_m = time.monotonic()
+                        if afc_prev is not None and abs(afc - afc_prev) < 30.0:
+                            if stable_since is None:
+                                stable_since = now_m
+                            elif now_m - stable_since >= 1.0:
+                                settled = True
+                                break
+                        else:
+                            stable_since = None
+                        afc_prev = afc
+                    if settled:
+                        collected = self.ppm_cal.collect(int(st["freq_hz"]), afc)
+            finally:
+                try:
+                    self.dsp.afc_enabled = afc_was
+                    self.dsp.afc_alpha = alpha_was
+                except Exception:
+                    pass
+                try:
+                    self._apply_frequency_and_mode(saved_freq, saved_mode)
+                    self.gui.center_freq = self.freq
+                    self.gui.mode = self.mode
+                except Exception as e:
+                    print(f"[ERROR] PPM cal restore failed: {e}", file=sys.stderr)
+            if collected >= PpmCalibrator.MIN_SAMPLES:
+                self._ppm_try_apply(collected, "scan")
+            else:
+                self.gui.scan_status_text = t("ppm_none")
+            return collected
+
         t_usb = start_usb_stream()
+        self._worker_t0 = time.monotonic()
 
         while self.running:
             # コマンドキューの処理 (陳腐化合体: 連続FREQ等は最新のみ適用)
@@ -555,14 +769,15 @@ class SdrApp:
                         if val == "auto":
                             # 適応制御へ復帰 (Hyperはoverride解除、dspは既定モードへ)
                             self.dsp.filter_mode = "clean"
-                            if self.controller_type == "hyper" and hasattr(self.controller, "set_filter_override"):
+                            if hasattr(self.controller, "set_filter_override"):
                                 self.controller.set_filter_override(None)
                             if self.controller_type == "hyper" and hasattr(self.controller, "reset_tracking"):
                                 self.controller.reset_tracking()
                         else:
                             self.dsp.filter_mode = val
                             # Cascade式の離散モード切替ではなく、Hyperは連続カットオフの手動固定として反映
-                            if self.controller_type == "hyper" and hasattr(self.controller, "set_filter_override"):
+                            # cascadeにもfilter_overrideを移植したため共通で呼ぶ
+                            if hasattr(self.controller, "set_filter_override"):
                                 self.controller.set_filter_override(val)
                     elif cmd == "SEEK":
                         # 次局/前局シーク (AM/短波ではSW局リスト、FM/その他ではFM局リスト)
@@ -570,23 +785,38 @@ class SdrApp:
                         use_sw = (self.freq < 24000000)
                         # 初回シークは局リストが無いため帯域スキャンが必要
                         # (USBストリームを安全に停止しないとread_syncが競合・ハングする)
-                        if not (self.tuner.discovered_sw if use_sw else self.tuner.discovered_stations):
-                            if use_sw:
-                                # シーク用スキャン: 同調/モード変更をしない
+                        is_sw = (self.mode in ("AM", "USB", "LSB", "CW")) or (self.freq < 24000000)
+                        if is_sw:
+                            if not self.tuner.discovered_sw:
                                 safe_hf_scan(t("first_seek_scan"), auto_tune_best=False)
-                            else:
+                            st = self.tuner.seek_next(self.freq, direction=direction, use_sw=True)
+                            if st:
+                                # WFM/NFMのまま短波へ飛ぶと無音/誤復調のためAMへ補正
+                                next_mode = self.mode if self.mode in ("AM", "USB", "LSB", "CW") else "AM"
+                                self._apply_frequency_and_mode(st["freq_hz"], next_mode)
+                                self.gui.center_freq = self.freq
+                                self.gui.scan_status_text = t("tuned", freq=f"{st.get('freq_mhz', st['freq_hz'] / 1e6):.3f}", snr=f"{st['snr_db']:+.1f}")
+                        else:
+                            # 初回シークは局リストが無いため帯域スキャンが必要
+                            # (USBストリームを安全に停止しないとread_syncが競合・ハングする)
+                            if not self.tuner.discovered_stations:
                                 safe_band_scan(t("first_seek_scan"))
-                        st = self.tuner.seek_next(self.freq, direction=direction, use_sw=use_sw)
-                        if st:
-                            self._apply_frequency_and_mode(st["freq_hz"], self.mode)
-                            self.gui.center_freq = self.freq
-                            self.gui.scan_status_text = t("tuned", freq=f"{st['freq_mhz']:.2f}", snr=f"{st['snr_db']:+.1f}")
+                            st = self.tuner.seek_next(self.freq, direction=direction, use_sw=False)
+                            if st:
+                                # AM系のままFM帯へ飛ぶと誤復調のためWFMへ補正
+                                next_mode = self.mode if self.mode in ("WFM", "NFM") else "WFM"
+                                self._apply_frequency_and_mode(st["freq_hz"], next_mode)
+                                self.gui.center_freq = self.freq
+                                self.gui.scan_status_text = t("tuned", freq=f"{st['freq_mhz']:.2f}", snr=f"{st['snr_db']:+.1f}")
                     elif cmd == "SCAN":
                         # 全帯域スキャン (USBストリームを安全に停止してスイープ)
                         safe_band_scan(t("scanning", start=f"{self.profile['fm_start']:g}", end=f"{self.profile['fm_end']:g}"), auto_best=(val == "auto_best"))
                     elif cmd == "SW_SCAN":
                         # 短波(HF)放送バンドスキャン (ダイレクトサンプリング)
                         safe_hf_scan(t("sw_scanning"))
+                    elif cmd == "PPM_CAL":
+                        # PPM較正スキャン (強局巡回・ストリーム継続のまま同調だけ切替)
+                        safe_ppm_cal()
                     elif cmd == "STEREO_TOGGLE":
                         enabled = not bool(getattr(self.dsp, "stereo_enabled", True))
                         self.dsp.set_stereo_enabled(enabled)
@@ -721,6 +951,41 @@ class SdrApp:
                 # 音声キューへ転送
                 self.audio.put_audio(audio_pcm)
 
+                # 信号健康ログ (1Hz。特定局の揺れ切り分け用 signal_log.csv)
+                # 起動・選局の過渡 (AFC収束前) はブランキングして記録しない
+                try:
+                    now_sig = time.time()
+                    if now_sig - getattr(self, "_siglog_last", 0.0) >= 1.0:
+                        self._siglog_last = now_sig
+                        d = self.dsp
+                        if _sig_settled(time.monotonic(),
+                                        getattr(d, "_tune_monotonic", 0.0),
+                                        getattr(self, "_worker_t0", 0.0)):
+                            self.sig_logger.log({
+                            "freq_hz": self.freq,
+                            "mode": self.mode,
+                            "gain_db": getattr(self.gui, "gain_val", 0.0),
+                            "pilot_lock": getattr(d, "stereo_pilot_lock", 0.0),
+                            "blend": getattr(d, "stereo_blend", 0.0),
+                            "nr_gain": getattr(d, "stereo_nr_gain", 1.0),
+                            "cut_hz": getattr(d, "stereo_cut_hz", 0.0),
+                            "wiener_gain": getattr(d, "stereo_wiener_gain", 1.0),
+                            "multipath_gain": getattr(d, "multipath_gain", 1.0),
+                            "afc_hz": getattr(d, "afc_offset_hz", 0.0),
+                            "s_units": getattr(d, "s_units", 0.0),
+                        })
+                except Exception:
+                    pass
+
+                # PPM自動較正の背景収集 (2秒間隔。強力FM局のAFC残差を標本化)
+                try:
+                    now_ppm = time.time()
+                    if now_ppm - getattr(self, "_ppm_last_tick", 0.0) >= 2.0:
+                        self._ppm_last_tick = now_ppm
+                        self._ppm_background_tick(now_ppm)
+                except Exception as e:
+                    print(f"[WARN] PPM tick failed: {e}", file=sys.stderr)
+
                 # スペクトラム・波形データの更新
                 with self.spectrum_lock:
                     self.latest_spectrum = spectrum_db
@@ -772,9 +1037,9 @@ class SdrApp:
 
                 with self.spectrum_lock:
                     spec_copy = self.latest_spectrum.copy()
-                    audio_ref = self.latest_audio
+                    audio_copy = self.latest_audio.copy()
 
-                self.gui.render(spec_copy, audio_ref)
+                self.gui.render(spec_copy, audio_copy)
 
         except KeyboardInterrupt:
             pass
@@ -790,9 +1055,19 @@ class SdrApp:
                           file=sys.stderr)
                     self.sdr_thread.join(timeout=5.0)
                     if self.sdr_thread.is_alive():
-                        print("[WARN] SDR worker did not exit; tearing down anyway "
-                              "(device handle kept safe by driver.close guard)",
+                        print("[WARN] SDR worker did not exit; skipping driver.close "
+                              "to avoid use-after-close (retry on next start)",
                               file=sys.stderr)
+                        try:
+                            self.audio.stop()
+                        except Exception:
+                            pass
+                        try:
+                            self.gui.close()
+                        except Exception:
+                            pass
+                        print("[*] Exited (driver left open for stuck worker).")
+                        return
             self.audio.stop()
             self.driver.close()
             self.gui.close()
@@ -804,6 +1079,7 @@ def _setup_stdout_log():
     try:
         if sys.stdout is None or sys.stderr is None:
             logf = open(LOG_PATH, "w", encoding="utf-8", buffering=1)
+            atexit.register(logf.close)
             sys.stdout = logf
             sys.stderr = logf
     except Exception:

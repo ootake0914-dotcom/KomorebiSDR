@@ -104,6 +104,7 @@ def main() -> int:
             {"freq_hz": 83200000, "freq_mhz": 83.2, "name": "83.2", "snr_db": 30.0,
              "peak_power_db": -30.0, "afc_offset_hz": 0.0, "quality": "STRONG"},
         ]
+        app.tuner.last_scan_time = time.time()
         return list(app.tuner.discovered_stations)
 
     app.tuner.scan_band = fake_scan
@@ -115,12 +116,17 @@ def main() -> int:
         pygame.event.post(pygame.event.Event(pygame.MOUSEBUTTONDOWN, pos=(x, y), button=1))
         pygame.event.post(pygame.event.Event(pygame.MOUSEBUTTONUP, pos=(x, y), button=1))
 
+    def click_scan():
+        # ハードコード座標ではなく実ボタン矩形中心を押す (レイアウト変更に頑健)
+        r = app.gui.btn_scan_band.rect
+        click(r.centerx, r.centery)
+
     def script():
         try:
             time.sleep(2.0)
             assert frames[0] > 5, f"no frames processed before scan: {frames[0]}"
 
-            click(966, 347)  # scan button (glass layout)
+            click_scan()  # scan button (glass layout)
             time.sleep(1.5)
             assert len(scans) == 1 and scans[0] is False, f"scan raced with async: {scans}"
             f1 = frames[0]
@@ -128,7 +134,7 @@ def main() -> int:
             assert frames[0] > f1, "streaming did not resume after scan"
 
             fake.fail_sync = True
-            click(966, 347)
+            click_scan()
             time.sleep(2.0)
             assert len(scans) == 2 and scans[1] is False, f"failed scan raced: {scans}"
             f2 = frames[0]

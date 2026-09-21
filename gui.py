@@ -257,6 +257,7 @@ class SdrGui:
         self.on_seek_change = None      # lambda direction: ...
         self.on_scan_request = None     # lambda: ...
         self.on_sw_scan_request = None  # lambda: ...
+        self.on_ppm_cal_request = None  # lambda: ...
         self.on_stereo_toggle = None    # lambda: ...
         self.on_nr_toggle = None        # lambda: ...
         self.on_bfo_change = None       # lambda delta_hz: ...
@@ -430,8 +431,9 @@ class SdrGui:
 
     def set_presets(self, presets_fm: list, presets_am: list):
         """スキャン結果などからプリセットボタンを再構築する。
-        破損エントリ (freq_hz欠落等) は除去してKeyErrorを防止。空呼出しでは
-        既存ボタンを維持する (全消去は明示的な空リスト再構築時のみ)。"""
+        破損エントリ (freq_hz欠落・範囲外・未知mode) は除去してKeyErrorを防止。
+        Noneでは既存ボタンを維持する (FM/SW両スキャンの片側維持用)。
+        空リスト[]は明示的全消去として扱う。"""
         fm = self._clean_presets(presets_fm, "WFM")
         am = self._clean_presets(presets_am, "AM")
         if presets_fm is not None:
@@ -474,6 +476,7 @@ class SdrGui:
 
     @staticmethod
     def _clean_presets(items, default_mode: str) -> list:
+        valid_modes = {"WFM", "AM", "NFM", "USB", "LSB", "CW"}
         out = []
         for p in (items or []):
             if not isinstance(p, dict):
@@ -481,9 +484,14 @@ class SdrGui:
             f = p.get("freq_hz")
             if isinstance(f, bool) or not isinstance(f, (int, float)):
                 continue
+            fi = int(f)
+            if not (100000 <= fi <= 1750000000):
+                continue
             m = p.get("mode", default_mode)
-            out.append({"freq_hz": int(f), "name": str(p.get("name", "?")),
-                        "mode": m if isinstance(m, str) else default_mode})
+            if not isinstance(m, str) or m not in valid_modes:
+                m = default_mode
+            out.append({"freq_hz": fi, "name": str(p.get("name", "?")),
+                        "mode": m})
         return out
 
     def _init_controls(self):
@@ -503,12 +511,17 @@ class SdrGui:
                                     bg_color=(226, 235, 248), active_color=C_BTN_ACTIVE2)
         self.btn_seek_next = Button((tx + half + 6, 300, half, 28), "Auto Seek >>", lambda: self._seek(1),
                                     bg_color=(226, 235, 248), active_color=C_BTN_ACTIVE2)
-        fm_w = int(tw * 0.55)
+        fm_w = int((tw - 12) * 0.45)
+        sw_w = int((tw - 12) * 0.33)
         self.btn_scan_band = Button((tx, 332, fm_w, 30), t("scan_button"), self._request_scan,
                                     bg_color=(214, 240, 229), active_color=C_ACCENT)
-        self.btn_scan_sw = Button((tx + fm_w + 6, 332, tw - fm_w - 6, 30), t("scan_sw_button"),
+        self.btn_scan_sw = Button((tx + fm_w + 6, 332, sw_w, 30), t("scan_sw_button"),
                                    self._request_sw_scan, bg_color=(226, 236, 248), active_color=C_ACCENT)
-        btns.extend([self.btn_seek_prev, self.btn_seek_next, self.btn_scan_band, self.btn_scan_sw])
+        self.btn_ppm_cal = Button((tx + fm_w + sw_w + 12, 332, tw - fm_w - sw_w - 12, 30),
+                                  t("ppm_button"), self._request_ppm_cal,
+                                  bg_color=(240, 230, 250), active_color=C_ACCENT)
+        btns.extend([self.btn_seek_prev, self.btn_seek_next, self.btn_scan_band, self.btn_scan_sw,
+                     self.btn_ppm_cal])
         # 検出局プルダウン (25局でもワンクリック選局)
         self.btn_station_list = Button((tx, 360, tw, 20), "▼ 検出局 (0)",
                                        self._toggle_station_list,
@@ -597,6 +610,14 @@ class SdrGui:
             self.on_mode_change(self.mode)
 
     def _toggle_gain_auto(self):
+        # クリック直後に暫定表示を即時反映し、worker/statsで確定上書きする (DX/AFCと同パターン)
+        try:
+            if bool(getattr(self, "is_auto_gain", True)):
+                self.btn_gain_auto.text = "切替中…"
+            else:
+                self.btn_gain_auto.text = "探索中…"
+        except Exception:
+            pass
         if self.on_gain_lock_toggle:
             self.on_gain_lock_toggle()
         elif self.on_gain_change:
@@ -612,6 +633,9 @@ class SdrGui:
         idx = max(min_idx, min(len(self.gains_list) - 1, idx + dir_step))
         self.gain_val = self.gains_list[idx]
         self.is_hard_locked = True
+        # worker側GAINハンドラと同一値を即時反映し、ヘッダー表示乖離を防ぐ
+        self.is_auto_gain = False
+        self.manual_gain_db = float(self.gain_val)
         self.btn_gain_auto.text = f"手動 {self.gain_val:.1f}dB"
         self.btn_gain_auto.bg_color = (216, 240, 230)
         if self.on_gain_change:
@@ -649,6 +673,10 @@ class SdrGui:
             self.scan_status_text = t("sw_scanning")
             self.on_sw_scan_request()
 
+    def _request_ppm_cal(self):
+        if self.on_ppm_cal_request:
+            self.on_ppm_cal_request()
+
     # ---- 検出局プルダウン ----
     _SL_ROW_H = 26
     _SL_HEADER_H = 30
@@ -677,20 +705,30 @@ class SdrGui:
         """プルダウン開閉中のクリック処理。消費したらTrue。"""
         if not self.station_list_open:
             return False
+        # ワーカーによる detected_stations 差し替えとのレース防止: スナップショットで一貫参照
+        sts = list(self.detected_stations) if self.detected_stations else []
         panel, rows, total = self._station_list_layout()
+        # レイアウトが旧リスト長で計算される場合に備え、スナップショット長で補正
+        total = len(sts)
         start = max(0, min(self.station_list_scroll, max(0, total - len(rows))))
         for i, rc in enumerate(rows):
             if rc.collidepoint(mx, my):
                 idx = start + i
                 if 0 <= idx < total:
-                    st = self.detected_stations[idx]
-                    self.center_freq = int(st["freq_hz"])
-                    self.scan_status_text = (
-                        f"局リスト選局: {st.get('name', '')} "
-                        f"({st.get('freq_mhz', st['freq_hz'] / 1e6):.2f}MHz, "
-                        f"SNR:+{st.get('snr_db', 0.0):.1f}dB)")
-                    if self.on_freq_change:
-                        self.on_freq_change(self.center_freq)
+                    try:
+                        st = sts[idx]
+                        fh = st.get("freq_hz")
+                        if fh is None:
+                            continue
+                        self.center_freq = int(fh)
+                        self.scan_status_text = (
+                            f"局リスト選局: {st.get('name', '')} "
+                            f"({st.get('freq_mhz', float(fh) / 1e6):.2f}MHz, "
+                            f"SNR:+{st.get('snr_db', 0.0):.1f}dB)")
+                        if self.on_freq_change:
+                            self.on_freq_change(self.center_freq)
+                    except Exception:
+                        pass
                 self.station_list_open = False
                 return True
         # パネル外クリックで閉じる
@@ -712,16 +750,26 @@ class SdrGui:
         self.screen.blit(title, (panel.x + 14, panel.y + 6))
         start = max(0, min(self.station_list_scroll, max(0, total - len(rows))))
         cur = int(self.center_freq)
+        sts_draw = list(self.detected_stations)
         for i, rc in enumerate(rows):
             idx = start + i
-            if idx >= total:
+            if idx >= total or idx >= len(sts_draw):
                 break
-            st = self.detected_stations[idx]
-            sel = abs(int(st["freq_hz"]) - cur) < 50000
+            try:
+                st = sts_draw[idx]
+                fh = st.get("freq_hz")
+                if fh is None:
+                    continue
+                sel = abs(int(fh) - cur) < 50000
+            except Exception:
+                continue
             if sel:
                 pygame.draw.rect(self.screen, (214, 236, 248), rc, border_radius=6)
             name = str(st.get("name", ""))[:18]
-            freq = st.get("freq_mhz", st["freq_hz"] / 1e6)
+            try:
+                freq = st.get("freq_mhz", float(st.get("freq_hz", 0)) / 1e6)
+            except Exception:
+                freq = 0.0
             snr = st.get("snr_db", 0.0)
             line = cached_text(self.font_small, f"{name}  {freq:.2f}MHz  +{snr:.1f}dB",
                                (30, 50, 80))
@@ -732,10 +780,19 @@ class SdrGui:
             self.screen.blit(hint, (panel.x + 14, panel.bottom - 20))
 
     def _toggle_stereo(self):
+        # worker往復まで無反応に見えるため表示だけ楽観更新 (実権はworker)
+        try:
+            self.set_stereo_enabled(not bool(getattr(self, "stereo_enabled", True)))
+        except Exception:
+            pass
         if self.on_stereo_toggle:
             self.on_stereo_toggle()
 
     def _toggle_nr(self):
+        try:
+            self.set_nr_enabled(not bool(getattr(self, "nr_enabled", True)))
+        except Exception:
+            pass
         if self.on_nr_toggle:
             self.on_nr_toggle()
 
@@ -823,7 +880,9 @@ class SdrGui:
             if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                 mx, my = event.pos
                 if self.station_list_open:
+                    # モーダル消費時は下層ボタン/同調へ素通りさせない
                     self._station_list_click(mx, my)
+                    continue
                 elif self.spec_rect.collidepoint(mx, my) or self.wf_rect.collidepoint(mx, my):
                     w = self.spec_rect.width
                     ratio = (mx - self.spec_rect.x) / w if w > 0 else 0.5
@@ -832,35 +891,53 @@ class SdrGui:
 
                     snapped_station = None
                     min_dist = float("inf")
-                    for st in self.detected_stations:
-                        dist_hz = abs(st["freq_hz"] - clicked_freq)
-                        if dist_hz <= 45000 and dist_hz < min_dist:
-                            min_dist = dist_hz
-                            snapped_station = st
+                    for st in list(self.detected_stations):
+                        try:
+                            fh = st.get("freq_hz")
+                            if fh is None:
+                                continue
+                            dist_hz = abs(float(fh) - clicked_freq)
+                            if dist_hz <= 45000 and dist_hz < min_dist:
+                                min_dist = dist_hz
+                                snapped_station = st
+                        except Exception:
+                            continue
 
                     if snapped_station:
-                        self.center_freq = snapped_station["freq_hz"]
-                        self.scan_status_text = (f"局吸着同調: {snapped_station['name']} "
-                                                 f"({snapped_station['freq_mhz']:.2f}MHz, SNR:+{snapped_station['snr_db']}dB)")
+                        try:
+                            self.center_freq = int(snapped_station.get("freq_hz", self.center_freq))
+                            self.scan_status_text = (f"局吸着同調: {snapped_station.get('name', '')} "
+                                                     f"({snapped_station.get('freq_mhz', float(self.center_freq) / 1e6):.2f}MHz, SNR:+{snapped_station.get('snr_db', 0.0)}dB)")
+                        except Exception:
+                            pass
                     else:
                         # 第2段: liveピーク吸着 (スキャン不要。30kHz以内で正確周波数へ)
                         best_pk = None
                         best_pd = 30000.0
-                        for pk in self.live_peaks:
-                            pd = abs(pk["freq_hz"] - clicked_freq)
-                            if pd < best_pd:
-                                best_pd = pd
-                                best_pk = pk
+                        for pk in list(self.live_peaks):
+                            try:
+                                pf = pk.get("freq_hz")
+                                if pf is None:
+                                    continue
+                                pd = abs(float(pf) - clicked_freq)
+                                if pd < best_pd:
+                                    best_pd = pd
+                                    best_pk = pk
+                            except Exception:
+                                continue
                         if best_pk is not None:
                             try:
                                 from auto_tuner import match_station_name
-                                pk_name = match_station_name(int(best_pk["freq_hz"]))
+                                pk_name = match_station_name(int(best_pk.get("freq_hz", 0)))
                             except Exception:
                                 pk_name = ""
-                            self.center_freq = int(best_pk["freq_hz"])
-                            self.scan_status_text = (
-                                f"ピーク同調: {pk_name} "
-                                f"({best_pk['freq_hz'] / 1e6:.2f}MHz, SNR:+{best_pk['snr_db']:.1f}dB)")
+                            try:
+                                self.center_freq = int(best_pk.get("freq_hz", self.center_freq))
+                                self.scan_status_text = (
+                                    f"ピーク同調: {pk_name} "
+                                    f"({float(best_pk.get('freq_hz', 0)) / 1e6:.2f}MHz, SNR:+{float(best_pk.get('snr_db', 0.0)):.1f}dB)")
+                            except Exception:
+                                pass
                         else:
                             self.center_freq = int(round(clicked_freq / 10000) * 10000)
 
@@ -1184,16 +1261,22 @@ class SdrGui:
         # 検出局マーカー
         f_min = self.center_freq - self.sample_rate / 2
         f_max = self.center_freq + self.sample_rate / 2
-        for st in self.detected_stations:
-            sfreq = st["freq_hz"]
-            if f_min <= sfreq <= f_max:
-                ratio = (sfreq - f_min) / (f_max - f_min)
-                m_x = r.x + int(ratio * r.width)
-                color = (58, 200, 140) if st["quality"] == "STRONG" else (230, 178, 75) if st["quality"] == "MEDIUM" else (186, 130, 210)
-                pygame.draw.polygon(self.screen, color,
-                                    [(m_x, r.y + 16), (m_x - 5, r.y + 6), (m_x + 5, r.y + 6)])
-                lbl = cached_text(self.font_tiny, f"{st['freq_mhz']:.1f}", color)
-                self.screen.blit(lbl, (m_x - 11, r.y + 18))
+        if (f_max - f_min) > 0:
+            for st in list(self.detected_stations):
+                try:
+                    sfreq = st.get("freq_hz")
+                    if sfreq is None:
+                        continue
+                    if f_min <= sfreq <= f_max:
+                        ratio = (sfreq - f_min) / (f_max - f_min)
+                        m_x = r.x + int(ratio * r.width)
+                        color = (58, 200, 140) if st.get("quality") == "STRONG" else (230, 178, 75) if st.get("quality") == "MEDIUM" else (186, 130, 210)
+                        pygame.draw.polygon(self.screen, color,
+                                            [(m_x, r.y + 16), (m_x - 5, r.y + 6), (m_x + 5, r.y + 6)])
+                        lbl = cached_text(self.font_tiny, f"{st.get('freq_mhz', float(sfreq) / 1e6):.1f}", color)
+                        self.screen.blit(lbl, (m_x - 11, r.y + 18))
+                except Exception:
+                    continue
 
         # liveピーク (スキャン不要のワンクリック選局マーカー。5Hz更新)
         try:
