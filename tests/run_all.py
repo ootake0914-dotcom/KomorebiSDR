@@ -20,6 +20,8 @@ TESTS = sorted(
 
 def main() -> int:
     env = dict(os.environ)
+    env["PYTHONUTF8"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
     env["SDL_VIDEODRIVER"] = "dummy"
     env["SDL_AUDIODRIVER"] = "dummy"
     env["PYTHONPATH"] = ROOT + os.pathsep + env.get("PYTHONPATH", "")

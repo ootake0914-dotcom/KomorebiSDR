@@ -245,7 +245,7 @@ class HyperController:
             noise_p = float(np.median(guards))
         else:
             # 実機FM: 強局自身の側波帯/隣接局がガード帯を汚染するため、
-            # 帯域全体の下位25%タイルを雑音床に採用 (ai_sdrと同一の頑健推定)
+            # 帯域全体の下位25%タイルを雑音床に採用 (頑健推定)
             noise_p = float(np.percentile(lin, 25))
         noise_db = 10.0 * np.log10(noise_p + 1e-12)
         mean_snr = 10.0 * np.log10((sig_mean + 1e-12) / (noise_p + 1e-12))

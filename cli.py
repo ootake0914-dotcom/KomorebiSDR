@@ -151,7 +151,7 @@ def main():
         if f_hz < 24000000:
             driver.set_direct_sampling(2)
             # ダイレクトサンプリングはDC付近に巨大スパイクがあるため+150kHzずらす
-            # (main.py/ai_sdr.pyと同一方式。旧実装はoffset=0でスパイクが乗っていた)
+            # (main.pyと同一方式。旧実装はoffset=0でスパイクが乗っていた)
             offset = 150000.0
             driver.set_center_freq(int(f_hz + offset))
         else:
