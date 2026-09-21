@@ -21,6 +21,8 @@ from adaptive_rf import (
     AdaptiveIqCorrector,
     DynamicIfBandwidthTracker,
     UltrasonicSquelchTracker,
+    CyclostationaryFeatureDetector,
+    DigitalSelfInterferenceCanceller,
 )
 from adaptive_demod import (
     DeepSpaceEkfDemodulator,
@@ -71,4 +73,6 @@ __all__ = [
     "TopologicalClickSuppressor",
     "QuaternionMpxDecoupler",
     "BistableStochasticResonator",
+    "CyclostationaryFeatureDetector",
+    "DigitalSelfInterferenceCanceller",
 ]
