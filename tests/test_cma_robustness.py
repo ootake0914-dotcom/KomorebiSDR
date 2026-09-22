@@ -71,7 +71,14 @@ def test_cma_auto_gate_hysteresis():
     pipeline.multipath_amount = 0.9
     assert pipeline._update_cma_auto_gate() is False, "無信号で自動CMAが作動した"
 
+    # 深フェード (lockなし・Sあり): S-meterだけでは作動しない。
+    # 合成deep-fadeでCMA作動時blend 1.00→0.73の劣化を実測したため、
+    # lock必須に締め直し (旧OR条件の廃止)。
     pipeline.s_meter_dbfs = -30.0
+    assert pipeline._update_cma_auto_gate() is False, "lockなしで自動CMAが作動した"
+
+    # 強反射波＋lockあり: 作動する
+    pipeline.stereo_pilot_lock = 0.5
     assert pipeline._update_cma_auto_gate() is True, "強反射波で自動CMAが作動しない"
     pipeline.multipath_amount = 0.20
     assert pipeline._update_cma_auto_gate() is True, "ヒステリシス保持が切れた"

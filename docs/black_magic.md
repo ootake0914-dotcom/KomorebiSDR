@@ -113,6 +113,20 @@ dsp.bm_sr_enabled = True      # C (副経路のみ。スケルチ自動反映な
   `black_magic.adaptive_notch.enabled`＋`dsp.bm_notch_enabled`。
   ハーネスは`--bm notch`。
 
+## CMAゲート締め直し＋2-2評価 ( synth測定に基づく)
+
+- 症状: 77.5MHz実測で`multipath_amount=1.0`飽和→CMAが常時作動。
+  ゲートのS-meter ORバイパスがlock≈0の深フェードでも作動させていた。
+- 測定: 静的/変動/弱エコーではCMAが+0〜+12dB改善。深フェード
+  (lock≈0.15) ではblend 1.00→0.73に悪化。長遅延強エコー
+  (d=40/g=1.2) では0.03でlock 0.18まで悪化。
+- 対策: ゲートをlock>0.2必須＋S-meterは-60dBFS vetoのみに締め直し
+  (使用側の条件も一致)。μは0.03→0.02
+  (長エコーlock 0.18→0.39、短エコー・flutter同等以上)。
+- 2-2 (第二等化器) は**見送り**: 既存CMAと正面競合するため。
+  残る長エコー問題はCMA自体の捕捉問題であり、実録音データが揃ってから
+  CMA側で対処する (別途CMA改善として扱う)。
+
 ## Phase 0実証基盤 (録音IQハーネス＋ゴールデンデータ)
 
 - `python tools/ab_benchmark.py <iq...> [--bm cyclo|rmt|sr|all] [--out json]`:

@@ -572,8 +572,10 @@ class SdrDspPipeline:
         self.multipath_auto_cancel = True
         self._cma_auto = False
         self._cma_taps = 33
-        # μ sweep実測: 0.15は重度で悪化(55dB)、0.03が中度+28dB・クリーン透明の最良点
-        self._cma_mu = 0.03
+        # μは0.03→0.02へ (長遅延強エコー d=40/g=1.2で0.03はlock 0.18・
+        # 0.02は0.39・0.015は0.56。短エコー・flutterは同等以上。
+        # 0.015が最良だが実フラッターの追従速度を残すため0.02を採用)。
+        self._cma_mu = 0.02
         self._cma_w = np.zeros(2 * self._cma_taps, dtype=np.float32)
         self._cma_w[2 * (self._cma_taps // 2)] = 1.0  # 中央タップ=デルタ初期化
         self._cma_hist = np.zeros(self._cma_taps - 1, dtype=np.complex64)
@@ -1038,11 +1040,22 @@ class SdrDspPipeline:
 
         強い反射波でのみ作動し、弱まったら速やかに戻す。手動設定は常に尊重する。
         cognitive無効時は自動介入しない（従来テスト/非認知経路の挙動を保護）。
+        介入条件はパイロットlock>0.2が必須。S-meterだけでの作動
+        (旧OR条件) は、lock≈0の深フェードでCMAが入りっぱなしになり
+        blendを下げる (合成deep-fadeでblend 1.00→0.73を実測) ため廃止。
+        S-meterは-60dBFSのノイズ床 veto としてのみ使う。
         """
         if not self.multipath_auto_cancel or not self.cognitive_enabled:
             self._cma_auto = bool(self.multipath_cancel_enabled)
             return self._cma_auto
-        present = abs(float(self.stereo_pilot_lock)) > 0.2 or float(self.s_meter_dbfs) > -45.0
+        try:
+            lock = abs(float(self.stereo_pilot_lock))
+            s_db = float(self.s_meter_dbfs)
+        except (TypeError, ValueError):
+            lock, s_db = 0.0, -90.0
+        if not (math.isfinite(lock) and math.isfinite(s_db)):
+            lock, s_db = 0.0, -90.0
+        present = lock > 0.2 and s_db > -60.0
         amt = float(self.multipath_amount)
         if self._cma_auto:
             hold = amt >= 0.18 and present
@@ -1110,8 +1123,11 @@ class SdrDspPipeline:
         use_cma = self._update_cma_auto_gate()
         if (use_cma and _NATIVE is not None and NATIVE_CMA
                 and self.multipath_amount > 0.15
-                and (abs(self.stereo_pilot_lock) > 0.2 or self.s_meter_dbfs > -45.0)):
+                and abs(self.stereo_pilot_lock) > 0.2
+                and self.s_meter_dbfs > -60.0):
             # CMA等化 (ハードリミット前。リミット後は包絡線一定で誤差が出ない)。
+            # 信号存在ゲート: lock必須 (S-meterだけでの作動は深フェードで
+            # blendを下げるため廃止。ゲート側と条件を一致させる)。
             # 信号存在ゲート: ノイズ上での無意味な適応・発散を防ぐ。
             iq_if = self._apply_cma(iq_if)
             self.cma_active = True
