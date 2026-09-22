@@ -78,10 +78,8 @@ class SdrApp:
         # オーディオ出力
         self.audio = AudioOutput(self.audio_rate)
         self.audio.set_volume(float(self.config.get("volume", 0.7)))
-        # GUI
+        # GUI (音量は起動時config固定＋システム音量。GUI側に音量概念なし)
         self.gui = SdrGui()
-        # 初期音量をオーディオ出力と同期 (表示と実音量の食い違い防止)
-        self.gui.volume = self.audio.volume
         # 地域表示・スキャン帯域・プリセット
         self.gui.set_region(self.profile["label"], self.profile["fm_start"], self.profile["fm_end"])
         self.gui.scan_status_text = t("idle")

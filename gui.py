@@ -256,16 +256,14 @@ class SdrGui:
         self.info_rect = pygame.Rect(558, 14, 548, 116)
         self.spec_rect = pygame.Rect(14, 142, 800, 200)
         self.wf_rect = pygame.Rect(14, 348, 800, 132)
-        self.wave_rect = pygame.Rect(14, 480, 0, 0)       # 安全ダミー (音量はメーターへ統合)
+        # wave/gainパネルは廃止 (ダミーrectも持たない)。
         self.tele_rect = pygame.Rect(826, 142, 280, 96)
         self.tune_rect = pygame.Rect(826, 246, 280, 234)
-        self.gain_rect = pygame.Rect(826, 480, 0, 0)       # 安全ダミー
         self.preset_rect = pygame.Rect(14, 490, 1092, 174)
         self.status_rect = pygame.Rect(14, 674, 1092, 32)
         self.is_favorite = False
         self.fav_rect = pygame.Rect(self.hero_rect.right - 40, self.hero_rect.y + 10, 26, 24)
-        self.vol_rect = pygame.Rect(self.hero_rect.x + 56, self.hero_rect.y + 100, 110, 14)
-        self.dragging_volume = False
+        # 音量スライダー廃止 (システム音量に一本化。死にコントロール除去)。
 
         self.wf_surface = pygame.Surface((self.wf_rect.width, self.wf_rect.height))
         self.wf_surface.fill((0, 0, 0))
@@ -287,9 +285,8 @@ class SdrGui:
         self.center_freq = 80000000  # 80.0 MHz
         self.sample_rate = 1152000
         self.mode = "WFM"
-        self.volume = 0.5  # 表示用。実音量は起動時config＋システム音量。
-        self.is_hard_locked = False     # 収束決め打ち中フラグ (表示用)
-        self.filter_mode = "clean"      # 常時clean固定 (ボタン廃止)
+        # 音量は起動時config固定＋システム音量 (GUI操作なし)。
+        # is_hard_locked/filter_modeは廃止 (表示更新が消滅したため。状態はworker内のみ)。
         self.current_rssi = -50.0
         self.is_stereo = False
         self.stereo_status = "MONO"
@@ -384,8 +381,7 @@ class SdrGui:
             ("preset", self.preset_rect),
         ):
             self.panels[name] = self._glass(rect.width, rect.height)
-        self.panels["gain"] = (pygame.Surface((1, 1), pygame.SRCALPHA), 0)
-        self.panels["wave"] = (pygame.Surface((1, 1), pygame.SRCALPHA), 0)
+        # 廃止パネル (gain/wave) のダミーは作らない。参照側も削除済み。
         self.panels["spec"] = self._glass(self.spec_rect.width, self.spec_rect.height,
                                           radius=16, tint=(17, 23, 36), dark=True)
         self.panels["wf"] = self._glass(self.wf_rect.width, self.wf_rect.height,
@@ -572,9 +568,14 @@ class SdrGui:
         # ---- 2. ONE-TOUCH DISCOVERY (tune_rect 内にスキャン・シーク・モード配置) ----
         tx, tw = self.tune_rect.x + 14, self.tune_rect.width - 28
         y_scan = self.tune_rect.y + 28
-        self.btn_scan_band = Button((tx, y_scan, tw, 42), t("scan_button"), self._request_scan,
+        # FM/短波スキャンを並列配置 (どちらも常時到達可能にする。片方だけ隠す破綻の修正)
+        half_scan = (tw - 8) // 2
+        self.btn_scan_band = Button((tx, y_scan, half_scan, 42), t("scan_button"), self._request_scan,
                                     bg_color=(196, 238, 226), active_color=C_ACCENT, radius=8)
-        btns.append(self.btn_scan_band)
+        self.btn_scan_sw = Button((tx + half_scan + 8, y_scan, half_scan, 42), t("scan_sw_button"),
+                                  self._request_sw_scan,
+                                  bg_color=(208, 230, 250), active_color=C_ACCENT, radius=8)
+        btns.extend([self.btn_scan_band, self.btn_scan_sw])
 
         # シークボタン (Prev / Next)
         half = (tw - 8) // 2
@@ -623,10 +624,7 @@ class SdrGui:
         self.btn_bfo_up = Button((tx + hw + 8, y_bfo, hw, 22), "BFO +",
                                  lambda: self._step_bfo(50), bg_color=(240, 243, 248), radius=4)
         btns.extend([self.btn_bfo_down, self.btn_bfo_up])
-
-        # 短波スキャンボタン (互換保持)
-        self.btn_scan_sw = Button((0, 0, 0, 0), t("scan_sw_button"), self._request_sw_scan)
-        self.btn_scan_sw.visible = False
+        # 短波スキャンはウェルカムカードから実行 (互換シム廃止)。
 
         # ---- 3. STATION CARDS (preset_rect: どこでも・だれでも・どんなアンテナでも) ----
         self.preset_buttons = []
@@ -846,21 +844,15 @@ class SdrGui:
             if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
                 self.station_list_open = False
 
-            # マウス移動時の桁ホバー検出およびボリュームドラッグ
+            # マウス移動時の桁ホバー検出
             if event.type == pygame.MOUSEMOTION:
                 mx, my = event.pos
                 self.hovered_freq_digit = None
-                if self.dragging_volume:
-                    ratio = np.clip((mx - self.vol_rect.x) / self.vol_rect.width, 0.0, 1.0)
-                    self.volume = float(ratio)
-                elif self.hero_rect.collidepoint(mx, my):
+                if self.hero_rect.collidepoint(mx, my):
                     for rect, step in self.freq_digit_hitboxes:
                         if rect.collidepoint(mx, my):
                             self.hovered_freq_digit = step
                             break
-
-            elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
-                self.dragging_volume = False
 
             # マウスホイールによる周波数同調 (桁単位ホイール同調)
             # pygame2はMOUSEWHEELを出すため、MOUSEBUTTONDOWN(4/5)は旧SDLの
@@ -897,11 +889,6 @@ class SdrGui:
                 mx, my = event.pos
                 if self.fav_rect.collidepoint(mx, my):
                     self.is_favorite = not self.is_favorite
-                    continue
-                elif self.vol_rect.collidepoint(mx, my):
-                    self.dragging_volume = True
-                    ratio = np.clip((mx - self.vol_rect.x) / self.vol_rect.width, 0.0, 1.0)
-                    self.volume = float(ratio)
                     continue
                 elif self.station_list_open:
                     # モーダル消費時は下層ボタン/同調へ素通りさせない
@@ -978,7 +965,6 @@ class SdrGui:
         is_hover_btn = any(btn.visible and btn.rect.collidepoint(mx, my) for btn in self.buttons)
         is_hover_digit = (self.hovered_freq_digit is not None)
         is_hover_fav = self.fav_rect.collidepoint(mx, my)
-        is_hover_vol = self.vol_rect.collidepoint(mx, my)
         # スペクトラム上のホバー周波数 (ワンクリック選局の照準表示)
         if self.spec_rect.collidepoint(mx, my) and self.spec_rect.width > 0:
             sr = self.sample_rate if self.sample_rate > 0 else 1152000
@@ -986,7 +972,7 @@ class SdrGui:
                                   + (mx - self.spec_rect.x) / self.spec_rect.width * sr)
         else:
             self.hover_freq_hz = None
-        if is_hover_btn or is_hover_digit or is_hover_fav or is_hover_vol or self.hover_freq_hz is not None:
+        if is_hover_btn or is_hover_digit or is_hover_fav or self.hover_freq_hz is not None:
             try:
                 pygame.mouse.set_cursor(pygame.SYSTEM_CURSOR_HAND)
             except Exception:
@@ -1246,22 +1232,10 @@ class SdrGui:
             st_col = (206, 240, 226) if status == "STEREO" else (236, 238, 244)
             self._draw_chip(status, badge_x + w1 + 10, base_y + 14, st_col)
 
-        # 下段: 音量スライダー
-        vol_lbl = cached_text(self.font_tiny, "VOL", (120, 138, 160))
-        self.screen.blit(vol_lbl, (self.hero_rect.x + 18, self.hero_rect.y + 102))
-        vr = self.vol_rect
-        pygame.draw.rect(self.screen, (224, 232, 242), (vr.x, vr.y + 4, vr.width, 6), border_radius=3)
-        vol_fill_w = int(self.volume * vr.width)
-        pygame.draw.rect(self.screen, (0, 190, 160), (vr.x, vr.y + 4, vol_fill_w, 6), border_radius=3)
-        knob_cx = vr.x + vol_fill_w
-        pygame.draw.circle(self.screen, (255, 255, 255), (knob_cx, vr.y + 7), 6)
-        pygame.draw.circle(self.screen, (0, 190, 160), (knob_cx, vr.y + 7), 6, 2)
-        vol_pct = cached_text(self.font_tiny, f"{int(self.volume * 100)}%", (90, 110, 135))
-        self.screen.blit(vol_pct, (vr.right + 8, vr.y))
-
+        # 下段の音量スライダーは廃止 (システム音量に一本化)。HI-FI表示のみ残す。
         # オーディオ品質バッジ (HI-FI)
         hi_fi = cached_text(self.font_tiny, "HI-FI AUDIO", (0, 150, 125))
-        self.screen.blit(hi_fi, (vr.right + 48, vr.y))
+        self.screen.blit(hi_fi, (self.hero_rect.x + 18, self.hero_rect.y + 102))
 
         # ============================================================
         # 2. BAND SELECTOR (info_rect: 558, 14, 548, 116)
@@ -1401,40 +1375,8 @@ class SdrGui:
         pygame.draw.line(self.screen, C_GOLD, (cx, r.y + 4), (cx, r.bottom - 4), 1)
 
     def _draw_waveform(self, audio_pcm):
-        self._draw_panel("wave", self.wave_rect)
-        r = self.wave_rect
-        lbl = cached_text(self.font_tiny, t("waveform"), (110, 128, 150))
-        self.screen.blit(lbl, (r.x + 12, r.y + 5))
-        # オーディオモニターステータスバッジ
-        mon_tag = cached_text(self.font_tiny, "HI-FI AUDIO", (60, 160, 140))
-        self.screen.blit(mon_tag, (r.right - mon_tag.get_width() - 14, r.y + 5))
-
-        if audio_pcm is None or len(audio_pcm) < 32:
-            return
-        n = min(len(audio_pcm), 8192)
-        chunk = np.asarray(audio_pcm[-n:], dtype=np.float32)
-        if chunk.ndim == 2:
-            # ステレオはL/Rを混ぜず片ch (L) を表示 (reshapeで交互に混ざるのを防ぐ)
-            chunk = chunk[:, 0]
-        pw = r.width - 24
-        seg = max(1, n // pw)
-        m = (n // seg) * seg
-        env = np.max(np.abs(chunk[-m:].reshape(-1, seg)), axis=1).astype(np.float32)
-        k = int(0.99 * (len(env) - 1)) if len(env) > 1 else 0
-        peak = max(0.01, float(np.partition(env, k)[k])) if len(env) else 0.01
-        env = np.clip(env / peak * 0.92, 0.0, 1.0)
-        # 座標配列は長さが変わった時だけ再生成 (O(n)リスト内包をCレベルのtolistへ)
-        if self._wave_xs is None or len(self._wave_xs) != len(env):
-            self._wave_xs = np.linspace(r.x + 12, r.right - 12, len(env))
-        xs = self._wave_xs
-        mid = r.centery + 7
-        amp = r.height / 2 - 13
-        top = np.stack((xs, mid - env * amp), axis=1).tolist()
-        bot = np.stack((xs, mid + env * amp), axis=1).tolist()
-        if len(top) >= 2:
-            pygame.draw.polygon(self.screen, (14, 78, 88), top + bot[::-1])
-            pygame.draw.lines(self.screen, (0, 220, 184), False, top, 1)
-            pygame.draw.lines(self.screen, (0, 220, 184), False, bot, 1)
+        # 波形パネルはレイアウトから削除済み (0サイズ)。ゴミ描画防止のため何もしない。
+        return
 
     def _draw_telemetry(self):
         # 初心者にもわかる電波クオリティ判定バッジ (どんなアンテナでも状況把握)

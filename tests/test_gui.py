@@ -28,7 +28,7 @@ def test_gui_panel_boundaries():
     spec = gui.spec_rect
     tele = gui.tele_rect
     tune = gui.tune_rect
-    gain = gui.gain_rect
+    # gain_rectは廃止 (GAIN/AUDIOパネル削除)。衝突検証の対象外。
     preset = gui.preset_rect
     status = gui.status_rect
 
