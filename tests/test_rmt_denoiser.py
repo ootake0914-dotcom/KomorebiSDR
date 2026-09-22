@@ -33,8 +33,14 @@ def test_snr_not_degraded():
     for i in range(8):
         xi, _ = _noisy_tone(seed=i)
         y, info = dn.process_mono(xi, s_meter_dbfs=-40.0, snr_db=15.0)
-    snr_in = _snr_vs_clean(x, clean)
-    snr_out = _snr_vs_clean(y, _noisy_tone(seed=7)[1])
+    # ラッパー出力はlookahead整合でDサンプル遅延するため、評価時は整合させる
+    # (0.3msの固定遅延。mono_nrの14msに比べ無視できる)
+    D = int(dn.core.half_taps)
+    ya = np.asarray(y)[D:]
+    ca = _noisy_tone(seed=7)[1][:len(ya)]
+    xa = np.asarray(x)[:len(ya)]
+    snr_in = _snr_vs_clean(xa, ca)
+    snr_out = _snr_vs_clean(ya, ca)
     print(f"[*] RMT SNR: in {snr_in:.2f} -> out {snr_out:.2f} dB")
     assert snr_out >= snr_in - 1.0, f"SNR悪化: {snr_in:.2f}->{snr_out:.2f}"
     assert info["retained_rank"] >= 0

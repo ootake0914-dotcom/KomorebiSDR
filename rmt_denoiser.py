@@ -23,11 +23,14 @@ import numpy as np
 from adaptive_audio import RmtHankelDenoiser
 
 # SNR帯→強度の既定マップ (上限・下限・帯内線形補間。設定で上書き可能)
-# bands: [(snr_db境界, strength), ...] 降順。snr>30: 0.05、20-30: 0.1-0.35、
-# 10-20: 0.35-0.65、<10: 0.65-0.85 (いずれもmax_strengthで頭打ち)
+# bands: [(snr_db境界, strength), ...] 降順。snr>30: 0.05、20-30: 0.05-0.40、
+# 10-20: 0.40-0.65、<10: 0.65-0.85 (いずれもmax_strengthで頭打ち)。
+# 値は合成2トーン掃引 (Phase 1-1) で検証済み: 高域損失<=1dBの範囲で
+# 改善最大となる強度を各帯で選ぶと (20→0.40、10→0.65) が最適だった。
+# なお合成定常トーンでは+10〜+30dB出るが、実番組では+2dB級 (bench条件7参照)。
 DEFAULT_STRENGTH_BANDS = (
     (30.0, 0.05),
-    (20.0, 0.35),
+    (20.0, 0.40),
     (10.0, 0.65),
     (-99.0, 0.85),
 )
@@ -82,6 +85,11 @@ class SafeRmtDenoiser:
         self._a_hf = float(1.0 - math.exp(-2.0 * math.pi * self.hf_cutoff / self.fs))
         self.blocks = 0
         self.bypassed = 0
+        # 遅延整合バッファ (ch毎): コア出力dはlookahead分だけ入力より
+        # 進んでいるため、ブレンド相手のxを同量遅延させて位相整合する。
+        # しないと1kHzで112°ずれたdとのブレンドが打消し合って番組を削る
+        # (合成2トーンで番組-2.4dBの劣化を実測)。
+        self._delay = {}
 
     def reset(self):
         """選局時に全状態をクリア (前局のカーネル・強度を持ち越さない)。"""
@@ -90,6 +98,7 @@ class SafeRmtDenoiser:
         self._hf_lp = 0.0
         self.blocks = 0
         self.bypassed = 0
+        self._delay.clear()
 
     def _hf_energy_db(self, x, y):
         """高域エネルギーの入出力比 (dB。負=損失)。rfftで10kHz以上を比較する。"""
@@ -176,7 +185,19 @@ class SafeRmtDenoiser:
         if len(d) != n or not bool(np.all(np.isfinite(d))):
             info["bypass_reason"] = "nan-output"
             return x, info
-        y = ((1.0 - s) * x + s * d).astype(np.float32)
+        # 遅延整合: dはlookahead分だけ進んでいるため、xを同量遅延させてから
+        # ブレンドする (0.3msの固定遅延。知覚不能・ブロック境界はtailで連続)。
+        D = int(min(max(getattr(self.core, "half_taps", 0), 0), n - 1))
+        if D > 0:
+            tail = self._delay.get(ch)
+            if tail is None or len(tail) != D:
+                tail = np.zeros(D, dtype=np.float32)
+            x_ext = np.concatenate((tail, x))
+            self._delay[ch] = x_ext[-D:].copy()
+            xd = x_ext[:n]
+        else:
+            xd = x
+        y = ((1.0 - s) * xd + s * d).astype(np.float32)
 
         # 監視: RMS差と高域損失。過剰なら強度を自動で半減させる
         rms_out = float(np.sqrt(np.mean(y.astype(np.float64) ** 2)) + 1e-18)
@@ -187,7 +208,7 @@ class SafeRmtDenoiser:
             info["bypass_reason"] = "auto-level"
             self._eff_strength *= 0.5
             return y, info
-        hf = self._hf_energy_db(x, y)
+        hf = self._hf_energy_db(xd, y)
         info["hf_loss_db"] = float(hf)
         if hf < -6.0 or info["rms_diff_db"] < -3.0:
             self._eff_strength *= 0.5

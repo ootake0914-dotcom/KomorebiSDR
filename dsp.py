@@ -92,6 +92,10 @@ try:
     from black_magic import BlackMagicController
 except ImportError:
     BlackMagicController = None
+try:
+    from adaptive_notch import AdaptiveNotchCanceller
+except ImportError:
+    AdaptiveNotchCanceller = None
 
 
 class SdrDspPipeline:
@@ -344,9 +348,11 @@ class SdrDspPipeline:
         self.bm_cyclo_enabled = False
         self.bm_rmt_enabled = False
         self.bm_sr_enabled = False
+        self.bm_notch_enabled = False
         self.cyclo_detector = None
         self.bm_rmt = None
         self.bm_sr = None
+        self.bm_notch = None
         self.bm_controller = None
         self.bm_cyclo_min_conf = 0.55
         self.bm_cyclo_confidence = 0.0
@@ -673,6 +679,8 @@ class SdrDspPipeline:
                 self.bm_rmt.reset()
             if getattr(self, "bm_sr", None) is not None:
                 self.bm_sr.reset()
+            if getattr(self, "bm_notch", None) is not None:
+                self.bm_notch.reset()
             if getattr(self, "bm_controller", None) is not None:
                 self.bm_controller.reset()
         except Exception:
@@ -1340,6 +1348,20 @@ class SdrDspPipeline:
             if ultra_gain < 0.999:
                 left = left * ultra_gain
                 right = right * ultra_gain
+            # 黒魔法2-1: 適応ハムノッチ (既定OFF)。RMTより前段に置く
+            # (ハム除去後のクリーンな信号をNRへ渡す)。
+            if (getattr(self, "black_magic_enabled", False)
+                    and getattr(self, "bm_notch_enabled", False)):
+                try:
+                    if self.bm_notch is None and AdaptiveNotchCanceller is not None:
+                        self.bm_notch = AdaptiveNotchCanceller(
+                            sample_rate=self.audio_rate)
+                    if self.bm_notch is not None and len(left) == len(right):
+                        (left, right), _ = self.bm_notch.process_stereo(left, right)
+                        left = np.asarray(left, dtype=np.float32)
+                        right = np.asarray(right, dtype=np.float32)
+                except Exception:
+                    pass
             # 黒魔法B: ステレオ対のMid/Side安全RMT (既定OFF)。
             # L/R独立処理は分離度を落とすため、Mid通常・Side低強度で処理する。
             # 既存rmt_denoiser側との二重処理は避けること (docs参照)。
@@ -1393,6 +1415,18 @@ class SdrDspPipeline:
         out_mono = self._post_process_wfm(mono_out, "")
         if ultra_gain < 0.999:
             out_mono = out_mono * ultra_gain
+        # 黒魔法2-1: モノラル経路の適応ハムノッチ (既定OFF)
+        if (getattr(self, "black_magic_enabled", False)
+                and getattr(self, "bm_notch_enabled", False)):
+            try:
+                if self.bm_notch is None and AdaptiveNotchCanceller is not None:
+                    self.bm_notch = AdaptiveNotchCanceller(
+                        sample_rate=self.audio_rate)
+                if self.bm_notch is not None:
+                    out_mono, _ = self.bm_notch.process_mono(out_mono, ch="bm")
+                    out_mono = np.asarray(out_mono, dtype=np.float32)
+            except Exception:
+                pass
         # 黒魔法B: モノラル経路の安全RMT (既定OFF)
         if (getattr(self, "black_magic_enabled", False)
                 and getattr(self, "bm_rmt_enabled", False)):

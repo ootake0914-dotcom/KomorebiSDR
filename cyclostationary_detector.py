@@ -175,17 +175,21 @@ class CyclostationaryPilotDetector:
         if pilot_amp < self.abs_floor:
             raw *= pilot_amp / self.abs_floor
         raw *= 0.5 + 0.5 * float(min(max(self.coherence, 0.0), 1.0))
-        # 狭帯域でない強入力 (広帯域ノイズの盛り上がり) は信頼度を下げる
-        if narrow_db < self.narrow_db:
-            raw *= max(0.0, narrow_db / self.narrow_db)
         dt = n / self.fs
         alpha = 1.0 - math.exp(-dt / self.smoothing_seconds)
+        # 狭帯域でない強入力 (広帯域ノイズの盛り上がり) は信頼度を下げる。
+        # NOTE: 平滑narrow化は試したが効果なしで立上りが2ブロック遅くなる
+        # だけだったため不採用 (10dB帯の脱落はnarrowではなくSNRテールが原因)。
+        # 単発スパイク耐性はdwell＋confidenceゲートで確保する。
+        narrow_use = narrow_db
+        if narrow_use < self.narrow_db:
+            raw *= max(0.0, narrow_use / self.narrow_db)
         self.confidence += alpha * (raw - self.confidence)
         self.blocks += 1
 
-        # ヒステリシス＋最小継続時間つきpresent判定
+        # ヒステリシス＋最小継続時間つきpresent判定 (narrowは瞬時値で評価)
         want = (snr_db >= self.snr_on_db and self.confidence >= self.min_confidence
-                and narrow_db >= self.narrow_db and pilot_amp >= self.abs_floor)
+                and narrow_use >= self.narrow_db and pilot_amp >= self.abs_floor)
         must_off = (snr_db <= self.snr_off_db
                     or self.confidence < self.min_confidence - 0.15)
         self._dwell += 1

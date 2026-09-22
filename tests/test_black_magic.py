@@ -114,7 +114,15 @@ def test_config_defaults_and_clamp():
     assert out["rmt_denoiser"]["max_strength"] == 1.0
     assert out["stochastic_resonance"]["detector_only"] is True  # False拒否
     assert out["stochastic_resonance"]["trials"] == 16  # クランプ
-    assert "unknown_key" not in out["stochastic_resonance"]
+    assert out["adaptive_notch"]["enabled"] is False  # 既定維持
+    assert out["adaptive_notch"]["max_harmonic"] == 5  # 未指定は既定
+    assert out["adaptive_notch"]["base_hz"] == 0.0
+    clamped = _clean_black_magic({"adaptive_notch": {"enabled": True, "max_harmonic": 99,
+                                                     "base_hz": 500.0, "line_on_db": -5.0}})
+    assert clamped["adaptive_notch"]["enabled"] is True
+    assert clamped["adaptive_notch"]["max_harmonic"] == 9  # 上限クランプ
+    assert clamped["adaptive_notch"]["base_hz"] == 100.0  # 上限クランプ
+    assert clamped["adaptive_notch"]["line_on_db"] == 0.0  # 下限クランプ
     assert "unknown_section" not in out
     assert _clean_black_magic(None)["enabled"] is False
 

@@ -1,0 +1,98 @@
+[
+  {
+    "present_rate_on": 0.9230769230769231,
+    "conf_mean_on": 0.8307098048854109,
+    "lock_mean_off": 1.195878987128918,
+    "lock_mean_on": 1.195878987128918,
+    "blend_mean_off": 0.9519230769230769,
+    "blend_mean_on": 0.9519230769230769,
+    "chatter_off": 1,
+    "chatter_on": 1,
+    "rms_diff_db": 0.0,
+    "hf_diff_db": 0.0,
+    "lat_off": {
+      "p50": 26.27554995706305,
+      "p95": 33.769499976187944,
+      "p99": 34.83996600145474,
+      "overrun": 0.0
+    },
+    "lat_on": {
+      "p50": 23.350999981630594,
+      "p95": 29.513004928594455,
+      "p99": 33.773320981999845,
+      "overrun": 0.0
+    },
+    "rmt_bypass_on": {
+      "rmt-disabled": 52
+    },
+    "file": "strong_946_3s.npy",
+    "blocks": 52,
+    "bm": [
+      "cyclo"
+    ]
+  },
+  {
+    "present_rate_on": 0.0,
+    "conf_mean_on": 0.14490576538608274,
+    "lock_mean_off": 0.009470356825309304,
+    "lock_mean_on": 0.009470356825309304,
+    "blend_mean_off": 0.0,
+    "blend_mean_on": 0.0,
+    "chatter_off": 0,
+    "chatter_on": 0,
+    "rms_diff_db": 0.0,
+    "hf_diff_db": 0.0,
+    "lat_off": {
+      "p50": 13.688849983736873,
+      "p95": 49.89310998353176,
+      "p99": 50.81804901827127,
+      "overrun": 0.0
+    },
+    "lat_on": {
+      "p50": 15.875549986958504,
+      "p95": 51.874650007812306,
+      "p99": 57.53801598213612,
+      "overrun": 0.02
+    },
+    "rmt_bypass_on": {
+      "rmt-disabled": 52
+    },
+    "file": "noise_762_3s.npy",
+    "blocks": 52,
+    "bm": [
+      "cyclo"
+    ]
+  },
+  {
+    "present_rate_on": 0.3333333333333333,
+    "conf_mean_on": 0.4572981633816258,
+    "lock_mean_off": 0.7731006940205892,
+    "lock_mean_on": 0.7731006940205892,
+    "blend_mean_off": 0.8333333333333334,
+    "blend_mean_on": 0.8333333333333334,
+    "chatter_off": 1,
+    "chatter_on": 1,
+    "rms_diff_db": 0.0,
+    "hf_diff_db": 0.0,
+    "lat_off": {
+      "p50": 24.74989998154342,
+      "p95": 32.807479961775236,
+      "p99": 35.50541594158857,
+      "overrun": 0.0
+    },
+    "lat_on": {
+      "p50": 25.233599939383566,
+      "p95": 34.95172001421451,
+      "p99": 37.44426399469375,
+      "overrun": 0.0
+    },
+    "rmt_bypass_on": {
+      "rmt-disabled": 9
+    },
+    "file": "flutter_775_seq.npy",
+    "blocks": 9,
+    "bm": [
+      "cyclo"
+    ]
+  }
+]

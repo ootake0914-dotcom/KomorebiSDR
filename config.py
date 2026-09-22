@@ -219,6 +219,12 @@ DEFAULT_CONFIG = {
             "min_snr_db": -5.0,
             "max_snr_db": 12.0,
         },
+        "adaptive_notch": {
+            "enabled": False,      # 既定無効 (ハムのない環境では素通し)
+            "base_hz": 0.0,        # 0=50/60Hz自動選択、50.0/60.0で固定
+            "max_harmonic": 5,
+            "line_on_db": 8.0,
+        },
     },
 }
 
@@ -300,6 +306,14 @@ def _clean_black_magic(v) -> dict:
             out["stochastic_resonance"]["sigma_ratio_max"]:
         out["stochastic_resonance"]["sigma_ratio_min"] = \
             out["stochastic_resonance"]["sigma_ratio_max"]
+    a = v.get("adaptive_notch")
+    if isinstance(a, dict):
+        out_sub = out["adaptive_notch"]
+        if isinstance(a.get("enabled"), bool):
+            out_sub["enabled"] = a["enabled"]
+        _num(a, "base_hz", 0.0, 100.0)
+        _num(a, "max_harmonic", 1, 9, integer=True)
+        _num(a, "line_on_db", 0.0, 40.0)
     return out
 
 
