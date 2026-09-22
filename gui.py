@@ -167,6 +167,7 @@ class Button:
         self.pressed = False
         self.radius = radius
         self.visible = True  # SSB/CW時のみ表示するボタン用 (BFO±)
+        self.custom_draw = None  # 特別な装飾カード用の描画フック (surface, rect, font)
 
     def handle_event(self, event):
         if event.type == pygame.MOUSEMOTION:
@@ -189,6 +190,10 @@ class Button:
         # 押下時は1px下に沈み込む立体物理フィードバック
         draw_rect = self.rect.move(0, 1) if self.pressed else self.rect
 
+        if self.custom_draw is not None:
+            self.custom_draw(self, surface, draw_rect, font)
+            return
+
         if self.is_active:
             fill = self.active_color
             txt_color = (255, 255, 255)
@@ -205,9 +210,20 @@ class Button:
         border_w = 2 if self.is_active else 1
         pygame.draw.rect(surface, fill, draw_rect, border_radius=self.radius)
         pygame.draw.rect(surface, border, draw_rect, width=border_w, border_radius=self.radius)
-        txt_surf = cached_text(font, self.text, txt_color)
-        txt_rect = txt_surf.get_rect(center=draw_rect.center)
-        surface.blit(txt_surf, txt_rect)
+
+        if "\n" in self.text:
+            lines = self.text.split("\n")
+            line_surfs = [cached_text(font, ln, txt_color) for ln in lines]
+            total_h = sum(s.get_height() for s in line_surfs) + (len(lines) - 1) * 4
+            cur_y = draw_rect.centery - total_h // 2
+            for s in line_surfs:
+                rc = s.get_rect(centerx=draw_rect.centerx, top=cur_y)
+                surface.blit(s, rc)
+                cur_y += s.get_height() + 4
+        else:
+            txt_surf = cached_text(font, self.text, txt_color)
+            txt_rect = txt_surf.get_rect(center=draw_rect.center)
+            surface.blit(txt_surf, txt_rect)
 
 
 class SdrGui:
@@ -235,17 +251,21 @@ class SdrGui:
 
         self.colormap = create_colormap()
 
-        # ---- レイアウト (1120x720) ----
-        self.hero_rect = pygame.Rect(14, 10, 668, 88)
-        self.info_rect = pygame.Rect(694, 10, 412, 88)
-        self.spec_rect = pygame.Rect(14, 110, 800, 210)
-        self.wf_rect = pygame.Rect(14, 332, 800, 150)
-        self.wave_rect = pygame.Rect(14, 494, 800, 54)
-        self.tele_rect = pygame.Rect(826, 110, 280, 102)
-        self.tune_rect = pygame.Rect(826, 222, 280, 326)
-        self.gain_rect = pygame.Rect(826, 548, 0, 0)
-        self.preset_rect = pygame.Rect(14, 560, 1092, 74)
-        self.status_rect = pygame.Rect(14, 644, 1092, 28)
+        # ---- レイアウト (1120x720: AI画像準拠の革新UX構造) ----
+        self.hero_rect = pygame.Rect(14, 14, 530, 116)
+        self.info_rect = pygame.Rect(558, 14, 548, 116)
+        self.spec_rect = pygame.Rect(14, 142, 800, 200)
+        self.wf_rect = pygame.Rect(14, 348, 800, 132)
+        self.wave_rect = pygame.Rect(14, 480, 0, 0)       # 安全ダミー (音量はメーターへ統合)
+        self.tele_rect = pygame.Rect(826, 142, 280, 96)
+        self.tune_rect = pygame.Rect(826, 246, 280, 234)
+        self.gain_rect = pygame.Rect(826, 480, 0, 0)       # 安全ダミー
+        self.preset_rect = pygame.Rect(14, 490, 1092, 174)
+        self.status_rect = pygame.Rect(14, 674, 1092, 32)
+        self.is_favorite = False
+        self.fav_rect = pygame.Rect(self.hero_rect.right - 40, self.hero_rect.y + 10, 26, 24)
+        self.vol_rect = pygame.Rect(self.hero_rect.x + 56, self.hero_rect.y + 100, 110, 14)
+        self.dragging_volume = False
 
         self.wf_surface = pygame.Surface((self.wf_rect.width, self.wf_rect.height))
         self.wf_surface.fill((0, 0, 0))
@@ -341,6 +361,8 @@ class SdrGui:
 
     def _glass(self, w, h, radius=18, alpha=180, tint=(255, 255, 255), dark=False):
         """ガラスパネル表面を生成 (pad付き)"""
+        if w <= 0 or h <= 0:
+            return pygame.Surface((1, 1), pygame.SRCALPHA), 0
         pad = 14
         surf = pygame.Surface((w + pad * 2, h + pad * 2), pygame.SRCALPHA)
         for i in range(8, 0, -1):
@@ -363,12 +385,11 @@ class SdrGui:
         ):
             self.panels[name] = self._glass(rect.width, rect.height)
         self.panels["gain"] = (pygame.Surface((1, 1), pygame.SRCALPHA), 0)
+        self.panels["wave"] = (pygame.Surface((1, 1), pygame.SRCALPHA), 0)
         self.panels["spec"] = self._glass(self.spec_rect.width, self.spec_rect.height,
                                           radius=16, tint=(17, 23, 36), dark=True)
         self.panels["wf"] = self._glass(self.wf_rect.width, self.wf_rect.height,
                                         radius=16, tint=(17, 23, 36), dark=True)
-        self.panels["wave"] = self._glass(self.wave_rect.width, self.wave_rect.height,
-                                          radius=16, tint=(17, 23, 36), dark=True)
         self.panels["status"] = self._glass(self.status_rect.width, self.status_rect.height,
                                             radius=14, alpha=160)
 
@@ -380,24 +401,19 @@ class SdrGui:
             ("tele", self.tele_rect), ("tune", self.tune_rect),
             ("preset", self.preset_rect),
             ("spec", self.spec_rect), ("wf", self.wf_rect),
-            ("wave", self.wave_rect), ("status", self.status_rect),
+            ("status", self.status_rect),
         ):
             surf, pad = self.panels[name]
             baked.blit(surf, (rect.x - pad, rect.y - pad))
 
-        # 静的見出しラベルの事前ベイク
-        lbl_tune = cached_text(self.font_title, t("tuning"), C_MUTED)
-        baked.blit(lbl_tune, (self.tune_rect.x + 14, self.tune_rect.y + 8))
-        lbl_mode = cached_text(self.font_tiny, t("mode"), C_MUTED)
-        baked.blit(lbl_mode, (self.tune_rect.x + 14, self.tune_rect.y + 170))
-
-        lbl_tele = cached_text(self.font_title, t("status"), C_MUTED)
-        baked.blit(lbl_tele, (self.tele_rect.x + 14, self.tele_rect.y + 8))
-
+        # 静的見出しラベルの事前ベイク (AI画像スタイルの上品なヘッダー)
+        baked.blit(cached_text(self.font_tiny, "NOW PLAYING HUB", C_MUTED), (self.hero_rect.x + 18, self.hero_rect.y + 8))
+        baked.blit(cached_text(self.font_tiny, "BAND SELECTOR", C_MUTED), (self.info_rect.x + 18, self.info_rect.y + 8))
+        baked.blit(cached_text(self.font_tiny, "ONE-TOUCH DISCOVERY", C_MUTED), (self.tune_rect.x + 14, self.tune_rect.y + 8))
+        baked.blit(cached_text(self.font_tiny, "STATION CARDS", C_MUTED), (self.preset_rect.x + 18, self.preset_rect.y + 8))
+        baked.blit(cached_text(self.font_title, t("status"), C_MUTED), (self.tele_rect.x + 14, self.tele_rect.y + 8))
         lbl_wf = cached_text(self.font_tiny, t("waterfall"), (110, 128, 150))
         baked.blit(lbl_wf, (self.wf_rect.x + 12, self.wf_rect.y + 6))
-        lbl_wave = cached_text(self.font_tiny, t("waveform"), (110, 128, 150))
-        baked.blit(lbl_wave, (self.wave_rect.x + 12, self.wave_rect.y + 5))
 
         self.baked_bg = baked
 
@@ -450,113 +466,222 @@ class SdrGui:
                         "mode": m})
         return out
 
+    def _draw_station_card(self, btn, surface, draw_rect, font):
+        """AI画像スタイルの大型ステーションカード描画"""
+        is_playing = (hasattr(btn, "freq_hz") and abs(self.center_freq - btn.freq_hz) < 50000)
+        p = getattr(btn, "station_data", {})
+        st_name = p.get("name", btn.text)
+        freq_hz = getattr(btn, "freq_hz", self.center_freq)
+        mode = p.get("mode", "WFM")
+
+        # 背景色と枠線
+        if is_playing:
+            fill = (11, 58, 54)        # 深緑エメラルド (#0B3A36)
+            border = (235, 190, 80)    # ゴールドアンバーのアクセント枠
+            border_w = 2
+            txt_col_main = (255, 255, 255)
+            txt_col_sub = (140, 245, 220)
+        else:
+            if btn.pressed:
+                fill = (220, 230, 240)
+            elif btn.hover:
+                fill = (248, 252, 255)
+            else:
+                fill = (236, 242, 248)
+            border = (190, 210, 230) if btn.hover else (210, 224, 236)
+            border_w = 1
+            txt_col_main = (24, 36, 52)
+            txt_col_sub = (90, 115, 145)
+
+        pygame.draw.rect(surface, fill, draw_rect, border_radius=btn.radius)
+        pygame.draw.rect(surface, border, draw_rect, width=border_w, border_radius=btn.radius)
+
+        # 1. 上部: ON AIRバッジ / モードバッジ
+        top_y = draw_rect.y + 10
+        if is_playing:
+            badge_surf = cached_text(self.font_tiny, "▶ ON AIR", (255, 255, 255))
+            badge_rect = pygame.Rect(draw_rect.x + 12, top_y, badge_surf.get_width() + 10, 16)
+            pygame.draw.rect(surface, (0, 185, 150), badge_rect, border_radius=4)
+            surface.blit(badge_surf, (draw_rect.x + 17, top_y + 1))
+        else:
+            mode_surf = cached_text(self.font_tiny, mode, (120, 140, 165))
+            badge_rect = pygame.Rect(draw_rect.x + 12, top_y, mode_surf.get_width() + 8, 16)
+            pygame.draw.rect(surface, (222, 230, 240), badge_rect, border_radius=4)
+            surface.blit(mode_surf, (draw_rect.x + 16, top_y + 1))
+
+        # 2. 中部: 局名 (太字、カード幅に収まるよう自動調整)
+        name_y = draw_rect.y + 34
+        name_font = self.font_med
+        name_surf = cached_text(name_font, st_name, txt_col_main)
+        if name_surf.get_width() > draw_rect.width - 24:
+            name_font = self.font_small
+            name_surf = cached_text(name_font, st_name, txt_col_main)
+        surface.blit(name_surf, (draw_rect.x + 12, name_y))
+
+        # 3. 中下部: 周波数 (大きく視認性良く)
+        f_mhz = freq_hz / 1e6
+        if freq_hz >= 1000000:
+            f_str = f"{f_mhz:.2f} MHz"
+        else:
+            f_str = f"{freq_hz / 1e3:.1f} kHz"
+        f_surf = cached_text(self.font_station, f_str, txt_col_sub)
+        surface.blit(f_surf, (draw_rect.x + 12, draw_rect.y + 60))
+
+        # 4. 下部: ミニLED VUメーター (6セグメント)
+        vu_y = draw_rect.bottom - 22
+        vu_w = draw_rect.width - 24
+        n_segs = 6
+        seg_gap = 3
+        sw = (vu_w - (n_segs - 1) * seg_gap) // n_segs
+
+        if is_playing:
+            lit_cnt = min(n_segs, max(1, int(round(self.s_units / 9.0 * n_segs))))
+        else:
+            snr = p.get("snr_db", 10.0)
+            lit_cnt = min(n_segs, max(1, int(round(float(snr) / 30.0 * n_segs))))
+
+        for si in range(n_segs):
+            sx = draw_rect.x + 12 + si * (sw + seg_gap)
+            s_rect = pygame.Rect(sx, vu_y, sw, 8)
+            if si < lit_cnt:
+                seg_col = (0, 225, 180) if is_playing else (140, 195, 220)
+                if si >= 4:
+                    seg_col = (245, 190, 60)
+            else:
+                seg_col = (16, 40, 38) if is_playing else (218, 226, 235)
+            pygame.draw.rect(surface, seg_col, s_rect, border_radius=2)
+
     def _init_controls(self):
         btns = []
 
-        # ---- TUNINGパネル (上からバランスよくゆったり配置) ----
-        tx, tw = self.tune_rect.x + 14, self.tune_rect.width - 28
-        half = (tw - 8) // 2
-        y_seek = self.tune_rect.y + 36
-        self.btn_seek_prev = Button((tx, y_seek, half, 34), t("seek_prev"), lambda: self._seek(-1),
-                                    bg_color=(226, 235, 248), active_color=C_BTN_ACTIVE2)
-        self.btn_seek_next = Button((tx + half + 8, y_seek, half, 34), t("seek_next"), lambda: self._seek(1),
-                                    bg_color=(226, 235, 248), active_color=C_BTN_ACTIVE2)
-        fm_w = int((tw - 8) * 0.52)
-        sw_w = tw - 8 - fm_w
-        y_scan = y_seek + 34 + 10
-        self.btn_scan_band = Button((tx, y_scan, fm_w, 34), t("scan_button"), self._request_scan,
-                                    bg_color=(214, 240, 229), active_color=C_ACCENT)
-        self.btn_scan_sw = Button((tx + fm_w + 8, y_scan, sw_w, 34), t("scan_sw_button"),
-                                   self._request_sw_scan, bg_color=(226, 236, 248), active_color=C_ACCENT)
-        btns.extend([self.btn_seek_prev, self.btn_seek_next, self.btn_scan_band, self.btn_scan_sw])
+        # ---- 1. BAND SELECTOR (info_rect 内に大型ピルボタン3種を配置) ----
+        bx0 = self.info_rect.x + 14
+        by0 = self.info_rect.y + 26
+        bw = (self.info_rect.width - 28 - 16) // 3
+        self.btn_band_fm = Button((bx0, by0, bw, 32), "📻 FM Radio",
+                                  lambda: self._tune(80000000, "WFM"),
+                                  bg_color=(220, 238, 250), radius=16)
+        self.btn_band_am = Button((bx0 + bw + 8, by0, bw, 32), "📰 AM News",
+                                  lambda: self._tune(954000, "AM"),
+                                  bg_color=(232, 240, 248), radius=16)
+        self.btn_band_sw = Button((bx0 + (bw + 8) * 2, by0, bw, 32), "🌐 Shortwave",
+                                  lambda: self._tune(6055000, "AM"),
+                                  bg_color=(236, 236, 248), radius=16)
+        btns.extend([self.btn_band_fm, self.btn_band_am, self.btn_band_sw])
 
-        # 検出局プルダウン (生成画像スタイルの淡いエメラルドアクセント)
-        y_list = y_scan + 34 + 10
+        # ---- 2. ONE-TOUCH DISCOVERY (tune_rect 内にスキャン・シーク・モード配置) ----
+        tx, tw = self.tune_rect.x + 14, self.tune_rect.width - 28
+        y_scan = self.tune_rect.y + 28
+        self.btn_scan_band = Button((tx, y_scan, tw, 42), t("scan_button"), self._request_scan,
+                                    bg_color=(196, 238, 226), active_color=C_ACCENT, radius=8)
+        btns.append(self.btn_scan_band)
+
+        # シークボタン (Prev / Next)
+        half = (tw - 8) // 2
+        y_seek = y_scan + 48
+        self.btn_seek_prev = Button((tx, y_seek, half, 32), t("seek_prev"), lambda: self._seek(-1),
+                                    bg_color=(226, 235, 248), active_color=C_BTN_ACTIVE2, radius=8)
+        self.btn_seek_next = Button((tx + half + 8, y_seek, half, 32), t("seek_next"), lambda: self._seek(1),
+                                    bg_color=(226, 235, 248), active_color=C_BTN_ACTIVE2, radius=8)
+        btns.extend([self.btn_seek_prev, self.btn_seek_next])
+
+        # 検出局プルダウンボタン
+        y_list = y_seek + 38
         n_st = len(self.detected_stations)
-        self.btn_station_list = Button((tx, y_list, tw, 30), t("station_list_btn", n=n_st),
+        self.btn_station_list = Button((tx, y_list, tw, 28), t("station_list_btn", n=n_st),
                                        self._toggle_station_list,
-                                       bg_color=(200, 238, 226), active_color=C_ACCENT)
+                                       bg_color=(210, 240, 232), active_color=C_ACCENT, radius=6)
         btns.append(self.btn_station_list)
 
-        gap = 4
-        mw = (tw - 5 * gap) // 6
-        mode_defs = [("WFM", (212, 236, 248)), ("AM", (212, 236, 248)), ("NFM", (212, 236, 248)),
-                     ("USB", (226, 236, 250)), ("LSB", (226, 236, 250)), ("CW", (226, 236, 250))]
+        # モード切替ボタン群 (2行3列でゆったりと押しやすく配置)
+        y_mode = y_list + 32
+        m_gap = 6
+        mw = (tw - 2 * m_gap) // 3
+        mh = 24
         mode_buttons = {}
-        y_mode = self.tune_rect.y + 192
-        for i, (name, col) in enumerate(mode_defs):
-            b = Button((tx + i * (mw + gap), y_mode, mw, 30), name,
-                       (lambda m=name: self._set_mode(m)), bg_color=col)
-            mode_buttons[name] = b
-            btns.append(b)
+        mode_rows = [
+            [("WFM", (216, 238, 250)), ("AM", (216, 238, 250)), ("NFM", (216, 238, 250))],
+            [("USB", (228, 238, 252)), ("LSB", (228, 238, 252)), ("CW", (228, 238, 252))]
+        ]
+        for r_idx, row in enumerate(mode_rows):
+            cur_my = y_mode + r_idx * (mh + 4)
+            for c_idx, (m_name, m_col) in enumerate(row):
+                b = Button((tx + c_idx * (mw + m_gap), cur_my, mw, mh), m_name,
+                           (lambda m=m_name: self._set_mode(m)), bg_color=m_col, radius=6)
+                mode_buttons[m_name] = b
+                btns.append(b)
         self.mode_buttons = mode_buttons
         self.btn_wfm = self.mode_buttons["WFM"]
         self.btn_am = self.mode_buttons["AM"]
         self.btn_nfm = self.mode_buttons["NFM"]
 
         # BFO微調整 (SSB・CW時に表示)
-        gap2 = 8
-        hw = (tw - gap2) // 2
-        y_bfo = y_mode + 30 + 10
-        self.btn_bfo_down = Button((tx, y_bfo, hw, 28), "BFO-",
-                                   lambda: self._step_bfo(-50), bg_color=(240, 243, 248))
-        self.btn_bfo_up = Button((tx + hw + gap2, y_bfo, hw, 28), "BFO+",
-                                 lambda: self._step_bfo(50), bg_color=(240, 243, 248))
+        hw = (tw - 8) // 2
+        y_bfo = y_mode + 2 * (mh + 4) + 2
+        self.btn_bfo_down = Button((tx, y_bfo, hw, 22), "BFO -",
+                                   lambda: self._step_bfo(-50), bg_color=(240, 243, 248), radius=4)
+        self.btn_bfo_up = Button((tx + hw + 8, y_bfo, hw, 22), "BFO +",
+                                 lambda: self._step_bfo(50), bg_color=(240, 243, 248), radius=4)
         btns.extend([self.btn_bfo_down, self.btn_bfo_up])
 
-        # ---- チャンネルカード / プリセット (どこでも・だれでも・どんなアンテナでも) ----
+        # 短波スキャンボタン (互換保持)
+        self.btn_scan_sw = Button((0, 0, 0, 0), t("scan_sw_button"), self._request_sw_scan)
+        self.btn_scan_sw.visible = False
+
+        # ---- 3. STATION CARDS (preset_rect: どこでも・だれでも・どんなアンテナでも) ----
         self.preset_buttons = []
-        has_presets = bool(self.presets_fm or self.presets_am)
-        if not has_presets:
-            # 未スキャン時: 白紙にせず、ワンクリックでスキャンできる大きなウェルカムボタンを配置
-            px = self.preset_rect.x + 20
-            py = self.preset_rect.y + 16
-            pw = (self.preset_rect.width - 56) // 2
+        # 利用可能な局リストの収集 (プリセットまたは検出局)
+        all_stations = []
+        seen_freqs = set()
+        for src in [self.presets_fm, self.presets_am, self.detected_stations]:
+            for st in (src or []):
+                fh = st.get("freq_hz")
+                if fh and fh not in seen_freqs:
+                    seen_freqs.add(fh)
+                    all_stations.append(st)
+
+        if not all_stations:
+            # 未スキャン時: 巨大で親しみやすいウェルカムカードを2枚並べて即座に誘導
+            px = self.preset_rect.x + 18
+            py = self.preset_rect.y + 28
+            pw = (self.preset_rect.width - 36 - 16) // 2
+            ph = 130
             self.btn_welcome_fm = Button(
-                (px, py, pw, 42),
-                t("welcome_scan_fm"),
+                (px, py, pw, ph),
+                "📻  FM局を一括自動スキャン (76 - 95 MHz)\n\nワンタッチで身の回りのFMラジオ放送を自動検出します",
                 self._request_scan,
-                bg_color=(216, 242, 230), active_color=C_ACCENT
+                bg_color=(224, 244, 236), active_color=C_ACCENT, radius=14
             )
             self.btn_welcome_sw = Button(
-                (px + pw + 16, py, pw, 42),
-                t("welcome_scan_sw"),
+                (px + pw + 16, py, pw, ph),
+                "🌐  短波・世界放送スキャン (3 - 30 MHz)\n\n国際放送・アマチュア無線・エアバンドを探索します",
                 self._request_sw_scan,
-                bg_color=(228, 238, 252), active_color=C_ACCENT
+                bg_color=(232, 242, 254), active_color=C_ACCENT, radius=14
             )
             btns.extend([self.btn_welcome_fm, self.btn_welcome_sw])
         else:
-            # スキャン完了後: 検出局を美しいカードタイルとして均等配置 (押しやすいH=28px)
-            if self.presets_fm:
-                n_fm = min(10, len(self.presets_fm))
-                gap_p = 6
-                fw = (self.preset_rect.width - 60 - (n_fm - 1) * gap_p) // n_fm
-                fx0 = self.preset_rect.x + 48
-                for i, p in enumerate(self.presets_fm[:n_fm]):
-                    f, m = int(p["freq_hz"]), p.get("mode", "WFM")
-                    cb = (lambda freq=f, mode=m: self._tune(freq, mode))
-                    b = Button((fx0 + i * (fw + gap_p), self.preset_rect.y + 7, fw, 28),
-                               p["name"], cb, bg_color=(235, 242, 250), radius=6)
-                    b.freq_hz = f
-                    self.preset_buttons.append(b)
-                    btns.append(b)
-            if self.presets_am:
-                n_am = min(8, len(self.presets_am))
-                gap_a = 6
-                aw = (self.preset_rect.width - 60 - (n_am - 1) * gap_a) // n_am
-                ax0 = self.preset_rect.x + 48
-                for i, p in enumerate(self.presets_am[:n_am]):
-                    f, m = int(p["freq_hz"]), p.get("mode", "AM")
-                    cb = (lambda freq=f, mode=m: self._tune(freq, mode))
-                    b = Button((ax0 + i * (aw + gap_a), self.preset_rect.y + 39, aw, 28),
-                               p["name"], cb, bg_color=(238, 240, 246), radius=6)
-                    b.freq_hz = f
-                    self.preset_buttons.append(b)
-                    btns.append(b)
+            # スキャン後: 最大6枚の大型リッチステーションカードをカルーセル配置
+            n_cards = min(6, len(all_stations))
+            gap = 12
+            cw = (self.preset_rect.width - 36 - (n_cards - 1) * gap) // n_cards
+            ch = 130
+            cy = self.preset_rect.y + 28
+            for i, st in enumerate(all_stations[:n_cards]):
+                f = int(st["freq_hz"])
+                m = st.get("mode", "WFM")
+                cb = (lambda freq=f, mode=m: self._tune(freq, mode))
+                b = Button((self.preset_rect.x + 18 + i * (cw + gap), cy, cw, ch),
+                           st.get("name", "?"), cb, bg_color=(236, 242, 248), radius=12)
+                b.freq_hz = f
+                b.station_data = st
+                b.custom_draw = self._draw_station_card
+                self.preset_buttons.append(b)
+                btns.append(b)
 
         # アトミックに差し替え (スキャン完了時の再構築と描画の競合防止)
         self.buttons = btns
         self._sync_bfo_visibility()
+
 
     # ================================================================
     # 操作ハンドラ
@@ -721,15 +846,21 @@ class SdrGui:
             if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
                 self.station_list_open = False
 
-            # マウス移動時の桁ホバー検出
+            # マウス移動時の桁ホバー検出およびボリュームドラッグ
             if event.type == pygame.MOUSEMOTION:
                 mx, my = event.pos
                 self.hovered_freq_digit = None
-                if self.hero_rect.collidepoint(mx, my):
+                if self.dragging_volume:
+                    ratio = np.clip((mx - self.vol_rect.x) / self.vol_rect.width, 0.0, 1.0)
+                    self.volume = float(ratio)
+                elif self.hero_rect.collidepoint(mx, my):
                     for rect, step in self.freq_digit_hitboxes:
                         if rect.collidepoint(mx, my):
                             self.hovered_freq_digit = step
                             break
+
+            elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
+                self.dragging_volume = False
 
             # マウスホイールによる周波数同調 (桁単位ホイール同調)
             # pygame2はMOUSEWHEELを出すため、MOUSEBUTTONDOWN(4/5)は旧SDLの
@@ -761,10 +892,18 @@ class SdrGui:
                     step = 1000 if self.mode in ("USB", "LSB", "CW") else 10000
                     self._adjust_freq(wheel_delta * step)
 
-            # スペクトラム・ウォーターフォールクリックによる同調 (検出局マーカーへの自動吸着対応)
+            # クリックイベント
             if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                 mx, my = event.pos
-                if self.station_list_open:
+                if self.fav_rect.collidepoint(mx, my):
+                    self.is_favorite = not self.is_favorite
+                    continue
+                elif self.vol_rect.collidepoint(mx, my):
+                    self.dragging_volume = True
+                    ratio = np.clip((mx - self.vol_rect.x) / self.vol_rect.width, 0.0, 1.0)
+                    self.volume = float(ratio)
+                    continue
+                elif self.station_list_open:
                     # モーダル消費時は下層ボタン/同調へ素通りさせない
                     self._station_list_click(mx, my)
                     continue
@@ -838,6 +977,8 @@ class SdrGui:
         mx, my = pygame.mouse.get_pos()
         is_hover_btn = any(btn.visible and btn.rect.collidepoint(mx, my) for btn in self.buttons)
         is_hover_digit = (self.hovered_freq_digit is not None)
+        is_hover_fav = self.fav_rect.collidepoint(mx, my)
+        is_hover_vol = self.vol_rect.collidepoint(mx, my)
         # スペクトラム上のホバー周波数 (ワンクリック選局の照準表示)
         if self.spec_rect.collidepoint(mx, my) and self.spec_rect.width > 0:
             sr = self.sample_rate if self.sample_rate > 0 else 1152000
@@ -845,7 +986,7 @@ class SdrGui:
                                   + (mx - self.spec_rect.x) / self.spec_rect.width * sr)
         else:
             self.hover_freq_hz = None
-        if is_hover_btn or is_hover_digit or self.hover_freq_hz is not None:
+        if is_hover_btn or is_hover_digit or is_hover_fav or is_hover_vol or self.hover_freq_hz is not None:
             try:
                 pygame.mouse.set_cursor(pygame.SYSTEM_CURSOR_HAND)
             except Exception:
@@ -855,6 +996,7 @@ class SdrGui:
                 pygame.mouse.set_cursor(pygame.SYSTEM_CURSOR_ARROW)
             except Exception:
                 pass
+
 
     # ================================================================
     # 描画
@@ -999,126 +1141,34 @@ class SdrGui:
                 pygame.draw.rect(self.screen, dim_col, seg_rect, border_radius=2)
 
     def _draw_header(self):
-        # 1. 周波数ヒーローパネル
-        lbl = cached_text(self.font_title, t("freq"), C_MUTED)
-        self.screen.blit(lbl, (self.hero_rect.x + 18, self.hero_rect.y + 10))
+        # ============================================================
+        # 1. NOW PLAYING HUB (hero_rect: 14, 14, 530, 116)
+        # ============================================================
+        # ★ お気に入りアイコンボタン
+        fav_icon = "★" if self.is_favorite else "☆"
+        fav_col = (245, 185, 45) if self.is_favorite else (160, 175, 195)
+        mx, my = pygame.mouse.get_pos()
+        if self.fav_rect.collidepoint(mx, my):
+            pygame.draw.rect(self.screen, (225, 235, 248), self.fav_rect, border_radius=6)
+        fav_surf = cached_text(self.font_station, fav_icon, fav_col)
+        self.screen.blit(fav_surf, fav_surf.get_rect(center=self.fav_rect.center))
 
-        # 地域プロファイルラベル (局名との衝突を避けるため右上段へ退避！)
+        # 地域プロファイルラベル (右上段)
         if self.region_label:
-            rl = cached_text(self.font_tiny, f"{t('region')}: {self.region_label}", C_MUTED)
-            self.screen.blit(rl, (self.hero_rect.right - 18 - rl.get_width(), self.hero_rect.y + 12))
+            rl = cached_text(self.font_tiny, f"{t('region')}: {self.region_label}", (130, 145, 165))
+            self.screen.blit(rl, (self.fav_rect.left - 10 - rl.get_width(), self.hero_rect.y + 14))
 
-        # 周波数文字列のフォーマットと桁単位の当たり判定構築
-        # カンマ区切りは1GHz超で桁インデックスを狂わせ、同調ステップが10倍ずれるため使わない
-        if self.center_freq >= 1000000:
-            freq_str = f"{self.center_freq / 1e6:.4f}"
-            unit = "MHz"
-        else:
-            freq_str = f"{self.center_freq / 1e3:.1f}"
-            unit = "kHz"
-
-        # 周波数各桁の当たり判定とアンダーライン描画
-        self.freq_digit_hitboxes = []
-        cur_x = self.hero_rect.x + 18
-        base_y = self.hero_rect.y + 14
-
-        # 桁の重み付け (MHz/kHz表示時)
-        dot_idx = freq_str.find(".")
-        for i, ch in enumerate(freq_str):
-            ch_surf = cached_text(self.font_huge, ch, C_TEXT)
-            ch_w = ch_surf.get_width()
-            ch_rect = pygame.Rect(cur_x, base_y, ch_w, ch_surf.get_height())
-            self.screen.blit(ch_surf, (cur_x, base_y))
-
-            # 数字であればステップ周波数を算出
-            if ch.isdigit():
-                if self.center_freq >= 1000000:
-                    power = dot_idx - 1 - i if i < dot_idx else dot_idx - i
-                    step_hz = int(round(10 ** power * 1e6))
-                else:
-                    power = dot_idx - 1 - i if i < dot_idx else dot_idx - i
-                    step_hz = int(round(10 ** power * 1e3))
-
-                if step_hz >= 100:  # 100Hz以上を同調可能ステップとする
-                    self.freq_digit_hitboxes.append((ch_rect, step_hz))
-                    # 現在マウスがホバーしている桁であればアクセント下線を描画 (文字下端から綺麗に分離)
-                    if self.hovered_freq_digit == step_hz:
-                        pygame.draw.line(self.screen, C_ACCENT,
-                                         (cur_x + 1, base_y + ch_surf.get_height() - 6),
-                                         (cur_x + ch_w - 2, base_y + ch_surf.get_height() - 6), 3)
-
-            cur_x += ch_w
-
-        unit_surf = cached_text(self.font_med, unit, C_ACCENT_DARK)
-        self.screen.blit(unit_surf, (cur_x + 8, self.hero_rect.y + 36))
-
-        # アナログ調 周波数バンドスケール (FM/AMの受信位置を精密視覚化)
-        scale_x = max(cur_x + 30, self.hero_rect.x + 330)
-        scale_w = self.hero_rect.right - 20 - scale_x
-        scale_y = self.hero_rect.y + 26
-        scale_h = 24
-        if scale_w >= 140:
-            track_rect = pygame.Rect(scale_x, scale_y, scale_w, scale_h)
-            pygame.draw.rect(self.screen, (240, 244, 250), track_rect, border_radius=6)
-            pygame.draw.rect(self.screen, (214, 224, 236), track_rect, width=1, border_radius=6)
-
-            # バンド範囲と目盛りの判定
-            if 76000000 <= self.center_freq <= 108000000:
-                b_min, b_max = 76.0, (95.0 if self.center_freq <= 95000000 else 108.0)
-                ticks_major = [76.0, 80.0, 85.0, 90.0, 95.0] if b_max == 95.0 else [88.0, 92.0, 96.0, 100.0, 104.0, 108.0]
-                ticks_minor = np.arange(b_min, b_max + 0.1, 1.0)
-                unit_lbl = "FM BAND (76-95MHz)" if b_max == 95.0 else "FM BAND (88-108MHz)"
-            elif self.center_freq < 30000000:
-                b_min, b_max = 0.5, 15.0
-                ticks_major = [1.0, 3.0, 6.0, 9.0, 12.0, 15.0]
-                ticks_minor = np.arange(1.0, 15.1, 0.5)
-                unit_lbl = "AM / SHORTWAVE"
-            else:
-                b_min, b_max = 118.0, 144.0
-                ticks_major = [118.0, 124.0, 130.0, 136.0, 144.0]
-                ticks_minor = np.arange(118.0, 144.1, 2.0)
-                unit_lbl = "VHF AIR / AMATEUR"
-
-            # 小目盛り
-            for tk in ticks_minor:
-                if b_min <= tk <= b_max:
-                    tx_pos = scale_x + int((tk - b_min) / (b_max - b_min) * (scale_w - 12)) + 6
-                    pygame.draw.line(self.screen, (200, 212, 226), (tx_pos, scale_y + 12), (tx_pos, scale_y + scale_h - 4), 1)
-
-            # 大目盛り
-            for tk in ticks_major:
-                if b_min <= tk <= b_max:
-                    tx_pos = scale_x + int((tk - b_min) / (b_max - b_min) * (scale_w - 12)) + 6
-                    pygame.draw.line(self.screen, (160, 180, 205), (tx_pos, scale_y + 4), (tx_pos, scale_y + scale_h - 4), 1)
-
-            # 現在周波数の赤いダイヤル指針
-            cur_mhz = self.center_freq / 1e6
-            ratio = float(np.clip((cur_mhz - b_min) / (b_max - b_min), 0.0, 1.0))
-            needle_x = scale_x + int(ratio * (scale_w - 12)) + 6
-            pygame.draw.rect(self.screen, (235, 55, 55), (needle_x - 1, scale_y - 2, 3, scale_h + 4), border_radius=1)
-
-            # 指針上の現在周波数フロート数値 (例: 80.000)
-            cur_f_str = f"{cur_mhz:.3f}"
-            lbl_needle = cached_text(self.font_tiny, cur_f_str, (210, 45, 45))
-            nl_x = min(scale_x + scale_w - lbl_needle.get_width(), max(scale_x, needle_x - lbl_needle.get_width() // 2))
-            self.screen.blit(lbl_needle, (nl_x, scale_y - 14))
-
-            # バンド種別ラベル
-            lbl_scale = cached_text(self.font_tiny, unit_lbl, (140, 155, 175))
-            self.screen.blit(lbl_scale, (scale_x + 6, scale_y + scale_h + 2))
-
-        # 下段: 放送局名＆情報ティッカー (主役として大きく太字で堂々表示)
+        # メイン局名 (主役として太字で堂々表示)
         ticker_text = ""
-        ticker_color = C_TEXT
+        ticker_color = (20, 32, 48)
         if self.sw_info:
-            ticker_text = f"[短波EiBi] {self.sw_info}"
+            ticker_text = f"[短波] {self.sw_info}"
             ticker_color = (30, 80, 145)
         elif self.rds_text:
             ticker_text = f"♪ {self.rds_text}"
             ticker_color = (0, 135, 115)
         elif self.station_name:
             ticker_text = self.station_name
-            ticker_color = C_TEXT
         else:
             for st in self.detected_stations:
                 if abs(st["freq_hz"] - self.center_freq) <= 50000:
@@ -1133,26 +1183,118 @@ class SdrGui:
                 except Exception:
                     pass
 
-        if ticker_text:
-            ticker_surf = cached_text(self.font_station, ticker_text, ticker_color)
-            self.screen.blit(ticker_surf, (self.hero_rect.x + 20, self.hero_rect.y + 57))
+        if not ticker_text:
+            if 76000000 <= self.center_freq <= 108000000:
+                ticker_text = f"FM Broadcast ({self.center_freq / 1e6:.1f} MHz)"
+            elif self.center_freq < 30000000:
+                ticker_text = f"AM / Shortwave ({self.center_freq / 1e3:.0f} kHz)"
+            else:
+                ticker_text = f"VHF Station ({self.center_freq / 1e6:.2f} MHz)"
 
-        # 2. 情報パネル (ステータスバッジ + 本格SメーターLEDバー)
-        x0 = self.info_rect.x + 14
-        y0 = self.info_rect.y + 8
-        w1 = self._draw_chip(f"MODE {self.mode}", x0, y0, (210, 236, 248))
-        status = getattr(self, "stereo_status", None) or ("STEREO" if self.is_stereo else "MONO")
-        if status == "STEREO":
-            st_txt, st_col = t("stereo"), (206, 240, 226)
-        elif status == "BLEND":
-            st_txt, st_col = t("blend"), (250, 234, 206)
+        name_surf = cached_text(self.font_station, ticker_text, ticker_color)
+        max_name_w = self.hero_rect.width - 160
+        if name_surf.get_width() > max_name_w:
+            self.screen.blit(name_surf, (self.hero_rect.x + 18, self.hero_rect.y + 24),
+                             (0, 0, max_name_w, name_surf.get_height()))
         else:
-            st_txt, st_col = t("mono"), (236, 238, 244)
-        self._draw_chip(st_txt, x0 + w1 + 18, y0, st_col)
+            self.screen.blit(name_surf, (self.hero_rect.x + 18, self.hero_rect.y + 24))
 
-        # 本格的SメーターLEDバーの描画 (テレメトリチップの溢れを廃止し、美しいLEDメーターに！)
+        # 中下段: 周波数各桁の当たり判定とアンダーライン描画 (桁単位ホイール同調)
+        if self.center_freq >= 1000000:
+            freq_str = f"{self.center_freq / 1e6:.4f}"
+            unit = "MHz"
+        else:
+            freq_str = f"{self.center_freq / 1e3:.1f}"
+            unit = "kHz"
+
+        self.freq_digit_hitboxes = []
+        cur_x = self.hero_rect.x + 18
+        base_y = self.hero_rect.y + 44
+
+        dot_idx = freq_str.find(".")
+        for i, ch in enumerate(freq_str):
+            ch_surf = cached_text(self.font_huge, ch, C_TEXT)
+            ch_w = ch_surf.get_width()
+            ch_rect = pygame.Rect(cur_x, base_y, ch_w, ch_surf.get_height())
+            self.screen.blit(ch_surf, (cur_x, base_y))
+
+            if ch.isdigit():
+                if self.center_freq >= 1000000:
+                    power = dot_idx - 1 - i if i < dot_idx else dot_idx - i
+                    step_hz = int(round(10 ** power * 1e6))
+                else:
+                    power = dot_idx - 1 - i if i < dot_idx else dot_idx - i
+                    step_hz = int(round(10 ** power * 1e3))
+
+                if step_hz >= 100:
+                    self.freq_digit_hitboxes.append((ch_rect, step_hz))
+                    if self.hovered_freq_digit == step_hz:
+                        pygame.draw.line(self.screen, C_ACCENT,
+                                         (cur_x + 1, base_y + ch_surf.get_height() - 4),
+                                         (cur_x + ch_w - 2, base_y + ch_surf.get_height() - 4), 3)
+
+            cur_x += ch_w
+
+        unit_surf = cached_text(self.font_med, unit, C_ACCENT_DARK)
+        self.screen.blit(unit_surf, (cur_x + 6, base_y + 16))
+
+        # モードバッジ & ステレオバッジ
+        badge_x = cur_x + 56
+        if badge_x + 140 < self.hero_rect.right - 10:
+            w1 = self._draw_chip(f"MODE {self.mode}", badge_x, base_y + 14, (214, 236, 248))
+            status = getattr(self, "stereo_status", None) or ("STEREO" if self.is_stereo else "MONO")
+            st_col = (206, 240, 226) if status == "STEREO" else (236, 238, 244)
+            self._draw_chip(status, badge_x + w1 + 10, base_y + 14, st_col)
+
+        # 下段: 音量スライダー
+        vol_lbl = cached_text(self.font_tiny, "VOL", (120, 138, 160))
+        self.screen.blit(vol_lbl, (self.hero_rect.x + 18, self.hero_rect.y + 102))
+        vr = self.vol_rect
+        pygame.draw.rect(self.screen, (224, 232, 242), (vr.x, vr.y + 4, vr.width, 6), border_radius=3)
+        vol_fill_w = int(self.volume * vr.width)
+        pygame.draw.rect(self.screen, (0, 190, 160), (vr.x, vr.y + 4, vol_fill_w, 6), border_radius=3)
+        knob_cx = vr.x + vol_fill_w
+        pygame.draw.circle(self.screen, (255, 255, 255), (knob_cx, vr.y + 7), 6)
+        pygame.draw.circle(self.screen, (0, 190, 160), (knob_cx, vr.y + 7), 6, 2)
+        vol_pct = cached_text(self.font_tiny, f"{int(self.volume * 100)}%", (90, 110, 135))
+        self.screen.blit(vol_pct, (vr.right + 8, vr.y))
+
+        # オーディオ品質バッジ (HI-FI)
+        hi_fi = cached_text(self.font_tiny, "HI-FI AUDIO", (0, 150, 125))
+        self.screen.blit(hi_fi, (vr.right + 48, vr.y))
+
+        # ============================================================
+        # 2. BAND SELECTOR (info_rect: 558, 14, 548, 116)
+        # ============================================================
+        # 右上: アンテナ受信ピクトグラム 📶 (5本バー)
+        ant_x = self.info_rect.right - 104
+        ant_y = self.info_rect.y + 8
+        su = max(0.0, float(self.s_units))
+        active_bars = min(5, max(1, int(round(su / 9.0 * 5)))) if su > 0.3 else 1
+        for bi in range(5):
+            bar_h = 4 + bi * 3
+            bx = ant_x + bi * 5
+            by = ant_y + 16 - bar_h
+            b_col = (0, 190, 160) if bi < active_bars else (210, 222, 234)
+            pygame.draw.rect(self.screen, b_col, (bx, by, 3, bar_h), border_radius=1)
+        sig_lbl = cached_text(self.font_tiny, "SIGNAL", (120, 138, 160))
+        self.screen.blit(sig_lbl, (ant_x + 30, ant_y + 4))
+
+        # バンドボタンのアクティブ同期
+        is_fm = (76000000 <= self.center_freq <= 108000000)
+        is_am = (500000 <= self.center_freq <= 1750000)
+        is_sw = (3000000 <= self.center_freq <= 30000000)
+        if hasattr(self, "btn_band_fm"):
+            self.btn_band_fm.is_active = is_fm
+        if hasattr(self, "btn_band_am"):
+            self.btn_band_am.is_active = is_am
+        if hasattr(self, "btn_band_sw"):
+            self.btn_band_sw.is_active = is_sw
+
+        # 本格的SメーターLEDバーの描画 (幅いっぱいゆったりと)
         sm_w = self.info_rect.width - 28
-        self._draw_smeter(x0, y0 + 30, sm_w, 42)
+        self._draw_smeter(self.info_rect.x + 14, self.info_rect.y + 64, sm_w, 42)
+
 
     def _draw_spectrum(self, spectrum_db):
         self._draw_panel("spec", self.spec_rect)
@@ -1329,14 +1471,6 @@ class SdrGui:
             self.screen.blit(surf, (bx + 6, by + 3))
 
     def _draw_controls(self):
-        # プリセットが存在する場合のみ、左端にバンドタグを描画
-        if self.presets_fm:
-            self.screen.blit(cached_text(self.font_tiny, "FM", C_MUTED),
-                             (self.preset_rect.x + 16, self.preset_rect.y + 14))
-        if self.presets_am:
-            self.screen.blit(cached_text(self.font_tiny, "AM", C_MUTED),
-                             (self.preset_rect.x + 16, self.preset_rect.y + 45))
-
         # ステータスバー (右端の検出局数と被らないよう幅をガード)
         max_st_w = self.status_rect.width - 150
         st_surf = cached_text(self.font_small, f"{t('rx_status')}: {self.scan_status_text}", C_ACCENT_DARK)

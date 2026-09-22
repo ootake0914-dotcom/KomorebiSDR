@@ -149,15 +149,19 @@ def test_button_tactile_feedback():
 
 
 def test_header_vertical_separation():
-    """周波数巨大数字と下段ティッカーの上下被りがないことを検証"""
+    """周波数巨大数字がhero_rect内に収まり、ボリュームスライダーと被らないことを検証"""
     gui = SdrGui()
     dummy_spec = np.zeros(1024, dtype=np.float32)
     gui.render(dummy_spec)
 
-    ticker_y = gui.hero_rect.y + 69
-    # 周波数各桁の底辺 (下線位置) がティッカーのY座標より上にあること
+    # 周波数各桁の底辺がボリュームスライダーのY座標(hero_rect.y + 92)より上にあること
+    vol_y = gui.hero_rect.y + 100
     for rect, _ in gui.freq_digit_hitboxes:
-        assert rect.bottom <= ticker_y, f"Digit rect bottom {rect.bottom} overlaps ticker_y {ticker_y}"
+        assert rect.bottom <= vol_y, f"Digit rect bottom {rect.bottom} overlaps vol_y {vol_y}"
+
+    # 周波数各桁がhero_rect内に完全に収まっていること
+    for rect, _ in gui.freq_digit_hitboxes:
+        assert gui.hero_rect.contains(rect), f"Digit rect {rect} outside hero_rect {gui.hero_rect}"
 
     print("[OK] Header vertical text separation verified (no overlap)")
     gui.close()

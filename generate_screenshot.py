@@ -37,8 +37,12 @@ def generate_screenshot(output_path="assets/screenshot.png"):
         {"name": "短波日経 6.055M", "freq_hz": 6055000, "mode": "AM"},
     ]
     gui.detected_stations = [
-        {"name": "TOKYO FM", "freq_hz": 80000000, "freq_mhz": 80.0, "snr_db": 28.5, "quality": "STRONG"},
-        {"name": "J-WAVE", "freq_hz": 80350000, "freq_mhz": 80.35, "snr_db": 18.0, "quality": "MEDIUM"},
+        {"name": "TOKYO FM", "freq_hz": 80000000, "freq_mhz": 80.0, "snr_db": 28.5, "quality": "STRONG", "mode": "WFM"},
+        {"name": "J-WAVE", "freq_hz": 81300000, "freq_mhz": 81.3, "snr_db": 22.0, "quality": "STRONG", "mode": "WFM"},
+        {"name": "NHK-FM", "freq_hz": 82500000, "freq_mhz": 82.5, "snr_db": 18.5, "quality": "MEDIUM", "mode": "WFM"},
+        {"name": "NHK水戸", "freq_hz": 83200000, "freq_mhz": 83.2, "snr_db": 14.0, "quality": "MEDIUM", "mode": "WFM"},
+        {"name": "TBS Radio", "freq_hz": 90500000, "freq_mhz": 90.5, "snr_db": 20.0, "quality": "STRONG", "mode": "WFM"},
+        {"name": "文化放送", "freq_hz": 91600000, "freq_mhz": 91.6, "snr_db": 16.0, "quality": "MEDIUM", "mode": "WFM"},
     ]
     gui.set_presets(fm_presets, am_presets)
 
