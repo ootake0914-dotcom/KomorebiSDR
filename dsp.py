@@ -74,6 +74,26 @@ from dsp_filters import (
 from dsp_resampler import AdaptiveDriftResampler
 
 
+# 黒魔法三点セット (弱電界検出補助)。既定ではdsp経路に接続しない。
+# import失敗時はNoneとなり、配線側のhasattr/Noneガードで既存経路のみ動作する。
+try:
+    from cyclostationary_detector import CyclostationaryPilotDetector
+except ImportError:
+    CyclostationaryPilotDetector = None
+try:
+    from rmt_denoiser import SafeRmtDenoiser
+except ImportError:
+    SafeRmtDenoiser = None
+try:
+    from stochastic_resonance import StochasticResonanceDetector
+except ImportError:
+    StochasticResonanceDetector = None
+try:
+    from black_magic import BlackMagicController
+except ImportError:
+    BlackMagicController = None
+
+
 class SdrDspPipeline:
     """超低ノイズ・超高音質 SDR 信号処理パイプライン"""
 
@@ -314,6 +334,30 @@ class SdrDspPipeline:
         # 弱電界FMでハイカットでは消せない番組帯ノイズを低減。クリーン時は透明)
         self.mono_nr = MonoNoiseSuppressor(sample_rate=self.audio_rate)
         self.mono_nr_enabled = True
+
+        # ===== 黒魔法三点セット (弱電界検出補助。既定は全て無効) =====
+        # master=self.black_magic_enabled がFalseの間は一切動作せず、
+        # 既存経路とビット同一の出力を保つ (tests/test_black_magic.pyで検証)。
+        # 各インスタンスは遅延生成 (有効化時のみ) し、失敗時はNoneのまま
+        # 既存経路へフォールバックする。
+        self.black_magic_enabled = False
+        self.bm_cyclo_enabled = False
+        self.bm_rmt_enabled = False
+        self.bm_sr_enabled = False
+        self.cyclo_detector = None
+        self.bm_rmt = None
+        self.bm_sr = None
+        self.bm_controller = None
+        self.bm_cyclo_min_conf = 0.55
+        self.bm_cyclo_confidence = 0.0
+        self.bm_sr_confidence = 0.0
+        self.bm_rmt_cap = 0.65
+        # flutter検出用lock履歴 (直近32ブロック) と判定閾値
+        self._bm_lock_hist = deque(maxlen=32)
+        self.bm_flutter_std = 0.15
+        self._bm_params = None
+        self._bm_last_rmt_info = None
+        self._bm_sr_tw = None  # SR用19kHz単一ビンtwiddleキャッシュ
 
         # ===== RDS (57kHz) =====
         self.rds_enabled = True
@@ -621,6 +665,25 @@ class SdrDspPipeline:
             self.mono_nr.reset()
         if hasattr(self, "sic_canceller"):
             self.sic_canceller.reset()
+        # 黒魔法状態も選局でリセット (前局のconfidence・強度を持ち越さない)
+        try:
+            if getattr(self, "cyclo_detector", None) is not None:
+                self.cyclo_detector.reset()
+            if getattr(self, "bm_rmt", None) is not None:
+                self.bm_rmt.reset()
+            if getattr(self, "bm_sr", None) is not None:
+                self.bm_sr.reset()
+            if getattr(self, "bm_controller", None) is not None:
+                self.bm_controller.reset()
+        except Exception:
+            pass
+        self.bm_cyclo_confidence = 0.0
+        self.bm_sr_confidence = 0.0
+        try:
+            if getattr(self, "_bm_lock_hist", None) is not None:
+                self._bm_lock_hist.clear()
+        except Exception:
+            pass
         self._sic_detect_counter = 0
         # RDS状態も選局でリセット (前局のPS/PI/RTを次局へ持ち越さない)
         if self.rds is not None:
@@ -1097,6 +1160,52 @@ class SdrDspPipeline:
         if getattr(self, "ultra_squelch", None) is not None and self.ultra_squelch.enabled:
             ultra_gain, _ = self.ultra_squelch.process(demod)
 
+        # 黒魔法C: 確率共鳴は検出用副経路のみ。メインのdemod配列には一切触らない。
+        # confidenceを属性 (bm_sr_confidence) として公開するだけで、
+        # スケルチ判定への自動反映は既存動作との競合回避のため見送る。
+        # (評価はbenchmark_black_magic.pyの検出率比較で行う)
+        if (getattr(self, "black_magic_enabled", False)
+                and getattr(self, "bm_sr_enabled", False)):
+            try:
+                _bmp2 = getattr(self, "_bm_params", None) or {}
+                # コントローラがSR非活性と判断したら試行自体を休止する
+                _sr_active = bool(_bmp2.get("sr_active", True))
+                if self.bm_sr is None and StochasticResonanceDetector is not None:
+                    self.bm_sr = StochasticResonanceDetector()
+                if (self.bm_sr is not None and _sr_active
+                        and len(demod) >= 1024):
+                    n_sr = len(demod)
+                    if self._bm_sr_tw is None or self._bm_sr_tw[0] != n_sr:
+                        k_sr = int(round(19000.0 * n_sr / float(self.if_rate)))
+                        k_sr = min(max(k_sr, 1), n_sr - 1)
+                        self._bm_sr_tw = (
+                            n_sr,
+                            np.exp(-2j * np.pi * k_sr * np.arange(n_sr) / n_sr))
+                    _tw = self._bm_sr_tw[1]
+
+                    def _bm_base(v, _tw=_tw, _n=n_sr):
+                        vv = np.asarray(v, dtype=np.float64).reshape(-1)
+                        if len(vv) != _n:
+                            return False
+                        return bool(abs(np.dot(vv, _tw)) * (2.0 / _n) > 0.02)
+
+                    _uq = getattr(self, "ultra_squelch", None)
+                    floor = 10.0 ** (float(getattr(_uq, "noise_db", -40.0)) / 20.0)
+                    snr = float(getattr(self, "s_meter_dbfs", -45.0)) + 45.0
+                    base_conf = min(max(float(getattr(self, "stereo_pilot_lock",
+                                                      0.0)), 0.0), 1.0)
+                    res = self.bm_sr.assess(
+                        demod, _bm_base, floor, snr, base_conf,
+                        clip=False,  # dspにADCクリップ旗なし。過大時は使わないこと
+                        candidate_present=bool(self.stereo_enabled))
+                    if res.get("enabled"):
+                        self.bm_sr_confidence = float(res.get("sr_confidence",
+                                                              base_conf))
+                    else:
+                        self.bm_sr_confidence = base_conf
+            except Exception:
+                pass
+
         # AFC (Automatic Frequency Control): 復調信号のDCバイアスから周波数偏差を推定してフィードバック
         if self.afc_enabled and len(demod) > 0:
             mean_dc = float(np.mean(demod))
@@ -1231,6 +1340,34 @@ class SdrDspPipeline:
             if ultra_gain < 0.999:
                 left = left * ultra_gain
                 right = right * ultra_gain
+            # 黒魔法B: ステレオ対のMid/Side安全RMT (既定OFF)。
+            # L/R独立処理は分離度を落とすため、Mid通常・Side低強度で処理する。
+            # 既存rmt_denoiser側との二重処理は避けること (docs参照)。
+            if (getattr(self, "black_magic_enabled", False)
+                    and getattr(self, "bm_rmt_enabled", False)):
+                try:
+                    if self.bm_rmt is None and SafeRmtDenoiser is not None:
+                        self.bm_rmt = SafeRmtDenoiser(sample_rate=self.audio_rate)
+                    if self.bm_rmt is not None and len(left) == len(right):
+                        self.bm_rmt.max_strength = min(max(
+                            float(getattr(self, "bm_rmt_cap", 0.65)), 0.0), 0.85)
+                        (left, right), _bm_info = self.bm_rmt.process_stereo(
+                            left, right,
+                            s_meter_dbfs=float(getattr(self, "s_meter_dbfs",
+                                                       -20.0)),
+                            snr_db=None)
+                        left = np.asarray(left, dtype=np.float32)
+                        right = np.asarray(right, dtype=np.float32)
+                        try:
+                            _bm_mid = (_bm_info.get("mid", None) or {})
+                            self._bm_last_rmt_info = {
+                                "hf_loss_db": float(_bm_mid.get("hf_loss_db", 0.0)),
+                                "rms_diff_db": float(_bm_mid.get("rms_diff_db", 0.0)),
+                            }
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
             blend = self._stereo_blend * (self.stereo_nr_gain if self.stereo_nr_enabled else 1.0) \
                 * self.multipath_gain
             self.is_stereo = blend > 0.5
@@ -1256,6 +1393,29 @@ class SdrDspPipeline:
         out_mono = self._post_process_wfm(mono_out, "")
         if ultra_gain < 0.999:
             out_mono = out_mono * ultra_gain
+        # 黒魔法B: モノラル経路の安全RMT (既定OFF)
+        if (getattr(self, "black_magic_enabled", False)
+                and getattr(self, "bm_rmt_enabled", False)):
+            try:
+                if self.bm_rmt is None and SafeRmtDenoiser is not None:
+                    self.bm_rmt = SafeRmtDenoiser(sample_rate=self.audio_rate)
+                if self.bm_rmt is not None:
+                    self.bm_rmt.max_strength = min(max(
+                        float(getattr(self, "bm_rmt_cap", 0.65)), 0.0), 0.85)
+                    out_mono, _bm_info_m = self.bm_rmt.process_mono(
+                        out_mono,
+                        s_meter_dbfs=float(getattr(self, "s_meter_dbfs", -20.0)),
+                        snr_db=None, ch="bm")
+                    out_mono = np.asarray(out_mono, dtype=np.float32)
+                    try:
+                        self._bm_last_rmt_info = {
+                            "hf_loss_db": float(_bm_info_m.get("hf_loss_db", 0.0)),
+                            "rms_diff_db": float(_bm_info_m.get("rms_diff_db", 0.0)),
+                        }
+                    except Exception:
+                        pass
+            except Exception:
+                pass
         return np.clip(out_mono, -1.0, 1.0)
 
     def _delay_mono(self, mono: np.ndarray) -> np.ndarray:
@@ -1685,6 +1845,10 @@ class SdrDspPipeline:
             s_meter = getattr(self, "s_meter_dbfs", -20.0)
             audio = self.rmt_denoiser.process(audio, ch=ch, s_meter_dbfs=s_meter)
 
+        # NOTE: 黒魔法Bはチャンネル別ポスト内では処理しない。L/R独立処理は
+        # チャンネル間をdecorrelateし分離度を落とす (ベンチで-3〜-4dB悪化を実測)。
+        # ステレオはdemodulate_wfmのスタック直前でMid/Side処理する。
+
         # 単一ch スペクトル抑圧NR (帯域内ノイズの最小統計Wiener抑圧)
         # 弱電界FMの番組帯ノイズ (ハイカットでは消せない) を低減する。
         # クリーン/定常信号ではゲイン1で透明に通過する自己ゲート方式。
@@ -1695,6 +1859,38 @@ class SdrDspPipeline:
             audio = self.mono_nr.process(audio, ch=ch)
 
         return audio.astype(np.float32)
+
+    def _bm_attack_limit(self, lock: float) -> float:
+        """黒魔法Aのblend上昇レート (既定0.25=従来動作)。
+
+        confidence低＋lock低の安定弱信号のときのみ鈍化させる。
+        flutter中 (直近lockの標準偏差が閾値超) は介入すると上昇だけ
+        鈍ってblendが下げ方向にラチェットするため、従来レートに戻す
+        (77.5MHz実測で崩落を確認した副作用の対策)。
+        """
+        try:
+            if not (getattr(self, "black_magic_enabled", False)
+                    and getattr(self, "bm_cyclo_enabled", False)):
+                return 0.25
+            lock_f = float(lock)
+            if not math.isfinite(lock_f):
+                return 0.25
+            # 既存PLLが正常ロックしている場合は介入しない
+            if lock_f > 0.5:
+                return 0.25
+            hist = getattr(self, "_bm_lock_hist", None)
+            if hist is not None and len(hist) >= 8:
+                sd = float(np.std(np.asarray(hist, dtype=np.float64)))
+                if math.isfinite(sd) and sd > float(getattr(self, "bm_flutter_std",
+                                                             0.15)):
+                    return 0.25
+            conf = float(getattr(self, "bm_cyclo_confidence", 0.0))
+            if conf < float(getattr(self, "bm_cyclo_min_conf", 0.55)):
+                _bmp = getattr(self, "_bm_params", None) or {}
+                return float(_bmp.get("blend_attack_limit", 0.05))
+            return 0.25
+        except Exception:
+            return 0.25
 
     def _update_stereo_pilot(self, mpx: np.ndarray):
         """19kHzパイロットPLLを更新し、ステレオブレンド係数とRDS用57kHz搬送波を生成する"""
@@ -1741,6 +1937,23 @@ class SdrDspPipeline:
                 self.stereo_pilot_ratio = 0.0
                 return
             sig = np.ascontiguousarray(np.asarray(mpx, dtype=np.float32) / pilot_rms, dtype=np.float32)
+            # 黒魔法A: 検出のみ行い、上昇レート判断は後段の_bm_attack_limitへ委ねる。
+            # PLLゲイン自体には触らない。
+            # (コントローラがcyclo非活性と判断した場合は検出自体を休止する)
+            if (getattr(self, "black_magic_enabled", False)
+                    and getattr(self, "bm_cyclo_enabled", False)):
+                try:
+                    _bmp = getattr(self, "_bm_params", None) or {}
+                    _cyc_active = bool(_bmp.get("cyclo_active", True))
+                    if (self.cyclo_detector is None
+                            and CyclostationaryPilotDetector is not None):
+                        self.cyclo_detector = CyclostationaryPilotDetector(
+                            sample_rate=self.if_rate)
+                    if self.cyclo_detector is not None and _cyc_active:
+                        cyc = self.cyclo_detector.update(mpx)
+                        self.bm_cyclo_confidence = float(cyc.get("confidence", 0.0))
+                except Exception:
+                    pass
             cos2 = np.empty(n, dtype=np.float32)
             sin2 = np.empty(n, dtype=np.float32)
             quality = ctypes.c_float(0.0)
@@ -1778,6 +1991,13 @@ class SdrDspPipeline:
             ratio = pilot_rms / mpx_rms
             lock = float(quality.value)  # 正規化パイロット基準: ロック時 ~0.5-0.7
             self.stereo_pilot_lock = lock
+            # flutter検出用にlock履歴を保持 (ラチェット防止。固定長で自動破棄)
+            try:
+                _hlh = getattr(self, "_bm_lock_hist", None)
+                if _hlh is not None and math.isfinite(lock):
+                    _hlh.append(lock)
+            except Exception:
+                pass
             self.stereo_pilot_ratio = ratio
 
             if not self.stereo_enabled:
@@ -1804,7 +2024,8 @@ class SdrDspPipeline:
                 target = min(1.0, (ratio - 0.02) / 0.04)
 
             if target > self._stereo_blend:
-                self._stereo_blend = min(target, self._stereo_blend + 0.25)
+                self._stereo_blend = min(target, self._stereo_blend
+                                         + self._bm_attack_limit(lock))
                 self._pilot_hold_n = 0
             elif target >= self._stereo_blend - 1e-9:
                 # ロック定常の等値: 低下ではないため保持枠を消費しない
@@ -2211,6 +2432,8 @@ class SdrDspPipeline:
         return self.fft_smooth.astype(np.float32)
 
     def process(self, raw_bytes: np.ndarray, mode: str = "WFM") -> tuple[np.ndarray, np.ndarray]:
+        # 黒魔法CPU計測用 (master OFF時は取得しない)
+        _bm_t0 = time.perf_counter() if getattr(self, "black_magic_enabled", False) else 0.0
         # 前回余った端数バイトと結合
         if len(self.raw_leftover) > 0:
             raw_bytes = np.concatenate((self.raw_leftover, raw_bytes))
@@ -2279,6 +2502,41 @@ class SdrDspPipeline:
             audio = self.demodulate_ssb(iq_48, mode)
         else:
             audio = self.demodulate_wfm(iq_if)
+
+        # 黒魔法統合マネージャ: 安全パラメータの計算のみ (音声には触らない)。
+        # 既定OFF時はゼロコストでスキップする。
+        self._bm_params = None
+        if getattr(self, "black_magic_enabled", False):
+            try:
+                if self.bm_controller is None and BlackMagicController is not None:
+                    self.bm_controller = BlackMagicController(enabled=True)
+                if self.bm_controller is not None:
+                    _bm_cpu = 0.0
+                    try:
+                        _bm_dt = len(iq_if) / float(self.if_rate)
+                        _bm_cpu = ((time.perf_counter() - _bm_t0)
+                                   / max(_bm_dt, 1e-6) * 100.0)
+                    except Exception:
+                        pass
+                    _bm_last = getattr(self, "_bm_last_rmt_info", None) or {}
+                    _bm_deg = (float(_bm_last.get("hf_loss_db", 0.0)) < -6.0
+                               or float(_bm_last.get("rms_diff_db", 0.0)) < -3.0)
+                    _uq2 = getattr(self, "ultra_squelch", None)
+                    self._bm_params = self.bm_controller.process_metrics({
+                        "snr_db": float(getattr(self, "s_meter_dbfs", -45.0)) + 45.0,
+                        "clipped": False,  # dspにADCクリップ旗なし
+                        "pilot_confidence": float(getattr(self, "bm_cyclo_confidence",
+                                                           0.0)),
+                        "stereo_blend": float(getattr(self, "_stereo_blend", 0.0)),
+                        "squelch_confidence": float(getattr(_uq2, "current_gain",
+                                                             1.0)),
+                        "cpu_percent": float(min(max(_bm_cpu, 0.0), 100.0)),
+                        "audio_degraded": bool(_bm_deg),
+                    })
+                    if not self._bm_params.get("bypass_all", True):
+                        self.bm_rmt_cap = float(self._bm_params.get("rmt_cap", 0.0))
+            except Exception:
+                self._bm_params = None
 
         # Sメーター: チャンネル通過後の電力を平滑化 (S9=-30dBFS, 6dB/S-unitの目安)
         try:

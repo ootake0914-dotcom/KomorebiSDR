@@ -287,12 +287,19 @@ class RmtHankelDenoiser:
             "_l": np.zeros(self._hist_len, dtype=np.float32),
             "_r": np.zeros(self._hist_len, dtype=np.float32),
         }
+        # 診断公開値 (SafeRmtDenoiser用。処理内容には影響しない)
+        self.last_retained_rank = 0
+        self.last_sigma2 = 0.0
+        self.last_gamma = 0.0
 
     def reset(self):
         """内部状態リセット"""
         self._frame_count = 0
         self._cached_kernel = None
         self._cached_sigma2 = 0.0
+        self.last_retained_rank = 0
+        self.last_sigma2 = 0.0
+        self.last_gamma = 0.0
         for h in self._histories.values():
             h.fill(0)
 
@@ -342,6 +349,10 @@ class RmtHankelDenoiser:
             # ノイズ固有値の切除 (BBP相転移閾値)
             retained = np.maximum(0.0, eigvals - sigma2_est)
             retained[eigvals <= lambda_plus] = 0.0
+            # 診断公開 (処理内容不変)
+            self.last_retained_rank = int(np.count_nonzero(retained > 0.0))
+            self.last_sigma2 = float(sigma2_est)
+            self.last_gamma = float(gamma)
 
             # 信号射影行列 P = U Lambda_s U^T
             denom = eigvals + 1e-12

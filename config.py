@@ -193,6 +193,33 @@ DEFAULT_CONFIG = {
     "presets_am": [],
     "presets_region": None,   # プリセットを生成した地域 (地域変更で無効化)
     "ppm": None,              # ドングルPPM較正値 (None = 未較正)。PpmCalibratorが自動更新
+    # 黒魔法三点セット (弱電界検出補助)。master既定OFF: 全機能が既存経路のみで動作。
+    # 各機能は独立にON/OFFでき、音声を壊しうるRMT/SRは既定で無効または最小強度。
+    "black_magic": {
+        "enabled": False,
+        "cyclostationary": {
+            "enabled": True,       # master ON時のみ有効 (PLL置換ではなく助言)
+            "pilot_frequency_hz": 19000.0,
+            "min_confidence": 0.55,
+            "smoothing_seconds": 0.25,
+        },
+        "rmt_denoiser": {
+            "enabled": False,      # 既定無効 (音声変形リスクのため)
+            "max_strength": 0.65,
+            "max_rank": 8,
+            "max_matrix_size": 256,
+            "cpu_budget_percent": 20.0,
+        },
+        "stochastic_resonance": {
+            "enabled": False,      # 既定無効 (検出補助専用)
+            "detector_only": True,  # Falseは拒否される (音声経路保護)
+            "sigma_ratio_min": 0.01,
+            "sigma_ratio_max": 0.10,
+            "trials": 4,
+            "min_snr_db": -5.0,
+            "max_snr_db": 12.0,
+        },
+    },
 }
 
 
@@ -216,6 +243,63 @@ def _clean_preset_list(v, default_mode: str) -> list:
             m = default_mode
         out.append({"name": str(p.get("name", "?")), "freq_hz": fi,
                     "mode": m})
+    return out
+
+
+def _clean_black_magic(v) -> dict:
+    """black_magic設定を検証・正規化 (破損値は既定へ戻す。未知キーは捨てる)。"""
+    import copy
+    default = copy.deepcopy(DEFAULT_CONFIG["black_magic"])
+    if not isinstance(v, dict):
+        return default
+    out = copy.deepcopy(default)
+    m = v.get("enabled", False)
+    if isinstance(m, bool):
+        out["enabled"] = m
+
+    def _num(d, key, lo, hi, integer=False):
+        try:
+            x = d.get(key, None)
+            if isinstance(x, bool):
+                return
+            if isinstance(x, (int, float)):
+                v = min(max(float(x), lo), hi)
+                out_sub[key] = int(round(v)) if integer else v
+        except (TypeError, ValueError):
+            pass
+
+    c = v.get("cyclostationary")
+    if isinstance(c, dict):
+        out_sub = out["cyclostationary"]
+        if isinstance(c.get("enabled"), bool):
+            out_sub["enabled"] = c["enabled"]
+        _num(c, "pilot_frequency_hz", 1000.0, 100000.0)
+        _num(c, "min_confidence", 0.0, 1.0)
+        _num(c, "smoothing_seconds", 0.01, 5.0)
+    r = v.get("rmt_denoiser")
+    if isinstance(r, dict):
+        out_sub = out["rmt_denoiser"]
+        if isinstance(r.get("enabled"), bool):
+            out_sub["enabled"] = r["enabled"]
+        _num(r, "max_strength", 0.0, 1.0)
+        _num(r, "max_rank", 1, 64, integer=True)
+        _num(r, "max_matrix_size", 16, 4096, integer=True)
+        _num(r, "cpu_budget_percent", 0.0, 100.0)
+    s = v.get("stochastic_resonance")
+    if isinstance(s, dict):
+        out_sub = out["stochastic_resonance"]
+        if isinstance(s.get("enabled"), bool):
+            out_sub["enabled"] = s["enabled"]
+        # detector_only=Falseは受け付けない (音声経路保護のため常にTrue)
+        _num(s, "sigma_ratio_min", 0.0, 1.0)
+        _num(s, "sigma_ratio_max", 0.0, 1.0)
+        _num(s, "trials", 2, 16, integer=True)
+        _num(s, "min_snr_db", -40.0, 40.0)
+        _num(s, "max_snr_db", -40.0, 40.0)
+    if out["stochastic_resonance"]["sigma_ratio_min"] > \
+            out["stochastic_resonance"]["sigma_ratio_max"]:
+        out["stochastic_resonance"]["sigma_ratio_min"] = \
+            out["stochastic_resonance"]["sigma_ratio_max"]
     return out
 
 
@@ -252,6 +336,8 @@ def load_config() -> dict:
                         pass
                     elif isinstance(v, (int, float)) and -200.0 <= float(v) <= 200.0:
                         cfg[k] = int(v)
+                elif k == "black_magic":
+                    cfg[k] = _clean_black_magic(v)
                 # 型不一致は既定値を維持 (破損値でのクラッシュ防止)
     except FileNotFoundError:
         pass
