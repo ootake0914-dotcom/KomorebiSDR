@@ -28,8 +28,8 @@ def test_gui_panel_boundaries():
     spec = gui.spec_rect
     tele = gui.tele_rect
     tune = gui.tune_rect
-    # gain_rectは廃止 (GAIN/AUDIOパネル削除)。衝突検証の対象外。
-    preset = gui.preset_rect
+    # preset_rectは廃止 (ステーションカード削除)。衝突検証の対象外。
+    wf = gui.wf_rect
     status = gui.status_rect
 
     # 1. ヒーローパネルと情報パネルが重なっていないこと
@@ -44,8 +44,8 @@ def test_gui_panel_boundaries():
     # 3. スペクトラム系と右側コントロール系が横方向に衝突していないこと
     assert spec.right <= tele.left, f"Spec right {spec.right} > Tele left {tele.left}"
 
-    # 4. プリセットとステータスバーが縦方向に衝突していないこと
-    assert preset.bottom < status.top, f"Preset bottom {preset.bottom} >= Status top {status.top}"
+    # 4. ウォーターフォールとステータスバーが縦方向に衝突していないこと
+    assert wf.bottom < status.top, f"Waterfall bottom {wf.bottom} >= Status top {status.top}"
 
     print("[OK] UI panel boundary & layout collision test passed")
     gui.close()

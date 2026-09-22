@@ -255,11 +255,11 @@ class SdrGui:
         self.hero_rect = pygame.Rect(14, 14, 530, 116)
         self.info_rect = pygame.Rect(558, 14, 548, 116)
         self.spec_rect = pygame.Rect(14, 142, 800, 200)
-        self.wf_rect = pygame.Rect(14, 348, 800, 132)
+        self.wf_rect = pygame.Rect(14, 348, 800, 312)  # 下部カード廃止で縦に拡大
         # wave/gainパネルは廃止 (ダミーrectも持たない)。
         self.tele_rect = pygame.Rect(826, 142, 280, 96)
-        self.tune_rect = pygame.Rect(826, 246, 280, 234)
-        self.preset_rect = pygame.Rect(14, 490, 1092, 174)
+        self.tune_rect = pygame.Rect(826, 246, 280, 414)  # 下部まで延長 (カード廃止分)
+        # preset_rectは廃止 (ステーションカード削除)。プリセットデータはconfig側で維持。
         self.status_rect = pygame.Rect(14, 674, 1092, 32)
         self.is_favorite = False
         self.fav_rect = pygame.Rect(self.hero_rect.right - 40, self.hero_rect.y + 10, 26, 24)
@@ -378,7 +378,6 @@ class SdrGui:
         for name, rect in (
             ("hero", self.hero_rect), ("info", self.info_rect),
             ("tele", self.tele_rect), ("tune", self.tune_rect),
-            ("preset", self.preset_rect),
         ):
             self.panels[name] = self._glass(rect.width, rect.height)
         # 廃止パネル (gain/wave) のダミーは作らない。参照側も削除済み。
@@ -395,7 +394,6 @@ class SdrGui:
         for name, rect in (
             ("hero", self.hero_rect), ("info", self.info_rect),
             ("tele", self.tele_rect), ("tune", self.tune_rect),
-            ("preset", self.preset_rect),
             ("spec", self.spec_rect), ("wf", self.wf_rect),
             ("status", self.status_rect),
         ):
@@ -406,7 +404,6 @@ class SdrGui:
         baked.blit(cached_text(self.font_tiny, "NOW PLAYING HUB", C_MUTED), (self.hero_rect.x + 18, self.hero_rect.y + 8))
         baked.blit(cached_text(self.font_tiny, "BAND SELECTOR", C_MUTED), (self.info_rect.x + 18, self.info_rect.y + 8))
         baked.blit(cached_text(self.font_tiny, "ONE-TOUCH DISCOVERY", C_MUTED), (self.tune_rect.x + 14, self.tune_rect.y + 8))
-        baked.blit(cached_text(self.font_tiny, "STATION CARDS", C_MUTED), (self.preset_rect.x + 18, self.preset_rect.y + 8))
         baked.blit(cached_text(self.font_title, t("status"), C_MUTED), (self.tele_rect.x + 14, self.tele_rect.y + 8))
         lbl_wf = cached_text(self.font_tiny, t("waterfall"), (110, 128, 150))
         baked.blit(lbl_wf, (self.wf_rect.x + 12, self.wf_rect.y + 6))
@@ -461,91 +458,6 @@ class SdrGui:
             out.append({"freq_hz": fi, "name": str(p.get("name", "?")),
                         "mode": m})
         return out
-
-    def _draw_station_card(self, btn, surface, draw_rect, font):
-        """AI画像スタイルの大型ステーションカード描画"""
-        is_playing = (hasattr(btn, "freq_hz") and abs(self.center_freq - btn.freq_hz) < 50000)
-        p = getattr(btn, "station_data", {})
-        st_name = p.get("name", btn.text)
-        freq_hz = getattr(btn, "freq_hz", self.center_freq)
-        mode = p.get("mode", "WFM")
-
-        # 背景色と枠線
-        if is_playing:
-            fill = (11, 58, 54)        # 深緑エメラルド (#0B3A36)
-            border = (235, 190, 80)    # ゴールドアンバーのアクセント枠
-            border_w = 2
-            txt_col_main = (255, 255, 255)
-            txt_col_sub = (140, 245, 220)
-        else:
-            if btn.pressed:
-                fill = (220, 230, 240)
-            elif btn.hover:
-                fill = (248, 252, 255)
-            else:
-                fill = (236, 242, 248)
-            border = (190, 210, 230) if btn.hover else (210, 224, 236)
-            border_w = 1
-            txt_col_main = (24, 36, 52)
-            txt_col_sub = (90, 115, 145)
-
-        pygame.draw.rect(surface, fill, draw_rect, border_radius=btn.radius)
-        pygame.draw.rect(surface, border, draw_rect, width=border_w, border_radius=btn.radius)
-
-        # 1. 上部: ON AIRバッジ / モードバッジ
-        top_y = draw_rect.y + 10
-        if is_playing:
-            badge_surf = cached_text(self.font_tiny, "▶ ON AIR", (255, 255, 255))
-            badge_rect = pygame.Rect(draw_rect.x + 12, top_y, badge_surf.get_width() + 10, 16)
-            pygame.draw.rect(surface, (0, 185, 150), badge_rect, border_radius=4)
-            surface.blit(badge_surf, (draw_rect.x + 17, top_y + 1))
-        else:
-            mode_surf = cached_text(self.font_tiny, mode, (120, 140, 165))
-            badge_rect = pygame.Rect(draw_rect.x + 12, top_y, mode_surf.get_width() + 8, 16)
-            pygame.draw.rect(surface, (222, 230, 240), badge_rect, border_radius=4)
-            surface.blit(mode_surf, (draw_rect.x + 16, top_y + 1))
-
-        # 2. 中部: 局名 (太字、カード幅に収まるよう自動調整)
-        name_y = draw_rect.y + 34
-        name_font = self.font_med
-        name_surf = cached_text(name_font, st_name, txt_col_main)
-        if name_surf.get_width() > draw_rect.width - 24:
-            name_font = self.font_small
-            name_surf = cached_text(name_font, st_name, txt_col_main)
-        surface.blit(name_surf, (draw_rect.x + 12, name_y))
-
-        # 3. 中下部: 周波数 (大きく視認性良く)
-        f_mhz = freq_hz / 1e6
-        if freq_hz >= 1000000:
-            f_str = f"{f_mhz:.2f} MHz"
-        else:
-            f_str = f"{freq_hz / 1e3:.1f} kHz"
-        f_surf = cached_text(self.font_station, f_str, txt_col_sub)
-        surface.blit(f_surf, (draw_rect.x + 12, draw_rect.y + 60))
-
-        # 4. 下部: ミニLED VUメーター (6セグメント)
-        vu_y = draw_rect.bottom - 22
-        vu_w = draw_rect.width - 24
-        n_segs = 6
-        seg_gap = 3
-        sw = (vu_w - (n_segs - 1) * seg_gap) // n_segs
-
-        if is_playing:
-            lit_cnt = min(n_segs, max(1, int(round(self.s_units / 9.0 * n_segs))))
-        else:
-            snr = p.get("snr_db", 10.0)
-            lit_cnt = min(n_segs, max(1, int(round(float(snr) / 30.0 * n_segs))))
-
-        for si in range(n_segs):
-            sx = draw_rect.x + 12 + si * (sw + seg_gap)
-            s_rect = pygame.Rect(sx, vu_y, sw, 8)
-            if si < lit_cnt:
-                seg_col = (0, 225, 180) if is_playing else (140, 195, 220)
-                if si >= 4:
-                    seg_col = (245, 190, 60)
-            else:
-                seg_col = (16, 40, 38) if is_playing else (218, 226, 235)
-            pygame.draw.rect(surface, seg_col, s_rect, border_radius=2)
 
     def _init_controls(self):
         btns = []
@@ -624,57 +536,8 @@ class SdrGui:
         self.btn_bfo_up = Button((tx + hw + 8, y_bfo, hw, 22), "BFO +",
                                  lambda: self._step_bfo(50), bg_color=(240, 243, 248), radius=4)
         btns.extend([self.btn_bfo_down, self.btn_bfo_up])
-        # 短波スキャンはウェルカムカードから実行 (互換シム廃止)。
-
-        # ---- 3. STATION CARDS (preset_rect: どこでも・だれでも・どんなアンテナでも) ----
-        self.preset_buttons = []
-        # 利用可能な局リストの収集 (プリセットまたは検出局)
-        all_stations = []
-        seen_freqs = set()
-        for src in [self.presets_fm, self.presets_am, self.detected_stations]:
-            for st in (src or []):
-                fh = st.get("freq_hz")
-                if fh and fh not in seen_freqs:
-                    seen_freqs.add(fh)
-                    all_stations.append(st)
-
-        if not all_stations:
-            # 未スキャン時: 巨大で親しみやすいウェルカムカードを2枚並べて即座に誘導
-            px = self.preset_rect.x + 18
-            py = self.preset_rect.y + 28
-            pw = (self.preset_rect.width - 36 - 16) // 2
-            ph = 130
-            self.btn_welcome_fm = Button(
-                (px, py, pw, ph),
-                "📻  FM局を一括自動スキャン (76 - 95 MHz)\n\nワンタッチで身の回りのFMラジオ放送を自動検出します",
-                self._request_scan,
-                bg_color=(224, 244, 236), active_color=C_ACCENT, radius=14
-            )
-            self.btn_welcome_sw = Button(
-                (px + pw + 16, py, pw, ph),
-                "🌐  短波・世界放送スキャン (3 - 30 MHz)\n\n国際放送・アマチュア無線・エアバンドを探索します",
-                self._request_sw_scan,
-                bg_color=(232, 242, 254), active_color=C_ACCENT, radius=14
-            )
-            btns.extend([self.btn_welcome_fm, self.btn_welcome_sw])
-        else:
-            # スキャン後: 最大6枚の大型リッチステーションカードをカルーセル配置
-            n_cards = min(6, len(all_stations))
-            gap = 12
-            cw = (self.preset_rect.width - 36 - (n_cards - 1) * gap) // n_cards
-            ch = 130
-            cy = self.preset_rect.y + 28
-            for i, st in enumerate(all_stations[:n_cards]):
-                f = int(st["freq_hz"])
-                m = st.get("mode", "WFM")
-                cb = (lambda freq=f, mode=m: self._tune(freq, mode))
-                b = Button((self.preset_rect.x + 18 + i * (cw + gap), cy, cw, ch),
-                           st.get("name", "?"), cb, bg_color=(236, 242, 248), radius=12)
-                b.freq_hz = f
-                b.station_data = st
-                b.custom_draw = self._draw_station_card
-                self.preset_buttons.append(b)
-                btns.append(b)
+        # 下部ステーションカードは廃止 (検出局プルダウンに一本化)。
+        # プリセットデータ自体はconfig保存・set_presets経由で維持する。
 
         # アトミックに差し替え (スキャン完了時の再構築と描画の競合防止)
         self.buttons = btns
@@ -1428,8 +1291,6 @@ class SdrGui:
         # 全ボタン描画 (アクティブ状態更新)
         for name, b in self.mode_buttons.items():
             b.is_active = (self.mode == name)
-        for b in getattr(self, "preset_buttons", []):
-            b.is_active = (hasattr(b, "freq_hz") and abs(self.center_freq - b.freq_hz) < 50000)
         for btn in self.buttons:
             if btn.visible:
                 btn.draw(self.screen, self.font_small)
