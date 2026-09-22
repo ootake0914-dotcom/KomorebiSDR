@@ -291,7 +291,11 @@ class SdrDspPipeline:
         self.pilot_tracker = KalmanPilotTracker(sample_rate=self.if_rate)
 
         # ホログラフィック・ハイレゾ倍音外挿エンジン (15kHz〜22kHz エアバンド再合成)
+        # NOTE: 実機実測(ラッキーFM 94.6MHz 強電界)で無音時の12-15kHzを+18.7dB
+        # 持ち上げ、静かな場面に合成ヒスが乗ることを確認したため既定OFF。
+        # 再有効化は .enabled=True (弱局で空気感を出したい場合のみ推奨)。
         self.holographic_enhancer = HolographicAudioEnhancer(sample_rate=self.audio_rate, air_gain=0.08)
+        self.holographic_enhancer.enabled = False
 
         # リーマン多様体トポロジカル測地線復調器 (特異点位相スリップ幾何学遮断)
         self.riemann_demodulator = RiemannianTopologicalDemodulator(sample_rate=self.if_rate)
@@ -300,7 +304,10 @@ class SdrDspPipeline:
         self.bss_separator = SuperSpatialBssStereoSeparator(sample_rate=self.audio_rate)
 
         # ランダム行列特異値切除ノイズクリーナー (Random Matrix Theory & Marchenko-Pastur Law ノイズ切除)
+        # NOTE: 実機実測で番組の12-15kHzを+7.1dB変形 (入出力相関0.9916=非透明) し、
+        # 弱局でのノイズ低減効果も確認できなかったため既定OFF (CPUも節約)。
         self.rmt_denoiser = RmtHankelDenoiser(sample_rate=self.audio_rate, embed_dim=24)
+        self.rmt_denoiser.enabled = False
 
         # 単一ch スペクトル抑圧NR (帯域内ノイズの最小統計Wiener抑圧。
         # 弱電界FMでハイカットでは消せない番組帯ノイズを低減。クリーン時は透明)
