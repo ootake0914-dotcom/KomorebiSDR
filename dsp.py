@@ -354,8 +354,10 @@ class SdrDspPipeline:
         self.bm_sq_close_conf = 0.55
         self.bm_sq_close_smeter_db = -25.0
         self.bm_sq_open_smeter_db = -40.0
+        self.bm_sq_min_close_blocks = 20
         self._bm_sq_open = True  # 起動時は開 (いきなりミュートしない)
         self._bm_sq_gain = 1.0
+        self._bm_sq_hold = 0
         self.cyclo_detector = None
         self.bm_rmt = None
         self.bm_sr = None
@@ -648,6 +650,7 @@ class SdrDspPipeline:
         # AM等WFM外ではhelperが呼ばれないためここで戻す)
         self._bm_sq_open = True
         self._bm_sq_gain = 1.0
+        self._bm_sq_hold = 0
         self._trim_dir = 1.0
         self._trim_block = 0
         self._trim_primed = False
@@ -702,6 +705,7 @@ class SdrDspPipeline:
         self.bm_sr_confidence = 0.0
         self._bm_sq_open = True
         self._bm_sq_gain = 1.0
+        self._bm_sq_hold = 0
         try:
             if getattr(self, "_bm_lock_hist", None) is not None:
                 self._bm_lock_hist.clear()
@@ -1960,6 +1964,19 @@ class SdrDspPipeline:
             elif s_db > open_s:
                 self._bm_sq_open = True
             # else: 保持 (ヒステリシス)
+            # 最小閉保持: 一度閉じたら一定ブロックは開き直さない。
+            # 深フェードで開閉が呼吸 (ポンピング) するのを防ぐ。
+            try:
+                hold_n = int(getattr(self, "bm_sq_min_close_blocks", 20))
+            except Exception:
+                hold_n = 20
+            if self._bm_sq_open:
+                if self._bm_sq_hold > 0:
+                    self._bm_sq_hold -= 1
+                    if self._bm_sq_hold > 0:
+                        self._bm_sq_open = False
+            else:
+                self._bm_sq_hold = max(0, hold_n)
             target = 1.0 if self._bm_sq_open else 0.0
             g = float(self._bm_sq_gain)
             step = 0.25 if target > g else 0.05

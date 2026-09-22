@@ -231,6 +231,7 @@ DEFAULT_CONFIG = {
             "close_conf": 0.55,    # これ割れ＋S低で閉 (ヒステリシス)
             "close_smeter_db": -25.0,
             "open_smeter_db": -40.0,
+            "min_close_blocks": 20,  # 一度閉じたら最低保持 (呼吸防止)
         },
     },
 }
@@ -330,6 +331,7 @@ def _clean_black_magic(v) -> dict:
         _num(q, "close_conf", 0.0, 1.0)
         _num(q, "close_smeter_db", -120.0, 0.0)
         _num(q, "open_smeter_db", -120.0, 0.0)
+        _num(q, "min_close_blocks", 0, 200, integer=True)
     return out
 
 

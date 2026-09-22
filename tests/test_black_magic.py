@@ -211,14 +211,13 @@ def test_squelch_assist_hysteresis():
     for _ in range(30):
         g = dsp._bm_update_squelch_assist()
     assert dsp._bm_sq_open is False and g == 0.0
-    # 弱ステレオ局 (conf高・S中) →速く開く
+    # 弱ステレオ局 (conf高・S中) →開く。ただし最小閉保持 (20blk) のため
+    # 開き直しに約1秒かかる (一過性信号でのバースト防止。スケルチの常識)
     dsp.bm_cyclo_confidence = 0.9
     dsp.s_meter_dbfs = -27.0
-    g1 = dsp._bm_update_squelch_assist()
-    assert dsp._bm_sq_open is True and g1 > 0.0
-    for _ in range(10):
+    for _ in range(25):
         g = dsp._bm_update_squelch_assist()
-    assert g == 1.0
+    assert dsp._bm_sq_open is True and g == 1.0
     # 強モノラル局 (conf=0だがS高) →開のまま (誤ミュート防止)
     dsp.bm_cyclo_confidence = 0.0
     dsp.s_meter_dbfs = -10.0
@@ -283,11 +282,35 @@ def test_squelch_assist_config():
     bm = DEFAULT_CONFIG["black_magic"]["squelch_assist"]
     assert bm["enabled"] is False
     assert bm["open_conf"] == 0.75 and bm["close_conf"] == 0.55
+    assert bm["min_close_blocks"] == 20
     out = _clean_black_magic({"squelch_assist": {"enabled": True, "open_conf": 5.0,
-                                                 "close_smeter_db": 99.0}})
+                                                 "close_smeter_db": 99.0,
+                                                 "min_close_blocks": 999}})
     assert out["squelch_assist"]["enabled"] is True
     assert out["squelch_assist"]["open_conf"] == 1.0
     assert out["squelch_assist"]["close_smeter_db"] == 0.0
+    assert out["squelch_assist"]["min_close_blocks"] == 200
+
+
+def test_squelch_min_close_hold():
+    # 深フェード呼吸: 最小閉保持で遷移が減り、ミュートが決定的になる
+    from dsp import SdrDspPipeline
+    for hold, max_tr in ((0, 99), (20, 6)):
+        dsp = SdrDspPipeline(1152000, 48000)
+        dsp.black_magic_enabled = True
+        dsp.bm_sq_assist_enabled = True
+        dsp.bm_sq_min_close_blocks = hold
+        states = []
+        gains = []
+        for _ in range(6):
+            for conf in [0.4] * 8 + [0.8] * 8:
+                dsp.bm_cyclo_confidence = conf
+                dsp.s_meter_dbfs = -27.0
+                gains.append(dsp._bm_update_squelch_assist())
+                states.append(dsp._bm_sq_open)
+        tr = sum(abs(int(b) - int(a)) for a, b in zip(states, states[1:]))
+        assert tr <= max_tr, f"hold={hold}で遷移{tr}"
+    assert min(gains) < 0.5, "閉保持中にgainが落ちない"
 
 
 def main() -> int:
@@ -320,6 +343,8 @@ def main() -> int:
         print("[*] スケルチ実経路 OK")
         test_squelch_assist_config()
         print("[*] スケルチ設定 OK")
+        test_squelch_min_close_hold()
+        print("[*] 最小閉保持 OK")
     except AssertionError as e:
         print(f"FAILED: {e}")
         return 1
