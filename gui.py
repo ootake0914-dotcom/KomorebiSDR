@@ -251,9 +251,7 @@ class SdrGui:
         # パラメータコールバック
         self.on_freq_change = None
         self.on_mode_change = None
-        # ゲインはHyper自動に一本化 (手動操作削除・木漏れ日整理)。
-        # btn_gain_autoは状態表示専用チップ (探索中/収束/固定)。
-        self.on_volume_change = None
+        # ゲイン・音量ボタンは廃止 (自動＋システム音量に一本化・木漏れ日整理)。
         # Filterはclean固定 (ボタン削除・木漏れ日整理)。
         self.on_seek_change = None      # lambda direction: ...
         self.on_scan_request = None     # lambda: ...
@@ -267,11 +265,9 @@ class SdrGui:
         self.center_freq = 80000000  # 80.0 MHz
         self.sample_rate = 1152000
         self.mode = "WFM"
-        self.volume = 0.5
-        self.is_auto_gain = True
+        self.volume = 0.5  # 表示用。実音量は起動時config＋システム音量。
         self.is_hard_locked = False     # 収束決め打ち中フラグ (表示用)
         self.filter_mode = "clean"      # 常時clean固定 (ボタン廃止)
-        self.gains_list = []
         self.current_rssi = -50.0
         self.is_stereo = False
         self.stereo_status = "MONO"
@@ -460,15 +456,8 @@ class SdrGui:
     def _init_controls(self):
         btns = []
 
-        # ---- TUNINGパネル ----
+        # ---- TUNINGパネル (周波数ステップは検出局プルダウンに一本化し廃止) ----
         tx, tw = self.tune_rect.x + 12, self.tune_rect.width - 24
-        bw = (tw - 12) // 3
-        step_btns = [("-1M", -1000000), ("-100k", -100000), ("-10k", -10000),
-                     ("+10k", 10000), ("+100k", 100000), ("+1M", 1000000)]
-        for i, (text, step) in enumerate(step_btns):
-            col, row = i % 3, i // 3
-            cb = (lambda s=step: self._adjust_freq(s))
-            btns.append(Button((tx + col * (bw + 6), 236 + row * 30, bw, 26), text, cb))
         half = (tw - 6) // 2
         self.btn_seek_prev = Button((tx, 300, half, 28), "<< Auto Seek", lambda: self._seek(-1),
                                     bg_color=(226, 235, 248), active_color=C_BTN_ACTIVE2)
@@ -511,16 +500,8 @@ class SdrGui:
                                  lambda: self._step_bfo(50), bg_color=(240, 243, 248))
         btns.extend([self.btn_bfo_down, self.btn_bfo_up])
 
-        # ---- GAIN / AUDIOパネル ----
-        gx, gy = self.gain_rect.x + 12, self.gain_rect.y
-        # ゲイン状態チップ (表示専用。Hyper自動の状態をworker側が上書きする)
-        self.btn_gain_auto = Button((gx, 470, 254, 25), "感度: 自動", lambda: None,
-                                    bg_color=(230, 240, 250))
-        btns.extend([self.btn_gain_auto])
-        self.btn_vol_down = Button((gx, 497, 46, 25), "V-", lambda: self._adjust_vol(-0.1))
-        self.btn_vol_up = Button((gx + 52, 497, 46, 25), "V+", lambda: self._adjust_vol(0.1))
-        btns.extend([self.btn_vol_down, self.btn_vol_up])
-        # DX行は廃止 (C/N連動の自動絞りに一本化)。524行目は空き。
+        # ---- GAIN / AUDIOパネルは廃止 (自動＋システム音量)。
+        # DX行・524行目も空き (将来の状態表示用に確保)。
 
         # ---- プリセット (地域/スキャン結果に応じて動的に設定される) ----
         fw, fgap, fx0 = 100, 4, self.preset_rect.x + 36
@@ -569,11 +550,6 @@ class SdrGui:
             self.on_freq_change(self.center_freq)
         if self.on_mode_change:
             self.on_mode_change(self.mode)
-
-    def _adjust_vol(self, delta):
-        self.volume = max(0.0, min(1.0, self.volume + delta))
-        if self.on_volume_change:
-            self.on_volume_change(self.volume)
 
     def _seek(self, direction):
         if self.on_seek_change:
@@ -1070,11 +1046,7 @@ class SdrGui:
         # 2. 情報パネル (ステータスバッジ + 本格SメーターLEDバー)
         x0 = self.info_rect.x + 14
         y0 = self.info_rect.y + 8
-        auto_name = getattr(self, "gain_auto_label", "Hyper").split(":")[0]
-        gain_txt = auto_name if self.is_auto_gain else f"{self.gain_val:.1f}dB"
-        w1 = self._draw_chip(f"MODE {self.mode}", x0, y0, (210, 236, 246))
-        w2 = self._draw_chip(f"VOL {int(self.volume * 100)}%", x0 + w1 + 6, y0, (226, 222, 246))
-        w3 = self._draw_chip(f"GAIN {gain_txt}", x0 + w1 + w2 + 12, y0, (246, 232, 210))
+        w1 = self._draw_chip(f"MODE {self.mode}", x0, y0, (210, 236, 248))
         status = getattr(self, "stereo_status", None) or ("STEREO" if self.is_stereo else "MONO")
         if status == "STEREO":
             st_txt, st_col = t("stereo"), (206, 240, 226)
@@ -1082,7 +1054,7 @@ class SdrGui:
             st_txt, st_col = t("blend"), (250, 234, 206)
         else:
             st_txt, st_col = t("mono"), (236, 238, 244)
-        self._draw_chip(st_txt, x0 + w1 + w2 + w3 + 18, y0, st_col)
+        self._draw_chip(st_txt, x0 + w1 + 18, y0, st_col)
 
         # 本格的SメーターLEDバーの描画 (テレメトリチップの溢れを廃止し、美しいLEDメーターに！)
         sm_w = self.info_rect.width - 28
@@ -1230,14 +1202,7 @@ class SdrGui:
             surf = cached_text(self.font_tiny, part, C_TEXT)
             self.screen.blit(surf, (x, y))
 
-        # 音量 / ゲインのスリムレベルインジケータ
-        bx = self.tele_rect.x + 14
-        by = self.tele_rect.bottom - 12
-        pygame.draw.rect(self.screen, (222, 229, 240), (bx, by, 250, 4), border_radius=2)
-        pygame.draw.rect(self.screen, C_ACCENT, (bx, by, int(250 * self.volume), 4), border_radius=2)
-        gain_norm = min(1.0, max(0.0, (self.gain_val - 10.0) / 45.0)) if self.gains_list else 0.5
-        pygame.draw.rect(self.screen, (222, 229, 240), (bx + 130, by, 120, 4), border_radius=2)
-        pygame.draw.rect(self.screen, C_GOLD, (bx + 130, by, int(120 * gain_norm), 4), border_radius=2)
+        # 音量/ゲインのバー表示は廃止 (システム音量＋自動感度に一本化)。
 
     def _draw_controls(self):
         # 注意: TUNING, MODE, GAIN/AUDIO, FM, AM 等の見出しラベルは

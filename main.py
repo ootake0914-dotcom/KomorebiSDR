@@ -116,7 +116,7 @@ class SdrApp:
         # GUIコールバック登録
         self.gui.on_freq_change = self.set_frequency
         self.gui.on_mode_change = self.set_mode
-        self.gui.on_volume_change = self.audio.set_volume
+        # 音量ボタン廃止 (起動時config＋システム音量)。
         # Filterはclean固定 (GUIボタン削除・木漏れ日整理)。
         self.gui.on_seek_change = lambda d: self.cmd_queue.put(("SEEK", d))
         self.gui.on_scan_request = lambda: self.cmd_queue.put(("SCAN", None))
@@ -237,10 +237,8 @@ class SdrApp:
         except Exception as e:
             print(f"[WARN] PPM restore failed: {e}", file=sys.stderr)
 
-        # コントローラ初期化 (ゲインは常に自動)
+        # コントローラ初期化 (ゲインは常に自動。状態チップ廃止のため表示更新なし)
         self.controller.init_gains()
-        self.gui.is_auto_gain = True
-        self.gui.btn_gain_auto.text = self._ctrl_label()
         print(f"[*] {self._ctrl_label()} autonomous optimization engine enabled")
 
         # 起動直後の音声途切れ(2秒後のスキャン停止)を防止するため、
@@ -758,24 +756,7 @@ class SdrApp:
                     else:
                         stats = self.controller.process_frame(raw_bytes, spectrum_db)
                     self.gui.gain_val = stats["gain_db"]
-                    # Filterボタン廃止済み (clean固定)。filter_mode報告はstats内のみ。
-
-                    # ゲインボタンの表示を決め打ち（手動固定）・自動収束・探索状態に正確に同期
-                    hard_locked = stats.get("hard_lock", False)
-                    converged = stats.get("converged", False)
-                    if hard_locked:
-                        self.gui.is_hard_locked = True
-                        self.gui.btn_gain_auto.text = t("gain_fixed", db=f"{stats['gain_db']:.1f}")
-                        self.gui.btn_gain_auto.bg_color = (206, 236, 224)  # ミント (固定表示)
-                    elif converged:
-                        self.gui.is_hard_locked = False
-                        self.gui.btn_gain_auto.text = t("gain_converged", db=f"{stats['gain_db']:.1f}")
-                        self.gui.btn_gain_auto.bg_color = (214, 236, 236)  # 青緑 (自動収束)
-                    else:
-                        self.gui.is_hard_locked = False
-                        ctrl_name = "Hyper" if self.controller_type == "hyper" else "Cascade"
-                        self.gui.btn_gain_auto.text = t("gain_searching", ctrl=ctrl_name)
-                        self.gui.btn_gain_auto.bg_color = (250, 234, 206)  # アプリコット (探索中)
+                    # ゲイン状態チップ廃止 (自動固定)。gain_valは信号ログ用に維持。
 
                     if self.controller_type == "hyper":
                         ant_tag = stats.get("antenna_profile", "BALANCED").replace("LOW_GAIN_", "LOW:").replace("HIGH_GAIN_", "HI:").replace("SATELLITE_", "SAT:")
