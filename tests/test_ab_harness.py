@@ -3,6 +3,8 @@
 import os
 import sys
 
+import tempfile
+
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -13,21 +15,26 @@ import ab_benchmark as ab
 
 def test_load_npy_raw():
     raw = (np.arange(132096 * 2) % 256).astype(np.uint8)
-    p = "/tmp/ab_test_raw.npy" if os.name != "nt" else \
-        r"C:\Users\ootak\AppData\Local\Temp\opencode\ab_test_raw.npy"
+    p = os.path.join(tempfile.gettempdir(), "ab_test_raw.npy")
     np.save(p, raw)
-    out = ab.load_iq(p)
-    assert out.dtype == np.uint8 and np.array_equal(out, raw)
-    os.remove(p)
+    try:
+        out = ab.load_iq(p)
+        assert out.dtype == np.uint8 and np.array_equal(out, raw)
+    finally:
+        if os.path.exists(p):
+            os.remove(p)
 
 
 def test_load_cs16():
-    p = r"C:\Users\ootak\AppData\Local\Temp\opencode\ab_test.cs16"
+    p = os.path.join(tempfile.gettempdir(), "ab_test.cs16")
     iq = (np.arange(1000) - 500).astype(np.int16)
     iq.tofile(p)
-    out = ab.load_iq(p)
-    assert out.dtype == np.uint8 and len(out) == 1000
-    os.remove(p)
+    try:
+        out = ab.load_iq(p)
+        assert out.dtype == np.uint8 and len(out) == 1000
+    finally:
+        if os.path.exists(p):
+            os.remove(p)
 
 
 def test_chatter_and_pct():
