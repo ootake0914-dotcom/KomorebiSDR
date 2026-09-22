@@ -240,7 +240,16 @@ dsp.bm_sr_enabled = True      # C (副経路のみ。スケルチ自動反映な
 - `dsp_native.dft_bins`＋numpy代替 (旧DLL互換)。等価性1.7e-9で検証。
 - DLLはgitignoreのため、他環境では`build_native.bat`で再ビルドすること。
 
-## Phase 0実証基盤 (録音IQハーネス＋ゴールデンデータ)
+## AM短波の品位 (7.3MHz実録音)
+
+- 症状: 100Hz系の線が番組比-20〜-27dBで存在＋深いフェージング
+  (包絡変動0.84)。AM経路にノッチ接合を追加済み (chキー分離)。
+- 検出器は作動せず (dwell -4のまま): 線が番組に埋もれ局所床比が
+  閾値に届かない。無理に掛けると音楽を削るため正しい判断。
+- 強制除去の実験WAV (temp: sw7300_off/nohum): ハム推定-27dB。
+  可聴域ギリギリのため、耳で確認してから閾値調整を判断する。
+- フェージング歪み自体はAGCの担当。選択性フェージングの歪み補償は
+  将来課題 (AM同期検波の混合率が既存の調整点)。
 
 - `python tools/ab_benchmark.py <iq...> [--bm cyclo|rmt|sr|all] [--out json]`:
   同一録音をOFF/ONで2回通す。対応形式は`.npy`(uint8 raw)、`.cs16`、

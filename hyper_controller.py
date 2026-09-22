@@ -13,7 +13,7 @@ HyperController - Cascade-Transcending Autonomous SDR Control Engine.
      Hyper  : 受信チャンネル帯域内パワー vs ガードバンド中央値による真のC/N測定
   3. フィルタ制御:
      Cascade: narrow/clean/wide の3段離散切替（境界で音質が不連続に跳躍）
-     Hyper  : カットオフ・IF帯域幅を無段階モーフィング（クリック・ポップ根絶）
+     Hyper  : カットオフ・IF帯域幅を無段階モーフィング（クリック・ポップ抑制）
   4. 品質評価:
      Cascade: 電波スペクトル情報のみ（聴感と乖離）
      Hyper  : 復調後オーディオの番組帯域(300-3kHz)対ヒス帯域(5.5-11kHz)比を直接測定し
@@ -31,10 +31,10 @@ import numpy as np
 
 
 class HyperController:
-    """カスケードを超越する統合認知制御エンジン"""
+    """ゲイン自動調整の統合制御エンジン"""
 
     SWEET_SPOT_DB = 33.8  # 実機R820T実測: 36.4dB以上はADCクリップ多発(1.3%→18%→35%)、33.8dBがクリップフリー上限
-    MIN_SAFE_GAIN_DB = 19.7  # 実用最低安全ゲイン: 19.7dB未満(IQ Std 0.5の熱雑音沈没)への転落を完全防止
+    MIN_SAFE_GAIN_DB = 19.7  # 実用最低安全ゲイン: 19.7dB未満への転落を防ぐ目安
     FLOOR_GAIN_DB = 12.5  # 過大入力時の非常用下限 (0.0dBまで沈めると音声がほぼ無音化するため)
     LOCK_MARGIN_DB = 1.5  # ロック時、最高品質からこの範囲内で最も高いゲインを選ぶ (測定誤差対策)
     _GAIN_FRACTIONS = (0.25, 0.55, 0.75, 0.90, 1.0)  # 実用高C/N帯(28.0〜49.6dB)に重点配置
@@ -90,7 +90,7 @@ class HyperController:
         self.search_phase = "coarse"  # coarse -> fine -> done
         self._coarse_plan = []
         self.locked = False
-        self.hard_lock = False        # 収束後の完全決め打ち固定 (フェージング・無音での誤再探索を100%遮断)
+        self.hard_lock = False        # 収束後の決め打ち固定 (フェージング・無音での誤再探索を抑える)
         self._verify_dir = 1
         self._regret_frames = 0
 
@@ -178,7 +178,7 @@ class HyperController:
         self.driver.set_gain(self.available_gains[idx])
 
     def set_hard_lock(self, locked: bool):
-        """ユーザーまたは収束イベントによる完全決め打ち固定 (True: 固定, False: 再探索開始)"""
+        """ユーザーまたは収束イベントによる決め打ち固定 (True: 固定, False: 再探索開始)"""
         self.hard_lock = locked
         if locked:
             self.locked = True
@@ -387,7 +387,7 @@ class HyperController:
         min_idx = self._min_safe_idx()
         for f in self._GAIN_FRACTIONS:
             candidates.add(int(round(min_idx + f * (n - 1 - min_idx))))
-        # クリップ境界の直下は最適点候補として優先的に調べる (安全下限未満へは絶対に下げない)
+        # クリップ境界の直下は最適点候補として優先的に調べる (安全下限未満へは下げない)
         if self.clip_upper_idx is not None and self.clip_upper_idx > min_idx:
             candidates.add(max(min_idx, self.clip_upper_idx - 1))
             candidates.add(max(min_idx, self.clip_upper_idx - 2))
@@ -498,7 +498,7 @@ class HyperController:
         cur_idx = self.current_gain_idx
         n = len(self.available_gains)
 
-        # --- ハードロック（決め打ち固定）中: ゲイン再探索・変更を100%遮断 ---
+        # --- ハードロック（決め打ち固定）中: ゲイン再探索・変更を止める ---
         if self.hard_lock:
             return
 
@@ -516,7 +516,7 @@ class HyperController:
             if candidate is not None:
                 self._apply_gain(self._nearest_idx(candidate))
                 return
-            # 全プローブ完了 -> 観測モデルの最大点に完全ロック (ヒステリシス付き)
+            # 全プローブ完了 -> 観測モデルの最大点にロック (ヒステリシス付き)
             self.locked = True
             target = self.best_gain_db
             # 測定誤差に強い選択: 最高品質から LOCK_MARGIN_DB 以内で最も高いゲインを採用。
@@ -533,7 +533,7 @@ class HyperController:
                 if self.best_snr <= ref + self.switch_margin_db:
                     target = self.locked_gain_db
             tidx = self._nearest_idx(target)
-            # 既知のクリップ境界より上のゲインへは絶対にロックしない (過大入力の決め打ち防止)
+            # 既知のクリップ境界より上のゲインへはロックしない (過大入力の決め打ち防止)
             if self.clip_upper_idx is not None and tidx >= self.clip_upper_idx:
                 tidx = max(self._min_safe_idx(), self.clip_upper_idx - 1)
                 target = self.available_gains[tidx]
@@ -548,7 +548,7 @@ class HyperController:
             self.locked_gain_db = target
             if tidx != cur_idx:
                 self._apply_gain(tidx)
-            # 収束完了: 直ちに完全決め打ち固定 (以後、勝手な自動再探索を100%遮断)
+            # 収束完了: 決め打ち固定 (以後、自動再探索を止める)
             self.hard_lock = True
             self.search_phase = "locked"
             return
@@ -577,8 +577,8 @@ class HyperController:
         else:
             self._regret_frames = 0
 
-        # --- ロック中: 安定聴取維持 (リスニング中の無駄なゲイン揺さぶり・クリック音を完全根絶) ---
-        # 一度最適ゲインにロックされたら、電波が喪失しない限りゲインを一切動かさず完全な静寂と高音質を維持
+        # --- ロック中: 安定聴取維持 (リスニング中の無駄なゲイン揺さぶり・クリック音の抑制) ---
+        # 一度最適ゲインにロックされたら、電波が喪失しない限りゲインを動かさず静かに維持
 
     def _map_continuous_parameters(self, mode: str):
         if not hasattr(self.dsp, "set_cognitive_parameters"):

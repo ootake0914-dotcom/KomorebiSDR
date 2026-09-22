@@ -116,7 +116,7 @@ class UltrasonicSquelchTracker:
 
     従来の電界強度 (RSSI) スケルチと異なり、都市部の高ノイズ環境でも
     ノイズ自身を電波と誤認せず、本物の変調波キャリアが存在する時のみ
-    瞬時に音声を開放 (Open) し、局間は完全な静寂 (Mute) を維持する。
+    瞬時に音声を開放 (Open) し、局間は静寂 (Mute) を維持する。
 
     数学的根拠: 古典FM三角ノイズ理論 (Rice / Carson, パブリックドメイン)。
     """
@@ -279,8 +279,8 @@ class DigitalSelfInterferenceCanceller:
     受信信号から逆位相合成 (Subtract) して消去します。
 
     【効果】
-    - 目的の広帯域変調信号 (FM音声等) に一切歪みを与えず、
-      PC 由来のスプリアススパイクのみを 20dB〜40dB 鋭利にノッチ消去。
+    - 目的の広帯域変調信号 (FM音声等) への歪みを抑えつつ、
+      PC 由来のスプリアススパイクのみを 20dB〜40dB程度ノッチ消去 (条件による)。
     - 受信ノイズフロアのクリーン化。
     """
 
@@ -312,7 +312,7 @@ class DigitalSelfInterferenceCanceller:
         - dc_guard_hz: 所望信号キャリア・主変調帯域 (0Hz近傍のAM搬送波やFM側波帯) を保護する除外帯域 (Hz)。
         - passband_hz: IFフィルタ通過帯域 (Hz)。阻止域の過小パワーによるメディアン歪みを防止。
         - 延長ケーブル使用等でスプリアスが消失した場合は自動で周波数リストを空にし、
-          即座に完全バイパス（計算コストゼロ・無歪み）へ移行。
+          即座にバイパス（計算コストゼロ・歪みなし）へ移行。
         """
         if len(iq_samples) < n_fft:
             return
@@ -373,7 +373,7 @@ class DigitalSelfInterferenceCanceller:
             chosen_freqs = [item[0] for item in detected_candidates[:self.max_tones]]
             self.set_spurious_frequencies(chosen_freqs)
         else:
-            # スプリアスが存在しない場合は空にして完全バイパス
+            # スプリアスが存在しない場合は空にしてバイパス
             self.set_spurious_frequencies([])
 
     def reset(self):

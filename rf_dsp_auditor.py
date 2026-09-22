@@ -103,7 +103,7 @@ def run_tier1_ground_truth_benchmark():
     idx_sp = int(np.argmin(np.abs(freqs_if - f_spur)))
 
     sic_cancellation = float(20.0 * np.log10(max(1e-12, fft_n[idx_sp] / max(1e-12, fft_c[idx_sp]))))
-    # 目的信号の保持度 (相関係数: 完全アライメント)
+    # 目的信号の保持度 (相関係数: アライメント後)
     tail_wanted = sig_wanted[:len(clean_if)][-4096:]
     corr_sig = float(np.abs(np.vdot(tail_clean, tail_wanted) / (np.linalg.norm(tail_clean) * np.linalg.norm(tail_wanted))))
 
@@ -172,12 +172,12 @@ def run_tier1_ground_truth_benchmark():
     results["Stereo_Separation"] = f"{sep_db:.1f} dB"
 
     # -------------------------------------------------------------
-    # 5. ActiveDcServo: 超低域位相回転ゼロ DCサーボ
+    # 5. ActiveDcServo: 低域位相回転の少ない DCサーボ
     # -------------------------------------------------------------
     print("\n[Test 5/7] ActiveDcServo (直流オフセット相殺 & 位相直線性の検証)")
     servo = ActiveDcServo(sample_rate=48000.0, time_constant_sec=0.2)
     t_aud = np.arange(48000 * 2) / 48000.0  # 2秒分
-    # 40Hzの超低音正弦波 + +0.35Vの直流バイアス
+    # 40Hzの低音正弦波 + +0.35Vの直流バイアス
     sig_ac = 0.5 * np.sin(2.0 * np.pi * 40.0 * t_aud)
     sig_dc = 0.35
     in_audio = (sig_ac + sig_dc).astype(np.float32)
@@ -190,14 +190,14 @@ def run_tier1_ground_truth_benchmark():
     corr_ac = float(np.corrcoef(tail_ac, tail_out)[0, 1])
 
     print(f"  - 直流オフセット: {sig_dc:+.2f}V -> {dc_remnant:+.6f}V (抑圧度: {20*np.log10(abs(dc_remnant)+1e-12):.1f} dBFS)")
-    print(f"  - 超低域(40Hz) 音声波形忠実度 (相関): {corr_ac:.5f} (位相回転ゼロ)")
+    print(f"  - 低域(40Hz) 音声波形忠実度 (相関): {corr_ac:.5f} (位相回転の少なさ)")
     results["DC_Offset_Remnant"] = f"{dc_remnant:.6f} V"
     results["DC_Servo_Phase_Correlation"] = f"{corr_ac:.5f}"
 
     # -------------------------------------------------------------
     # 6. TpdfDitherNoiseShaper: 音響心理ノイズシェーピングディザー
     # -------------------------------------------------------------
-    print("\n[Test 6/7] TpdfDitherNoiseShaper (微小信号歪み根絶 & 高域シェーピング)")
+    print("\n[Test 6/7] TpdfDitherNoiseShaper (微小信号歪み低減 & 高域シェーピング)")
     dither = TpdfDitherNoiseShaper(sample_rate=48000.0)
     # -60dBFS の極微弱 1kHz 正弦波
     sub_sig = (10.0 ** (-60.0 / 20.0)) * np.sin(2.0 * np.pi * 1000.0 * t_aud[:48000]).astype(np.float32)
@@ -228,7 +228,7 @@ def run_tier1_ground_truth_benchmark():
     print(f"  - 入力生バイト: {len(raw_test)} bytes -> 復調オーディオ出力: {audio_out.shape} samples (NaN/Infなし)")
     assert np.all(np.isfinite(audio_out)), "Pipeline output contained non-finite values!"
     assert np.all(np.isfinite(spec_out)), "Pipeline spectrum contained non-finite values!"
-    print("  - パイプライン完全連続性 & 数値健全性: PASS")
+    print("  - パイプライン連続性 & 数値健全性: PASS")
     results["Pipeline_E2E"] = "PASS (Bit-Exact Stable)"
 
     return results

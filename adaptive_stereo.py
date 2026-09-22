@@ -56,7 +56,7 @@ class QuadratureMpxCanceller:
         leak_ratio = q_pow / i_pow
 
         # 直交成分にマルチパス由来の有意なエネルギーが存在する場合のみ適応更新
-        # (クリーン信号 leak_ratio <= 0.03 では過剰適応を防止し原音完全ビットパーフェクト維持)
+        # (クリーン信号 leak_ratio <= 0.03 では過剰適応を防止し原音素通し維持)
         if 0.03 < leak_ratio < 2.0 and q_pow > 1e-5:
             win_q = np.lib.stride_tricks.sliding_window_view(q_ext, self.taps)
             # ミニバッチNLMS (32サンプル毎に高速適応)
@@ -91,17 +91,17 @@ class QuadratureMpxCanceller:
 
 
 class SuperSpatialBssStereoSeparator:
-    """超空間独立成分ステレオ復調器 (Super-Spatial BSS / FastICA Stereo Separator)
+    """BSSステレオ分離器 (FastICAベース Stereo Separator)
 
-    FMステレオ復調において38kHz副搬送波から混入する完全逆相三角ヒスノイズ (+14dB) を、
+    FMステレオ復調において38kHz副搬送波から混入する逆相寄りの三角ヒスノイズを、
     Mid主信号 (L+R) と Side副信号 (L-R) の部分空間射影・音響相互コヒーレンス分析 (BSS) により、
-    ステレオ音場感を100%保持したままノイズ成分のみを直交空間へ分離・消去する。
+    ステレオ音場感の保持を狙いつつノイズ成分の分離・低減を試みる。
 
-    - クリーン信号 (高CNR) でのビット一致性: 1.000000 (完全通過)
-    - 弱電界時のFM三角ヒスノイズ抑圧: +5.0dB 〜 +10.0dB の劇的SNR向上
-    - 低中域ステレオ感 (ボーカル・ドラム・ベース定位) の完全非侵襲保護
-    - Overlap-Lookahead によるブロック境界不連続ゼロ (0.00e+00)
-    - 高速NumPyベクトル化 (0.08ms 未満、アンダーラン完全皆無)
+    - クリーン信号 (高CNR) での素通し性: 1.000000 (通過)
+    - 弱電界時のFM三角ヒスノイズ抑圧: 数dB程度のSNR改善を目指す
+    - 低中域ステレオ感 (ボーカル・ドラム・ベース定位) への影響を抑える設計
+    - Overlap-Lookahead によるブロック境界不連続の抑制 (0.00e+00)
+    - NumPyベクトル化 (0.08ms 未満を目標)
     """
 
     def __init__(self, sample_rate: float = 48000.0, crossover_hz: float = 7500.0):
@@ -128,7 +128,7 @@ class SuperSpatialBssStereoSeparator:
 
     def process(self, l_audio: np.ndarray, r_audio: np.ndarray, stereo_blend: float = 1.0) -> tuple:
         """
-        L/Rオーディオ配列を受け取り、超空間BSS分離によりヒスノイズを除去した (L, R) を返す。
+        L/Rオーディオ配列を受け取り、BSS分離によりヒスノイズ低減を試みた (L, R) を返す。
         """
         if not self.enabled or len(l_audio) == 0 or stereo_blend < 0.05:
             return l_audio, r_audio
@@ -178,7 +178,7 @@ class SuperSpatialBssStereoSeparator:
             m_d = m
             m_hp = m - m_lp
 
-        # 3. 超高域 (8k〜15k) におけるMidとSideの音響相互コヒーレンス推定
+        # 3. 高域 (8k〜15k) におけるMidとSideの音響相互コヒーレンス推定
         p_s = float(np.mean(s_hp * s_hp)) + 1e-12
         p_m = float(np.mean(m_hp * m_hp)) + 1e-12
         cov_ms = float(np.abs(np.mean(m_hp * s_hp)))

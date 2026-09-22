@@ -167,7 +167,7 @@ class SafeRmtDenoiser:
         if not math.isfinite(s_db):
             s_db = -40.0
         if s_db > -28.0:
-            # 強信号はコア同様に完全バイパス (過剰処理の禁止)
+            # 強信号はコア同様にバイパス (過剰処理の禁止)
             info["bypass_reason"] = "strong-signal"
             self._eff_strength = 0.0
             return xd, info

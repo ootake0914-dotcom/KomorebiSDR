@@ -291,7 +291,7 @@ def dsp_path_sanity():
     assert err < 1e-5, f"crossover reconstruction error {err}"
 
     print(f"[OK] 240フレーム無段階モーフィング走破 (出力オーディオ総数 {total_audio} samples)")
-    print(f"[OK] クロスオーバー完全再構成誤差 {err:.2e}")
+    print(f"[OK] クロスオーバー再構成誤差 {err:.2e}")
     print("[OK] 例外・NaN・サンプル不整合なし")
 
 

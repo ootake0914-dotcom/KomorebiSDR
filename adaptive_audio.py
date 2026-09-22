@@ -19,7 +19,7 @@ class CognitiveSpeechMusicTracker:
     最適な音響チルト (明瞭度EQ / ワイドHi-Fi) をシームレスに適用する認知型プロセッサ。
 
     - トーク判定時: 低域モワつき・電源ハムカット + 子音了解度 (2.8〜3.5kHz) ブースト + 高域ヒスカット
-    - 音楽判定時: 50Hz〜15kHz 完全フラットHi-Fiワイドレンジへ無段階モーフィング
+    - 音楽判定時: 50Hz〜15kHz フラット寄りのHi-Fiワイドレンジへ無段階モーフィング
 
     数学的根拠: 音響特徴量スペクトルロールオフ解析 (パブリックドメイン)。
     """
@@ -32,7 +32,7 @@ class CognitiveSpeechMusicTracker:
         self._eq_wet = 0.0       # dry/wetクロスフェード (選局直後のジャンプ防止)
 
         # 3kHz プレゼンスブースト用 (線形位相 41タップ Kaiser窓 BPF)
-        # 位相回転ゼロ・群遅延完全補償・高域端での未補正微分ノイズ/シャリつきを完全根絶
+        # 位相回転ゼロ・群遅延補償・高域端での未補正微分ノイズ/シャリつきの抑制
         fc = 3000.0
         bw = 2000.0
         taps = 41
@@ -137,7 +137,7 @@ class CognitiveSpeechMusicTracker:
     def process(self, audio: np.ndarray) -> np.ndarray:
         """
         音声確率に応じて、3kHz線形位相プレゼンスEQ (トーク了解度) と
-        完全フラット (音楽) をシームレスに適用する。
+        フラット寄り (音楽) をシームレスに適用する。
         全体の音量ジャンプ (ポンピング歪み) を排除し等ラウドネス (ユニティゲイン) を維持。
 
         NOTE (時間軸の一意化): 音声確率に関わらず常に線形位相FIRの群遅延
@@ -172,7 +172,7 @@ class CognitiveSpeechMusicTracker:
             hist[:] = ch[-req:] if len(ch) >= req else x_ext[-req:]
             # 3kHz線形位相プレゼンス成分の畳み込み
             bp = np.convolve(x_ext, self.fir_presence, mode="valid")
-            # 群遅延補償: BPFの中心タップ(self._dly=20)と完全に時間整合した原音声
+            # 群遅延補償: BPFの中心タップ(self._dly=20)と時間整合した原音声
             ch_dly = x_ext[self._dly : self._dly + len(ch)]
             # 群遅延整合済み原音へ、フェード量で重み付けしたプレゼンス成分を加算。
             # dry/wetを同一時間軸に統一しコムを原理的に排除する。
@@ -266,9 +266,9 @@ class RmtHankelDenoiser:
     ランダム行列理論 (マルチェンコ・パスツール則) に基づく特異値しきい値処理を適用。
     主成分と雑音部分空間を分離し、ノイズ成分を抑制する。
 
-    - 反対角平均化により、射影行列 P を等価な 2L-1 タップの厳密ゼロ位相FIRフィルタへ縮約。
-    - クリーン信号 (強電界・高SNR) では完全バイパス。
-    - Overlap-Lookahead によるブロック境界誤差 0.00e+00 (完全シームレス)
+    - 反対角平均化により、射影行列 P を等価な 2L-1 タップのゼロ位相FIRフィルタへ縮約。
+    - クリーン信号 (強電界・高SNR) ではバイパス。
+    - Overlap-Lookahead によるブロック境界誤差 0.00e+00 (シームレス)
     """
 
     def __init__(self, sample_rate: float = 48000.0, embed_dim: int = 24):
@@ -308,7 +308,7 @@ class RmtHankelDenoiser:
         if not self.enabled or len(audio) < self.L * 4:
             return audio
 
-        # 強電界時 (S-Meter > -28dBFS) はクリーンとみなし完全バイパス (負荷 0.00ms, 1.000000一致)
+        # 強電界時 (S-Meter > -28dBFS) はクリーンとみなしバイパス (負荷 0.00ms、素通し)
         if s_meter_dbfs > -28.0:
             hist = self._histories.get(ch)
             if hist is not None and len(hist) == self._hist_len:
@@ -375,7 +375,7 @@ class RmtHankelDenoiser:
 
         kernel = self._cached_kernel
 
-        # 6. Overlap-Lookahead による完全連続FIR畳み込み
+        # 6. Overlap-Lookahead による連続FIR畳み込み
         hist = self._histories.get(ch)
         if hist is None or len(hist) != self._hist_len:
             hist = np.zeros(self._hist_len, dtype=np.float32)
@@ -401,7 +401,7 @@ class MonoNoiseSuppressor:
     これにより強局の静かな音楽パッセージをノイズと誤学習して抑圧する
     「ブリージング」を防ぐ (番組フレームは G→1 で透明に通過)。
 
-    - 48kHz / FFT 1024 / hop 344 / Hann (WOLA完全再構成)
+    - 48kHz / FFT 1024 / hop 344 / Hann (WOLA再構成)
     - 時間平滑 (アタック速・リリース遅) + 周波数3bin平滑でミュージカルノイズ抑制
     - 出力は常に同一時間軸 (再構成遅延 680サンプル=14ms、知覚不能)
     - クリーン信号: 再構成誤差のみ (実質ビット一致)
@@ -431,8 +431,8 @@ class MonoNoiseSuppressor:
         self._st = {}
         for ch in ("", "_l", "_r"):
             self._st[ch] = {
-                # ストリーミングWOLA状態: フレーム格子は絶対位置のhop倍数で連続。
-                # buf/buf_pos: 未処理入力、frame_next: 次フレーム開始絶対位置、
+                # ストリーミングWOLA状態: フレーム格子は通算位置のhop倍数で連続。
+                # buf/buf_pos: 未処理入力、frame_next: 次フレーム開始通算位置、
                 # acc/wsum/out_pos: 確定待ちWOLAアキュムレータ、pending: 未返却出力。
                 "buf": np.zeros(self._tail_len, dtype=np.float64),
                 "buf_pos": -self._tail_len,
@@ -482,10 +482,10 @@ class MonoNoiseSuppressor:
     def process(self, audio: np.ndarray, ch: str = "") -> np.ndarray:
         """オーディオ配列を受け取り、スペクトル抑圧後の同一長配列を返す。
 
-        WOLAアキュムレータを呼び出し間で保持し、フレーム格子を絶対位置の
-        hop倍数に固定するため、ブロック分割と一括処理の結果は完全一致する。
-        出力は入力に対し常に tail_len サンプル (14ms) 遅延する (知覚不能)。
-        性能のため絶対フレーム番号で整列した8フレーム単位で一括処理する
+        WOLAアキュムレータを呼び出し間で保持し、フレーム格子を通算位置の
+        hop倍数に固定するため、ブロック分割と一括処理の結果は一致する。
+        出力は入力に対し常に tail_len サンプル (14ms) 遅延する。
+        性能のため通算フレーム番号で整列した8フレーム単位で一括処理する
         (リアルタイム予算: 3ch合計で数ms/ブロック)。
         """
         if not self.enabled or len(audio) == 0:
@@ -503,7 +503,7 @@ class MonoNoiseSuppressor:
         cols_all = np.arange(n_fft)
         # 入力が揃ったフレームを8フレーム単位で処理 (窓長分の先読みで遅延)
         while st["frame_next"] + n_fft <= st["stream_pos"]:
-            g0 = st["fidx"]  # 絶対フレーム番号 (フロア更新点を呼び出し分割に依存させない)
+            g0 = st["fidx"]  # 通算フレーム番号 (フロア更新点を呼び出し分割に依存させない)
             nf = 8 - (g0 % 8)
             avail = (st["stream_pos"] - n_fft - st["frame_next"]) // hop + 1
             if nf > avail:
@@ -531,7 +531,7 @@ class MonoNoiseSuppressor:
                     st["idx"] = (st["idx"] + k) % self._floor_frames
                     st["nupd"] += k
             st["count"] += nf
-            # フロア再計算 (16フレーム毎 = 絶対グループ番号で間引き) と定常性ゲート
+            # フロア再計算 (16フレーム毎 = 通算グループ番号で間引き) と定常性ゲート
             # (フロアが平均に近い = 信号自身が定常でノイズと分離不能なため素通し)
             if st["nupd"] > 0 and (g0 // 8) % 2 == 0:
                 valid = hist[:, :min(st["nupd"], self._floor_frames)]

@@ -1166,7 +1166,7 @@ class SdrGui:
         unit_surf = cached_text(self.font_med, unit, C_ACCENT_DARK)
         self.screen.blit(unit_surf, (cur_x + 8, self.hero_rect.y + 36))
 
-        # 下段: ワイドステーション＆情報ティッカー (最大幅630px、周波数文字と完全分離)
+        # 下段: ワイドステーション＆情報ティッカー (最大幅630px、周波数文字と分離)
         ticker_text = ""
         ticker_color = C_TEXT
         if self.sw_info:
@@ -1351,7 +1351,7 @@ class SdrGui:
     def _draw_telemetry(self):
         parts = [p.strip() for p in self.telemetry_text.split("|") if p.strip()]
 
-        # 2列×3行の整然としたキー・バリュー形式で表示 (左列・右列が絶対に被らない固定座標)
+        # 2列×3行の整然としたキー・バリュー形式で表示 (左列・右列が被らない固定座標)
         for i, part in enumerate(parts[:6]):
             col, row = i // 3, i % 3
             x = self.tele_rect.x + (14 if col == 0 else 146)
@@ -1370,9 +1370,9 @@ class SdrGui:
 
     def _draw_controls(self):
         # 注意: TUNING, MODE, GAIN/AUDIO, FM, AM 等の見出しラベルは
-        # _bake_static_scene() に事前描画済みのため、毎フレームの重複blitを完全排除 (文字潰れ・滲み防止)
+        # _bake_static_scene() に事前描画済みのため、毎フレームの重複blitを排除 (文字潰れ・滲み防止)
 
-        # ステータスバー (右端の検出局数と絶対に被らないよう幅をガード)
+        # ステータスバー (右端の検出局数と被らないよう幅をガード)
         max_st_w = self.status_rect.width - 150
         st_surf = cached_text(self.font_small, f"{t('rx_status')}: {self.scan_status_text}", C_ACCENT_DARK)
         if st_surf.get_width() > max_st_w:
@@ -1391,7 +1391,7 @@ class SdrGui:
             btn.draw(self.screen, self.font_small)
 
     def render(self, spectrum_db, audio_pcm=None):
-        """1フレームの描画処理 (静的シーン事前ベイクにより超高速化)"""
+        """1フレームの描画処理 (静的シーン事前ベイクで高速化)"""
         if self.baked_bg is not None:
             self.screen.blit(self.baked_bg, (0, 0))
         else:

@@ -2,7 +2,7 @@
 Long-Term Audio & RF Quality Analyzer.
 比較的長時間の連続受信・音声ストリーミングを実行し、
 - クロックドリフト補正 (Adaptive Resampler) の同期安定度
-- バッファアンダーラン / パケットドロップ (完全ゼロ証明)
+- バッファアンダーラン / パケットドロップ (ゼロであることの確認)
 - 境界クリックノイズ発生回数
 - アンテナ環境自動同定 (Antenna Profiler)
 - 受信C/N比、聴感SNR、19kHzパイロットトーン抑圧度
@@ -486,7 +486,7 @@ def analyze_wav_file(wav_path: str, out_img: str = "long_term_analysis.png"):
     print("📊 WAVファイル 長時間解析結果サマリー")
     print("=" * 70)
     print(f"• 音声総再生時間         : {duration:.2f} 秒")
-    print(f"• 検出クリックノイズ総数 : {total_clicks} 回 (完全クリックレス判定)")
+    print(f"• 検出クリックノイズ総数 : {total_clicks} 回 (クリックレス判定)")
     print(f"• 平均聴感 音声SNR       : +{avg_snr:.1f} dB")
     print(f"• 19kHzパイロット漏洩比  : {pilot_leak_db:.1f} dB (抑圧目標: -40dB以下)")
     print("=" * 70)

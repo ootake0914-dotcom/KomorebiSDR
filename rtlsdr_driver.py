@@ -308,8 +308,8 @@ class RtlSdrDriver:
     def read_async(self, callback_fn, num_buffers: int = 16, buffer_len: int = 132096):
         """
         OSS (rtl_fm) と同一のカーネルレベル非同期ストリーミング受信。
-        librtlsdr内部で複数のUSBバルク転送バッファを循環させ、パケットロスを完全根絶。
-        バッファ長132096はUSB 2.0パケット(512B)と復調単位(48B)の両方の完全倍数(1536B * 86)。
+        librtlsdr内部で複数のUSBバルク転送バッファを循環させ、パケットロスを抑える。
+        バッファ長132096はUSB 2.0パケット(512B)と復調単位(48B)の両方の倍数(1536B * 86)。
         :param callback_fn: 新しい生IQデータ (np.ndarray uint8) を受け取るPythonコールバック
         """
         if not self.is_open:

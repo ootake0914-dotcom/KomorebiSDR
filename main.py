@@ -75,6 +75,7 @@ class SdrApp:
         self.dsp.set_stereo_enabled(self.config.get("stereo", True))
         self.dsp.set_stereo_nr(self.config.get("stereo_nr", True))
         self.dsp.sic_enabled = bool(self.config.get("sic", True))
+        self._apply_black_magic_config()
         # オーディオ出力
         self.audio = AudioOutput(self.audio_rate)
         self.audio.set_volume(float(self.config.get("volume", 0.7)))
@@ -293,6 +294,57 @@ class SdrApp:
         out.reverse()
         return out
 
+    def _apply_black_magic_config(self):
+        """configのblack_magic節をdsp属性へ反映 (起動時1回。既定は全OFF)。
+
+        パラメータ本体はdsp.bm_cfg経由で遅延生成インスタンスへ渡る。
+        破損値はconfig側の検証＋dsp側の_min/maxで二重に弾く。
+        """
+        try:
+            bm = self.config.get("black_magic", None) or {}
+            if not isinstance(bm, dict):
+                bm = {}
+            dsp = self.dsp
+            dsp.black_magic_enabled = bool(bm.get("enabled", False))
+            dsp.bm_cfg = {k: v for k, v in bm.items() if isinstance(v, dict)}
+            c = bm.get("cyclostationary", None) or {}
+            dsp.bm_cyclo_enabled = bool(c.get("enabled", True)) if isinstance(c, dict) else True
+            try:
+                dsp.bm_cyclo_min_conf = float(c.get("min_confidence", 0.55))
+            except (TypeError, ValueError, AttributeError):
+                dsp.bm_cyclo_min_conf = 0.55
+            r = bm.get("rmt_denoiser", None) or {}
+            dsp.bm_rmt_enabled = bool(r.get("enabled", False)) if isinstance(r, dict) else False
+            s = bm.get("stochastic_resonance", None) or {}
+            dsp.bm_sr_enabled = bool(s.get("enabled", False)) if isinstance(s, dict) else False
+            a = bm.get("adaptive_notch", None) or {}
+            dsp.bm_notch_enabled = bool(a.get("enabled", False)) if isinstance(a, dict) else False
+            q = bm.get("squelch_assist", None) or {}
+            if isinstance(q, dict):
+                dsp.bm_sq_assist_enabled = bool(q.get("enabled", False))
+                for attr, key, lo, hi, default in (
+                        ("bm_sq_open_conf", "open_conf", 0.0, 1.0, 0.75),
+                        ("bm_sq_close_conf", "close_conf", 0.0, 1.0, 0.55),
+                        ("bm_sq_close_smeter_db", "close_smeter_db", -120.0, 0.0, -25.0),
+                        ("bm_sq_open_smeter_db", "open_smeter_db", -120.0, 0.0, -40.0),
+                        ("bm_sq_min_close_blocks", "min_close_blocks", 0, 200, 20)):
+                    try:
+                        v = q.get(key, default)
+                        if isinstance(v, bool):
+                            v = default
+                        v = min(max(float(v), lo), hi)
+                        if attr == "bm_sq_min_close_blocks":
+                            v = int(round(v))
+                        setattr(dsp, attr, v)
+                    except (TypeError, ValueError):
+                        pass
+            else:
+                dsp.bm_sq_assist_enabled = False
+            sk = bm.get("seeking", None) or {}
+            dsp.bm_seek_enabled = bool(sk.get("enabled", False)) if isinstance(sk, dict) else False
+        except Exception:
+            pass
+
     def _apply_frequency_and_mode(self, freq: int, mode: str):
         """周波数と復調モードをハードウェア・DSPに適用"""
         self.freq = freq
@@ -476,7 +528,7 @@ class SdrApp:
             return t
 
         def stop_usb_stream(t) -> bool:
-            """Cループが実際に抜けるまで待機してから同期読み込みを行う (競合・ハング根絶)。
+            """Cループが実際に抜けるまで待機してから同期読み込みを行う (競合・ハング防止)。
             戻り値: 旧スレッドが抜けた(True)/残留(False)。残留時は二重read_asyncを
             避けるため呼び出し側はスキャンを中止しなければならない。"""
             usb_running.clear()
@@ -865,7 +917,7 @@ class SdrApp:
                 q_size = self.audio.get_queue_size()
                 self.dsp.update_resampler_feedback(float(q_size))
 
-                # DSP復調処理 (適応リサンプラによる完全無欠損ストリーミング)
+                # DSP復調処理 (適応リサンプラによる欠落を抑えたストリーミング)
                 t_dsp = time.perf_counter()
                 audio_pcm, spectrum_db = self.dsp.process(raw_bytes, mode=self.mode)
                 self.rt_profile.add((time.perf_counter() - t_dsp) * 1000.0)
@@ -903,7 +955,7 @@ class SdrApp:
                     if hard_locked:
                         self.gui.is_hard_locked = True
                         self.gui.btn_gain_auto.text = t("gain_fixed", db=f"{stats['gain_db']:.1f}")
-                        self.gui.btn_gain_auto.bg_color = (206, 236, 224)  # ミント (完全固定)
+                        self.gui.btn_gain_auto.bg_color = (206, 236, 224)  # ミント (固定表示)
                     elif converged:
                         self.gui.is_hard_locked = False
                         self.gui.btn_gain_auto.text = t("gain_converged", db=f"{stats['gain_db']:.1f}")

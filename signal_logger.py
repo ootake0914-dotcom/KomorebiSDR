@@ -232,7 +232,7 @@ def diagnose_environment(path: str, freq_hz: int = None, recent_n: int = 120) ->
     # 5. 推奨アクション
     recommendations = []
     if pl_unlock_ratio > 0.2 or mp_mean < 0.75 or b_crosses >= 2:
-        recommendations.append("[Stereo] ボタンを押して「MONO」に切り替える (台風フェージングによる38kHz副搬送波の位相乱れを完全遮断)")
+        recommendations.append("[Stereo] ボタンを押して「MONO」に切り替える (台風フェージングによる38kHz副搬送波の位相乱れを抑える)")
     if wiener_deep_ratio > 0.3 or cut_chatter_ratio > 0.2:
         recommendations.append("[NR] ボタンを押して「OFF」にする (適応ウィーナーフィルターの急峻な追従によるミュージカルノイズを停止)")
     if float(np.std(gain_arr)) > 2.0 or is_fading:

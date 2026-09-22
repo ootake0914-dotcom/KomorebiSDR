@@ -164,7 +164,7 @@ class CyclostationaryPilotDetector:
         phase = math.atan2(c0.imag, c0.real)
         # 位相連続性: 連続音ならブロック間の位相進みは理論値
         # (2π f N/fs) に一致する。残差の単位フェーザ平均をとり、
-        # 1=完全連続、0=ランダム (ノイズ) とする。
+        # 1=連続性が高い、0=ランダム (ノイズ) とする。
         if self._prev_phase is not None:
             expected_adv = 2.0 * math.pi * self.target_hz * n / self.fs
             resid = (phase - self._prev_phase - expected_adv + math.pi) % (2.0 * math.pi) - math.pi

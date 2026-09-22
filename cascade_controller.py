@@ -11,7 +11,7 @@ import numpy as np
 class CascadeController:
     """SDRカスケード自律最適化コントローラ"""
 
-    MIN_SAFE_GAIN_DB = 19.7  # 実用最低安全ゲイン: 19.7dB未満(熱雑音沈没)への転落を完全防止
+    MIN_SAFE_GAIN_DB = 19.7  # 実用最低安全ゲイン: 19.7dB未満への転落を防ぐ目安
     FLOOR_GAIN_DB = 12.5  # 持続クリップ時の非常用下限
 
     def _min_safe_idx(self) -> int:
@@ -30,7 +30,7 @@ class CascadeController:
         self.audio = audio
 
         self.enabled = True
-        self.dx_mode = False  # DX微弱局超高感度モード
+        self.dx_mode = False  # DX微弱局モード
         self.available_gains = []
         self.current_gain_idx = 0
 
@@ -47,7 +47,7 @@ class CascadeController:
         self.gain_snr_history = {}  # {gain_idx: smoothed_snr}
         self.search_direction = +1  # +1: ゲイン上げ探索, -1: ゲイン下げ探索
         self.weak_converged_count = 0
-        self.hard_lock = False  # 収束後の完全決め打ち固定 (フェージング・無音での誤再探索を完全防止)
+        self.hard_lock = False  # 収束後の決め打ち固定 (フェージング・無音での誤再探索を防ぐ)
         self.filter_override = None  # 手動フィルタ固定 (hyper互換: None=自動)
         self._filter_hold_ticks = 0
 
@@ -106,7 +106,7 @@ class CascadeController:
             self.driver.set_gain(self.available_gains[self.current_gain_idx])
 
     def set_hard_lock(self, locked: bool):
-        """ユーザーまたは収束による完全決め打ち固定 (True: 固定, False: 再探索開始)"""
+        """ユーザーまたは収束による決め打ち固定 (True: 固定, False: 再探索開始)"""
         self.hard_lock = locked
         if not locked:
             # ロック解除時は探索カウンタをリセットして即座に再評価

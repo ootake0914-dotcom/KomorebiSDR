@@ -105,7 +105,7 @@ class RdsDecoder:
         self._rt_ab = None          # RadioText A/Bフラグ (切替でバッファリセット)
 
     def reset(self):
-        """選局・モード切替時にデコーダ状態を完全リセットする。"""
+        """選局・モード切替時にデコーダ状態をリセットする。"""
         self._buf = np.zeros(0, dtype=np.float32)
         self._phase = None
         self._prev_soft = 0.0

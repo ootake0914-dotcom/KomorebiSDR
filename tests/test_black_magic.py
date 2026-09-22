@@ -361,6 +361,39 @@ def test_controller_seek_integration():
     assert c2.seeker.offset == 0.0 and c2.seeker.frozen is False
 
 
+def test_main_wiring():
+    # main.pyのconfig→dsp反映 (実インスタンス不要のfake selfで検証)
+    import types
+    import main as main_mod
+    from dsp import SdrDspPipeline
+    from config import DEFAULT_CONFIG
+    import copy
+    cfg = copy.deepcopy(DEFAULT_CONFIG)
+    cfg["black_magic"]["enabled"] = True
+    cfg["black_magic"]["rmt_denoiser"]["enabled"] = True
+    cfg["black_magic"]["rmt_denoiser"]["max_strength"] = 0.5
+    cfg["black_magic"]["squelch_assist"]["enabled"] = True
+    cfg["black_magic"]["seeking"]["enabled"] = True
+    fake = types.SimpleNamespace(config=cfg, dsp=SdrDspPipeline(1152000, 48000))
+    main_mod.SdrApp._apply_black_magic_config(fake)
+    dsp = fake.dsp
+    assert dsp.black_magic_enabled is True
+    assert dsp.bm_rmt_enabled is True
+    assert dsp.bm_sq_assist_enabled is True
+    assert dsp.bm_seek_enabled is True
+    assert dsp.bm_cfg["rmt_denoiser"]["max_strength"] == 0.5
+    # 遅延生成がconfig値を反映する
+    inst = dsp._bm_make_rmt()
+    assert abs(inst.max_strength - 0.5) < 1e-9
+    # 既定configでは全OFF
+    fake2 = types.SimpleNamespace(config=copy.deepcopy(DEFAULT_CONFIG),
+                                  dsp=SdrDspPipeline(1152000, 48000))
+    main_mod.SdrApp._apply_black_magic_config(fake2)
+    assert fake2.dsp.black_magic_enabled is False
+    assert fake2.dsp.bm_rmt_enabled is False
+    assert fake2.dsp.bm_sq_assist_enabled is False
+
+
 def main() -> int:
     try:
         test_disabled_bypass()
@@ -397,6 +430,8 @@ def main() -> int:
         print("[*] Q関数・収束 OK")
         test_controller_seek_integration()
         print("[*] 収束統合 OK")
+        test_main_wiring()
+        print("[*] main配線 OK")
     except AssertionError as e:
         print(f"FAILED: {e}")
         return 1

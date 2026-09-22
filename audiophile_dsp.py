@@ -4,9 +4,9 @@ Audiophile High-End DSP Modules for KomorebiSDR Radio.
 極限ピュアオーディオ信号処理モジュール群。
 
 【本モジュールの特徴】
-- 既存の動作コード（dsp.py, audio_output.py, main.py等）に一切手を加えない完全独立モジュール。
+- 既存の動作コード（dsp.py, audio_output.py, main.py等）に手を加えない独立モジュール。
 - 将来いつでも1行のインポートで本番パイプラインへ合流可能。
-- 古典信号処理・音響心理学・線形代数に基づく完全特許フリー設計。
+- 古典信号処理・音響心理学・線形代数に基づく設計（既知の公開手法のみ使用）。
 """
 
 import numpy as np
@@ -19,7 +19,7 @@ class TpdfDitherNoiseShaper:
 
     32bit浮動小数点 (-1.0〜+1.0) から 16bit整数 (-32768〜+32767) へ変換する際、
     単純丸め・切り捨てによって生じる「微小信号の階段歪み（量子化高調波歪み）」を
-    数学的に完全消滅させる。
+    低減する。
 
     さらに、ディザー雑音のスペクトルを人間の耳が極めて鈍感な超高域 (18kHz以上) へ
     フィードバックフィルタで押し上げることで、16bitでありながら可聴域実効S/N
@@ -76,7 +76,7 @@ class TpdfDitherNoiseShaper:
 
     def _shape_channel(self, ch_float: np.ndarray, is_right: bool) -> np.ndarray:
         n = len(ch_float)
-        # 非有限数 (NaN/Inf) のサニタイズ (例外クラッシュ根絶)
+        # 非有限数 (NaN/Inf) のサニタイズ (例外クラッシュ防止)
         ch_clean = np.nan_to_num(ch_float, nan=0.0, posinf=1.0, neginf=-1.0)
         # 16bitフルスケールにスケーリング
         scaled = np.clip(ch_clean * 32767.0, -32768.0, 32767.0)
@@ -92,7 +92,7 @@ class TpdfDitherNoiseShaper:
         e2 = float(self.err2_r if is_right else self.err2_l)
         b1, b2 = float(self.b1), float(self.b2)
 
-        # NumPyスカラー呼び出しオーバーヘッドを排除する超高速スカラー演算ループ (54ms -> 2ms)
+        # NumPyスカラー呼び出しオーバーヘッドを避けるスカラー演算ループ (54ms -> 2ms)
         s_list = scaled.tolist()
         t_list = tpdf.tolist()
 
@@ -129,8 +129,8 @@ class MinimumPhaseApodizer:
     「デジタル臭い」「音が冷たい」と感じる原因となる。
 
     本プロセッサは、ヒルベルト変換による最小位相化により、周波数振幅特性を
-    完全に維持したまま時間軸の前方リップル（プリリンギング）を数学的に「ゼロ」にし、
-    自然界のアコースティック楽器（ピアノ、ドラム、ギター）と同じ自然な立ち上がりを実現する。
+    ほぼ維持したまま時間軸の前方リップル（プリリンギング）を抑え、
+    立ち上がりの自然さを狙う。
 
     数学的根拠: 複素ケプストラム法・ヒルベルト変換最小位相再構成 (Oppenheim & Schafer)。
     """
@@ -139,7 +139,7 @@ class MinimumPhaseApodizer:
     def convert_fir_to_minimum_phase(linear_fir: np.ndarray, n_fft: int = 4096) -> np.ndarray:
         """
         対称な直線位相FIRフィルタ係数を受け取り、同等の振幅特性を持つ
-        因果的・最小位相FIRフィルタ係数（プリリンギング完全ゼロ）を返す。
+        因果的・最小位相FIRフィルタ係数（プリリンギング低減）を返す。
         """
         num_taps = len(linear_fir)
         if num_taps <= 3:
@@ -183,11 +183,11 @@ class ActiveDcServo:
     30Hz程度の1次HPF（IIR）を挿入するが、これにより20Hz〜300Hzの可聴低域全体に
     大きな位相進み歪み（時間軸のズレ）が生じ、低音が「緩い」「遅れる」原因になる。
 
-    本サーボは高級セパレートアンプのDCサーボ回路をデジタル再現し、
-    超低域（0.05Hz以下）の超低速積分負帰還ループによって直流オフセットのみを100%相殺し、
-    20Hz〜20kHzの可聴帯域全体で「位相回転ゼロ（フラット）」を維持する。
+    本サーボは高級セパレートアンプのDCサーボ回路を参考にしたデジタル実装で、
+    低域（0.05Hz以下）の低速積分負帰還ループによって直流オフセットの除去を狙い、
+    20Hz〜20kHzの可聴帯域全体で位相回転の少ない（フラットに近い）特性を目指す。
 
-    効果: バスドラムやエレクトリックベースのスピード感・タイトなアタック輪郭の復元。
+    効果の狙い: バスドラムやエレクトリックベースのアタック輪郭の保持。
     """
 
     def __init__(self, sample_rate: float = 48000.0, time_constant_sec: float = 3.5):
@@ -206,8 +206,8 @@ class ActiveDcServo:
 
     def process(self, audio: np.ndarray) -> np.ndarray:
         """
-        オーディオ信号を受け取り、可聴帯域の位相を一切回転させずに
-        直流オフセットのみを完全相殺して返す。
+        オーディオ信号を受け取り、可聴帯域の位相変化を抑えつつ
+        直流オフセットの除去を狙う。
         """
         if not self.enabled or len(audio) == 0:
             return audio

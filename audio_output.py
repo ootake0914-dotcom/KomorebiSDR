@@ -37,7 +37,7 @@ class AudioOutput:
         self._want_running = False
         self._device_watch_thread = None
         self._device_watch_stop = threading.Event()
-        self.preroll_threshold = 8  # 深層ジッターバッファ: 約400ms (8チャンク) 蓄積して完全安定再生
+        self.preroll_threshold = 8  # ジッターバッファ: 約400ms (8チャンク) 蓄積して安定再生
         self.last_out_samples = np.zeros(2, dtype=np.float32)
 
         # リアルタイムコールバック内の動的確保を排除 (uac2: pre-allocated pool / single-copy)
@@ -82,7 +82,7 @@ class AudioOutput:
         self._fpu_initialized = False
 
     def _callback_core(self, outdata, frames, time_info, status):
-        """深層ジッターバッファによる完全安定オーディオ再生コールバック。
+        """ジッターバッファによる安定オーディオ再生コールバック。
 
         リアルタイムパスでは新規メモリ確保を行わず、事前確保した _scratch へ
         キュー内容を直接コピーする (uac2 の pre-allocated pool / single-copy 方式)。
@@ -112,7 +112,7 @@ class AudioOutput:
             self._comp1d = np.empty(len(self._scratch), dtype=np.float32)
             self._gainbuf = np.empty(len(self._scratch), dtype=np.float32)
 
-        # プレロール判定: バッファが深層クッション(約400ms)まで蓄積されるまで待機
+        # プレロール判定: バッファがクッション(約400ms)まで蓄積されるまで待機
         if not self.is_prerolled:
             if self.audio_queue.qsize() >= self.preroll_threshold:
                 self.is_prerolled = True
@@ -169,7 +169,7 @@ class AudioOutput:
             # 次コールバックの復帰時にフェードインを掛ける (無音→任意振幅の段差防止)
             self._needs_fade_in = True
 
-            # キューが完全に空なら再プレロール(4チャンク)して小刻みなバタつきを防止
+            # キューが空なら再プレロール(4チャンク)して小刻みなバタつきを防止
             if self.audio_queue.empty() and len(self.remainder) == 0:
                 self.is_prerolled = False
                 self.preroll_threshold = 4
@@ -222,7 +222,7 @@ class AudioOutput:
             self._vol_current = vol
 
         # ステレオ連動（Linked Stereo）ソフトリミッター (0.85超のみ圧縮)
-        # 左右チャンネル独立圧縮による音像定位の揺れ・偏りを完全根絶し、左右の音量比を厳密保存。
+        # 左右チャンネル独立圧縮による音像定位の揺れ・偏りを抑え、左右の音量比を保存。
         # 全て事前確保域で計算しアロケーションゼロ。
         threshold = 0.85
         abs_l = self._absbuf[:frames, 0]
@@ -243,7 +243,7 @@ class AudioOutput:
             comp += threshold
             gain = self._gainbuf[:frames]
             np.divide(comp, np.maximum(peak, 1e-12), out=gain)
-            # 左右両チャンネルに同一の減衰ゲインを適用 (L/R比率・音像を100%完全保存)
+            # 左右両チャンネルに同一の減衰ゲインを適用 (L/R比率・音像を保存)
             # fancy-index (data[mask]*=) は一時配列を確保するため、where書戻しで確保回避
             np.copyto(self._compbuf[:frames, 0], data[:, 0])
             np.copyto(self._compbuf[:frames, 1], data[:, 1])

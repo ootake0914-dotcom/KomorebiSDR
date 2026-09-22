@@ -22,7 +22,7 @@ def design_fir_kaiser(num_taps: int, cutoff_norm: float, beta: float = 6.5) -> n
 
 
 def design_fir_highpass(num_taps: int, cutoff_norm: float, beta: float = 6.5) -> np.ndarray:
-    """Kaiser窓LPFのスペクトル反転による相補ハイパスFIR (LPF+HPF=完全再構成)"""
+    """Kaiser窓LPFのスペクトル反転による相補ハイパスFIR (LPF+HPF=再構成)"""
     h = design_fir_kaiser(num_taps, cutoff_norm, beta)
     h = -h
     h[len(h) // 2] += 1.0

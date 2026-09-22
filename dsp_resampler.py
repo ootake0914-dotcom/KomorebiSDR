@@ -11,8 +11,8 @@ import numpy as np
 class AdaptiveDriftResampler:
     """
     RTL-SDRとDAC間の独立クロック偏差（ドリフト）を微小に伸縮補正し、
-    サンプル欠落・重複・アンダーランを完全根絶する適応型分数リサンプラ。
-    深層ジッターバッファ（約400ms）と広域不感帯により通常時は0ppm・完全ビットパーフェクト通過。
+    サンプル欠落・重複・アンダーランを抑える適応型分数リサンプラ。
+    ジッターバッファ（約400ms）と不感帯により通常時は0ppm・ビットパーフェクト通過。
     """
 
     def __init__(self, target_chunks: float = 8.0, max_ppm: float = 2000.0):
@@ -33,7 +33,7 @@ class AdaptiveDriftResampler:
     def update_feedback(self, current_chunks: float, dt: float = 0.05):
         """
         オーディオバッファの残存チャンク数に応じた不感帯付き高精度PI制御。
-        通常時（5.5〜10.5チャンク）は 0ppm・完全ビットパーフェクト通過。
+        通常時（5.5〜10.5チャンク）は 0ppm・ビットパーフェクト通過。
         """
         # 不感帯（Deadband）判定: 健全領域
         if self.deadband_low <= current_chunks <= self.deadband_high:
@@ -61,7 +61,7 @@ class AdaptiveDriftResampler:
         adj = kp * error + ki * self.integral_error
         adj = float(np.clip(adj, -self.max_ratio_offset, self.max_ratio_offset))
 
-        # 0.5ppm未満の微小な揺らぎは完全ゼロ（ビットパーフェクト）に丸める
+        # 0.5ppm未満の微小な揺らぎはゼロ（ビットパーフェクト）に丸める
         if abs(adj) < 0.5e-6:
             adj = 0.0
 

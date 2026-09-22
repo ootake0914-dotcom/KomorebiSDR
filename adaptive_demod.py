@@ -15,12 +15,11 @@ import numpy as np
 
 class DeepSpaceEkfDemodulator:
     """
-    深宇宙通信・人工衛星級 拡張カルマンフィルタ (Deep-Space EKF) FM復調エンジン。
+    拡張カルマンフィルタ (EKF) FM復調エンジン。
 
-    NASA深宇宙ネットワーク (DSN) や惑星探査機で用いられる非線形カルマン推定と、
-    ロバスト統計学 (Huber M推定器) をFM復調へ完全統合。
+    非線形カルマン推定と、ロバスト統計学 (Huber M推定器) をFM復調へ組み合わせたもの。
     低CNR (搬送波対雑音比) 環境下での 2π 位相スリップ (クリックスパイクノイズ) を
-    確率論的に予測・抑圧し、FM閾値拡張 (Threshold Extension +6dB〜+9dB) を達成する。
+    確率論的に予測・抑圧し、FM閾値拡張 (Threshold Extension。条件により数dB程度) を狙う。
     """
 
     def __init__(self, sample_rate: float = 288000.0,
@@ -111,15 +110,15 @@ class DeepSpaceEkfDemodulator:
 
 
 class KalmanPilotTracker:
-    """NASA DSN (深宇宙ネットワーク) 方式 自律適応カルマン・パイロット搬送波追従器 (AKCTL)
+    """自律適応カルマン・パイロット搬送波追従器 (AKCTL)
 
     FMステレオ19kHzパイロット信号の直交位相誤差 (イノベーション) およびコヒーレント品質を
     リアルタイム観測し、代数リッカチ方程式 (ARE) の最適漸近解に基づいてループ固有周波数 fn,
     比例ゲイン Kp, 積分ゲイン Ki, およびループフィルタ極 alpha を動的適応制御する。
 
     - 強電界・高CNR: ループ帯域幅を拡大 (fn ~ 24Hz) し、送信機クリスタル偏差や航空機反射ドップラーに俊敏追従。
-    - 弱電界・低CNR・高マルチパス: ループ帯域幅を極小 (fn ~ 3.0Hz) まで絞り込み、熱雑音・位相ジッターを完全遮断。
-    - ステレオ音像の岩のような固定感と、-40dB超のステレオセパレーションを極限ノイズ下でも維持。
+    - 弱電界・低CNR・高マルチパス: ループ帯域幅を極小 (fn ~ 3.0Hz) まで絞り込み、熱雑音・位相ジッターを抑える。
+    - ステレオ音像の安定と、ステレオセパレーションの維持をノイズ下でも狙う。
     """
 
     def __init__(self, sample_rate: float = 288000.0, fn_min: float = 3.0, fn_max: float = 24.0, zeta: float = 0.85):
@@ -161,7 +160,7 @@ class KalmanPilotTracker:
         cnr_lin = 10.0 ** (self.current_cnr_db / 10.0)
         target_fn = self.fn_min + (self.fn_max - self.fn_min) * (cnr_lin / (8.0 + cnr_lin))
 
-        # パラメータの滑らかな推移 (ポップノイズ根絶)
+        # パラメータの滑らかな推移 (ポップノイズ抑制)
         self.current_fn = (1.0 - self._smooth_alpha) * self.current_fn + self._smooth_alpha * target_fn
         self._compute_gains(self.current_fn)
 
@@ -178,7 +177,7 @@ class RiemannianTopologicalDemodulator:
     ±π境界をまたぐ跳躍はノイズ性の偽スリップと断定できる。
     クリーン時は素通しとビット一致。ブロック境界の位相も保持し連続追跡する。
 
-    - クリーン信号での波形相関度: 1.000000 (完全ビット一致)
+    - クリーン信号での波形相関度: 1.000000 (ビット一致)
     - ±π境界横断クリックの除去 (素通しでは±2πスパイクとして残る)
     """
 

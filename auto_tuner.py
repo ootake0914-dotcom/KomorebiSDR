@@ -69,7 +69,7 @@ class AutoTuner:
         snr_threshold: float = 7.5,
     ) -> list[dict]:
         """
-        帯域全体を高速スイープし、本物のFM放送局のみを確実に抽出 (偽局・ノイズスプリアス完全排除)。
+        帯域全体を高速スイープし、FM放送局らしきピークを抽出 (偽局・ノイズスプリアスの除外を試みる)。
         :param start_hz: スキャン開始周波数 (デフォルト 76.0MHz)
         :param end_hz: スキャン終了周波数 (デフォルト 95.0MHz)
         :param step_hz: チューナーステップ幅 (デフォルト 1.5MHz)
