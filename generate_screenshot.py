@@ -36,6 +36,10 @@ def generate_screenshot(output_path="assets/screenshot.png"):
         {"name": "TBS 954k", "freq_hz": 954000, "mode": "AM"},
         {"name": "短波日経 6.055M", "freq_hz": 6055000, "mode": "AM"},
     ]
+    gui.detected_stations = [
+        {"name": "TOKYO FM", "freq_hz": 80000000, "freq_mhz": 80.0, "snr_db": 28.5, "quality": "STRONG"},
+        {"name": "J-WAVE", "freq_hz": 80350000, "freq_mhz": 80.35, "snr_db": 18.0, "quality": "MEDIUM"},
+    ]
     gui.set_presets(fm_presets, am_presets)
 
     # 美しいFM放送スペクトラムのシミュレーション

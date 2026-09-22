@@ -1207,12 +1207,17 @@ class SdrGui:
                     if f_min <= sfreq <= f_max:
                         ratio = (sfreq - f_min) / (f_max - f_min)
                         m_x = r.x + int(ratio * r.width)
-                        color = (58, 200, 140) if st.get("quality") == "STRONG" else (230, 178, 75) if st.get("quality") == "MEDIUM" else (186, 130, 210)
-                        pygame.draw.polygon(self.screen, color,
-                                            [(m_x, r.y + 16), (m_x - 5, r.y + 6), (m_x + 5, r.y + 6)])
                         st_tag = st.get("name") or f"{st.get('freq_mhz', float(sfreq) / 1e6):.1f}"
-                        lbl = cached_text(self.font_tiny, st_tag, color)
-                        self.screen.blit(lbl, (m_x - lbl.get_width() // 2, r.y + 18))
+                        lbl = cached_text(self.font_tiny, st_tag, (230, 246, 255))
+                        lw, lh = lbl.get_width(), lbl.get_height()
+                        bx = max(r.x + 4, min(r.right - 4 - lw - 8, m_x - lw // 2 - 4))
+                        by = r.y + 12
+                        badge_rect = pygame.Rect(bx, by, lw + 8, lh + 4)
+                        pygame.draw.rect(self.screen, (14, 24, 38), badge_rect, border_radius=4)
+                        pygame.draw.rect(self.screen, (0, 190, 160), badge_rect, width=1, border_radius=4)
+                        pygame.draw.polygon(self.screen, (0, 190, 160),
+                                            [(m_x, by + lh + 7), (m_x - 4, by + lh + 4), (m_x + 4, by + lh + 4)])
+                        self.screen.blit(lbl, (bx + 4, by + 2))
                 except Exception:
                     continue
 
