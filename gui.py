@@ -478,62 +478,63 @@ class SdrGui:
         btns.extend([self.btn_band_fm, self.btn_band_am, self.btn_band_sw])
 
         # ---- 2. ONE-TOUCH DISCOVERY (tune_rect 内にスキャン・シーク・モード配置) ----
+        # ---- 2. ONE-TOUCH DISCOVERY (tune_rectいっぱいに均等配置。空洞を作らない) ----
         tx, tw = self.tune_rect.x + 14, self.tune_rect.width - 28
-        y_scan = self.tune_rect.y + 28
+        y = self.tune_rect.y + 28
+        bottom = self.tune_rect.bottom - 12
+        # 固定行高の合計を差し引いた残りを均等gapに分配する
+        row_h = {"scan": 44, "seek": 34, "list": 30, "mode": 28, "bfo": 26}
+        fixed = row_h["scan"] + row_h["seek"] + row_h["list"] + 2 * row_h["mode"] + 4 + row_h["bfo"]
+        gap = max(6, (bottom - y - fixed) // 5)
+        half = (tw - 8) // 2
         # FM/短波スキャンを並列配置 (どちらも常時到達可能にする。片方だけ隠す破綻の修正)
-        half_scan = (tw - 8) // 2
-        self.btn_scan_band = Button((tx, y_scan, half_scan, 42), t("scan_button"), self._request_scan,
+        self.btn_scan_band = Button((tx, y, half, row_h["scan"]), t("scan_button"), self._request_scan,
                                     bg_color=(196, 238, 226), active_color=C_ACCENT, radius=8)
-        self.btn_scan_sw = Button((tx + half_scan + 8, y_scan, half_scan, 42), t("scan_sw_button"),
+        self.btn_scan_sw = Button((tx + half + 8, y, half, row_h["scan"]), t("scan_sw_button"),
                                   self._request_sw_scan,
                                   bg_color=(208, 230, 250), active_color=C_ACCENT, radius=8)
         btns.extend([self.btn_scan_band, self.btn_scan_sw])
+        y += row_h["scan"] + gap
 
         # シークボタン (Prev / Next)
-        half = (tw - 8) // 2
-        y_seek = y_scan + 48
-        self.btn_seek_prev = Button((tx, y_seek, half, 32), t("seek_prev"), lambda: self._seek(-1),
+        self.btn_seek_prev = Button((tx, y, half, row_h["seek"]), t("seek_prev"), lambda: self._seek(-1),
                                     bg_color=(226, 235, 248), active_color=C_BTN_ACTIVE2, radius=8)
-        self.btn_seek_next = Button((tx + half + 8, y_seek, half, 32), t("seek_next"), lambda: self._seek(1),
+        self.btn_seek_next = Button((tx + half + 8, y, half, row_h["seek"]), t("seek_next"), lambda: self._seek(1),
                                     bg_color=(226, 235, 248), active_color=C_BTN_ACTIVE2, radius=8)
         btns.extend([self.btn_seek_prev, self.btn_seek_next])
+        y += row_h["seek"] + gap
 
         # 検出局プルダウンボタン
-        y_list = y_seek + 38
         n_st = len(self.detected_stations)
-        self.btn_station_list = Button((tx, y_list, tw, 28), t("station_list_btn", n=n_st),
+        self.btn_station_list = Button((tx, y, tw, row_h["list"]), t("station_list_btn", n=n_st),
                                        self._toggle_station_list,
                                        bg_color=(210, 240, 232), active_color=C_ACCENT, radius=6)
         btns.append(self.btn_station_list)
+        y += row_h["list"] + gap
 
         # モード切替ボタン群 (2行3列でゆったりと押しやすく配置)
-        y_mode = y_list + 32
         m_gap = 6
         mw = (tw - 2 * m_gap) // 3
-        mh = 24
+        mh = row_h["mode"]
         mode_buttons = {}
         mode_rows = [
             [("WFM", (216, 238, 250)), ("AM", (216, 238, 250)), ("NFM", (216, 238, 250))],
             [("USB", (228, 238, 252)), ("LSB", (228, 238, 252)), ("CW", (228, 238, 252))]
         ]
         for r_idx, row in enumerate(mode_rows):
-            cur_my = y_mode + r_idx * (mh + 4)
+            cur_my = y + r_idx * (mh + 4)
             for c_idx, (m_name, m_col) in enumerate(row):
                 b = Button((tx + c_idx * (mw + m_gap), cur_my, mw, mh), m_name,
                            (lambda m=m_name: self._set_mode(m)), bg_color=m_col, radius=6)
                 mode_buttons[m_name] = b
                 btns.append(b)
         self.mode_buttons = mode_buttons
-        self.btn_wfm = self.mode_buttons["WFM"]
-        self.btn_am = self.mode_buttons["AM"]
-        self.btn_nfm = self.mode_buttons["NFM"]
+        y += 2 * mh + 4 + gap
 
         # BFO微調整 (SSB・CW時に表示)
-        hw = (tw - 8) // 2
-        y_bfo = y_mode + 2 * (mh + 4) + 2
-        self.btn_bfo_down = Button((tx, y_bfo, hw, 22), "BFO -",
+        self.btn_bfo_down = Button((tx, y, half, row_h["bfo"]), "BFO -",
                                    lambda: self._step_bfo(-50), bg_color=(240, 243, 248), radius=4)
-        self.btn_bfo_up = Button((tx + hw + 8, y_bfo, hw, 22), "BFO +",
+        self.btn_bfo_up = Button((tx + half + 8, y, half, row_h["bfo"]), "BFO +",
                                  lambda: self._step_bfo(50), bg_color=(240, 243, 248), radius=4)
         btns.extend([self.btn_bfo_down, self.btn_bfo_up])
         # 下部ステーションカードは廃止 (検出局プルダウンに一本化)。
