@@ -12,8 +12,6 @@ if not exist sdr_core.dll (
 python -m PyInstaller --noconfirm --clean --windowed --name KomorebiSDR ^
     --add-binary "rtlsdr.dll;." ^
     --add-binary "sdr_core.dll;." ^
-    --add-binary "msvcr100.dll;." ^
-    --add-binary "pthreadVC2.dll;." ^
     --hidden-import sounddevice ^
     main.py
 if errorlevel 1 goto :err
