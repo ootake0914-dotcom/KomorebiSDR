@@ -142,7 +142,8 @@ def main() -> int:
             assert frames[0] > f2, "streaming did not resume after failed scan"
 
             app.tuner.discovered_stations = []
-            click(1031, 314)  # Auto Seek >>
+            r_seek = app.gui.btn_seek_next.rect
+            click(r_seek.centerx, r_seek.centery)  # Auto Seek >>
             time.sleep(1.5)
             assert len(scans) == 3 and scans[2] is False, f"seek scan raced: {scans}"
             assert fake.sync_while_active == 0, "read_sync ran while async stream active"

@@ -239,9 +239,9 @@ class SdrGui:
         self.spec_rect = pygame.Rect(14, 110, 800, 210)
         self.wf_rect = pygame.Rect(14, 332, 800, 150)
         self.wave_rect = pygame.Rect(14, 494, 800, 54)
-        self.tele_rect = pygame.Rect(826, 110, 280, 88)
-        self.tune_rect = pygame.Rect(826, 210, 280, 228)
-        self.gain_rect = pygame.Rect(826, 450, 280, 104)
+        self.tele_rect = pygame.Rect(826, 110, 280, 102)
+        self.tune_rect = pygame.Rect(826, 222, 280, 326)
+        self.gain_rect = pygame.Rect(826, 548, 0, 0)
         self.preset_rect = pygame.Rect(14, 560, 1092, 74)
         self.status_rect = pygame.Rect(14, 644, 1092, 28)
 
@@ -357,9 +357,10 @@ class SdrGui:
         for name, rect in (
             ("hero", self.hero_rect), ("info", self.info_rect),
             ("tele", self.tele_rect), ("tune", self.tune_rect),
-            ("gain", self.gain_rect), ("preset", self.preset_rect),
+            ("preset", self.preset_rect),
         ):
             self.panels[name] = self._glass(rect.width, rect.height)
+        self.panels["gain"] = (pygame.Surface((1, 1), pygame.SRCALPHA), 0)
         self.panels["spec"] = self._glass(self.spec_rect.width, self.spec_rect.height,
                                           radius=16, tint=(17, 23, 36), dark=True)
         self.panels["wf"] = self._glass(self.wf_rect.width, self.wf_rect.height,
@@ -375,7 +376,7 @@ class SdrGui:
         for name, rect in (
             ("hero", self.hero_rect), ("info", self.info_rect),
             ("tele", self.tele_rect), ("tune", self.tune_rect),
-            ("gain", self.gain_rect), ("preset", self.preset_rect),
+            ("preset", self.preset_rect),
             ("spec", self.spec_rect), ("wf", self.wf_rect),
             ("wave", self.wave_rect), ("status", self.status_rect),
         ):
@@ -387,9 +388,6 @@ class SdrGui:
         baked.blit(lbl_tune, (self.tune_rect.x + 14, self.tune_rect.y + 8))
         lbl_mode = cached_text(self.font_tiny, t("mode"), C_MUTED)
         baked.blit(lbl_mode, (self.tune_rect.x + 14, self.tune_rect.y + 156))
-
-        lbl_gain = cached_text(self.font_title, t("gain_audio"), C_MUTED)
-        baked.blit(lbl_gain, (self.gain_rect.x + 14, self.gain_rect.y + 6))
 
         lbl_tele = cached_text(self.font_title, t("status"), C_MUTED)
         baked.blit(lbl_tele, (self.tele_rect.x + 14, self.tele_rect.y + 8))
@@ -456,22 +454,25 @@ class SdrGui:
     def _init_controls(self):
         btns = []
 
-        # ---- TUNINGパネル (周波数ステップは検出局プルダウンに一本化し廃止) ----
-        tx, tw = self.tune_rect.x + 12, self.tune_rect.width - 24
-        half = (tw - 6) // 2
-        self.btn_seek_prev = Button((tx, 300, half, 28), "<< Auto Seek", lambda: self._seek(-1),
+        # ---- TUNINGパネル (上からバランスよくゆったり配置) ----
+        tx, tw = self.tune_rect.x + 14, self.tune_rect.width - 28
+        half = (tw - 8) // 2
+        y_seek = self.tune_rect.y + 36
+        self.btn_seek_prev = Button((tx, y_seek, half, 32), "<< Auto Seek", lambda: self._seek(-1),
                                     bg_color=(226, 235, 248), active_color=C_BTN_ACTIVE2)
-        self.btn_seek_next = Button((tx + half + 6, 300, half, 28), "Auto Seek >>", lambda: self._seek(1),
+        self.btn_seek_next = Button((tx + half + 8, y_seek, half, 32), "Auto Seek >>", lambda: self._seek(1),
                                     bg_color=(226, 235, 248), active_color=C_BTN_ACTIVE2)
-        fm_w = int((tw - 6) * 0.55)
-        sw_w = tw - fm_w - 6
-        self.btn_scan_band = Button((tx, 332, fm_w, 30), t("scan_button"), self._request_scan,
+        fm_w = int((tw - 8) * 0.54)
+        sw_w = tw - 8 - fm_w
+        y_scan = y_seek + 32 + 8
+        self.btn_scan_band = Button((tx, y_scan, fm_w, 32), t("scan_button"), self._request_scan,
                                     bg_color=(214, 240, 229), active_color=C_ACCENT)
-        self.btn_scan_sw = Button((tx + fm_w + 6, 332, sw_w, 30), t("scan_sw_button"),
+        self.btn_scan_sw = Button((tx + fm_w + 8, y_scan, sw_w, 32), t("scan_sw_button"),
                                    self._request_sw_scan, bg_color=(226, 236, 248), active_color=C_ACCENT)
         btns.extend([self.btn_seek_prev, self.btn_seek_next, self.btn_scan_band, self.btn_scan_sw])
         # 検出局プルダウン (25局でもワンクリック選局)
-        self.btn_station_list = Button((tx, 360, tw, 20), "▼ 検出局 (0)",
+        y_list = y_scan + 32 + 8
+        self.btn_station_list = Button((tx, y_list, tw, 26), "▼ 検出局 (0)",
                                        self._toggle_station_list,
                                        bg_color=(232, 240, 250), active_color=C_BTN_ACTIVE2)
         btns.append(self.btn_station_list)
@@ -482,8 +483,9 @@ class SdrGui:
         # ローカルで組んで最後に一括差し替え (描画スレッドのitems()反復中の
         # dictサイズ変更によるRuntimeErrorを防止)
         mode_buttons = {}
+        y_mode = self.tune_rect.y + 176
         for i, (name, col) in enumerate(mode_defs):
-            b = Button((tx + i * (mw + gap), 382, mw, 27), name,
+            b = Button((tx + i * (mw + gap), y_mode, mw, 30), name,
                        (lambda m=name: self._set_mode(m)), bg_color=col)
             mode_buttons[name] = b
             btns.append(b)
@@ -492,11 +494,12 @@ class SdrGui:
         self.btn_am = self.mode_buttons["AM"]
         self.btn_nfm = self.mode_buttons["NFM"]
         # ステレオは自動ブレンドに一本化 (ボタン削除)。BFO微調整のみ (SSB・CW時に表示)
-        gap2 = 6
+        gap2 = 8
         hw = (tw - gap2) // 2
-        self.btn_bfo_down = Button((tx, 412, hw, 24), "BFO-",
+        y_bfo = y_mode + 30 + 10
+        self.btn_bfo_down = Button((tx, y_bfo, hw, 26), "BFO-",
                                    lambda: self._step_bfo(-50), bg_color=(240, 243, 248))
-        self.btn_bfo_up = Button((tx + hw + gap2, 412, hw, 24), "BFO+",
+        self.btn_bfo_up = Button((tx + hw + gap2, y_bfo, hw, 26), "BFO+",
                                  lambda: self._step_bfo(50), bg_color=(240, 243, 248))
         btns.extend([self.btn_bfo_down, self.btn_bfo_up])
 
