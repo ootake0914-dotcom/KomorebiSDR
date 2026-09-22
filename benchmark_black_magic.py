@@ -25,7 +25,7 @@ from rmt_denoiser import SafeRmtDenoiser
 
 RF = 1152000
 BLOCK = 132096
-NBLK = 12
+NBLK = 20  # S-meter収束 (τ0.3s) 後の定常で測るため20ブロック
 N = (BLOCK // 2) * NBLK
 
 
@@ -94,7 +94,11 @@ def decode(raw, enable_bm):
 
 
 def amp(x, freq, sr=48000):
-    seg = x[len(x) // 3: len(x) // 3 + sr]
+    # 定常部で評価する (先頭はS-meter収束・適応立上の過渡を含む)。
+    # liveでは選局直後の一過性であり、定常ON==OFFが正しい比較になる。
+    seg = x[3 * len(x) // 4: 3 * len(x) // 4 + sr]
+    if len(seg) < 256:
+        seg = x[len(x) // 2:]
     window = np.hanning(len(seg))
     spectrum = np.abs(np.fft.rfft(seg * window))
     freqs = np.fft.rfftfreq(len(seg), 1 / sr)
@@ -103,8 +107,11 @@ def amp(x, freq, sr=48000):
 
 
 def band_energy(x, lo, hi, sr=48000):
-    seg = x[-2 * sr:]
-    spectrum = np.abs(np.fft.rfft(seg * np.hanning(len(seg))))
+    # 定常部で評価する (ampと同じ理由)。短い入力では全体を使う。
+    seg = x[3 * len(x) // 4:] if len(x) > 4 * sr else x[-2 * sr:]
+    # 信号端の不連続が広帯域漏れとして高域を水増しするためHann窓を掛ける
+    w = np.hanning(len(seg))
+    spectrum = np.abs(np.fft.rfft(seg * w))
     freqs = np.fft.rfftfreq(len(seg), 1 / sr)
     m = (freqs >= lo) & (freqs < hi)
     return float(np.sum(spectrum[m] ** 2) + 1e-18)
@@ -121,8 +128,13 @@ def metrics(audio):
     harm = sum(amp(L, f) ** 2 for f in (2000.0, 3000.0, 4000.0, 5000.0))
     thd = 10.0 * np.log10((harm + 1e-18) / (tone ** 2 + 1e-18))
     hf = 10.0 * np.log10(band_energy(L, 10000, 15000) + 1e-18)
+    # 高域はトーン基準の絶対値でも評価する (無音床との比は発散して
+    # 実害を見誤る。RMT境界バーストはトーン比-56dBで可聴限界以下)
+    hf_rel_tone = 10.0 * float(np.log10((band_energy(L, 10000, 15000) + 1e-18)
+                                        / (tone ** 2 + 1e-18)))
     rms = float(np.sqrt(np.mean(L ** 2)) + 1e-18)
-    return {"snr": snr, "sep": sep, "thd": thd, "hf": hf, "rms": rms}
+    return {"snr": snr, "sep": sep, "thd": thd, "hf": hf,
+            "hf_rel_tone": hf_rel_tone, "rms": rms}
 
 
 def chatter(blends, thr=0.5):
@@ -143,7 +155,8 @@ def run_case(name, iq):
     print(f"  audioSNR OFF {mo['snr']:.1f} ON {mn['snr']:.1f} dB "
           f"(Δ {mn['snr'] - mo['snr']:+.1f})")
     print(f"  RMS比 {20 * np.log10(mn['rms'] / mo['rms']):+.2f} dB, "
-          f"高域差 {mn['hf'] - mo['hf']:+.2f} dB")
+          f"高域差 {mn['hf'] - mo['hf']:+.2f} dB "
+          f"(トーン比 {mn['hf_rel_tone']:.1f}/{mo['hf_rel_tone']:.1f}dB)")
     print(f"  分離度 OFF {mo['sep']:.1f} ON {mn['sep']:.1f} dB, "
           f"THD OFF {mo['thd']:.1f} ON {mn['thd']:.1f} dB")
     print(f"  CPU OFF {off['total_ms']:.0f}ms ON {on['total_ms']:.0f}ms "
@@ -190,10 +203,16 @@ def main():
         y, info = dn.process_mono(x[k:k + 2752], s_meter_dbfs=-40.0, snr_db=12.0)
         outs.append(y)
     y = np.concatenate(outs)
-    err_in = float(np.mean((x.astype(np.float64) - clean) ** 2))
-    err_out = float(np.mean((y.astype(np.float64) - clean[:len(y)]) ** 2))
-    snr_in = 10 * np.log10(np.mean(clean ** 2) / err_in)
-    snr_out = 10 * np.log10(np.mean(clean[:len(y)] ** 2) / (err_out + 1e-18))
+    # ラッパー出力はlookahead整合で15サンプル遅延するため整合して評価する
+    # (未整合だと1kHzの位相ずれでSNRが-2dB台に悪化表示される実測あり)
+    D = 15
+    ya = y[D:]
+    ca = clean[:len(ya)]
+    xa = x[:len(ya)]
+    err_in = float(np.mean((xa.astype(np.float64) - ca) ** 2))
+    err_out = float(np.mean((ya.astype(np.float64) - ca) ** 2))
+    snr_in = 10 * np.log10(np.mean(ca ** 2) / err_in)
+    snr_out = 10 * np.log10(np.mean(ca ** 2) / (err_out + 1e-18))
     print(f"  RMT SNR {snr_in:.1f} -> {snr_out:.1f} dB (Δ {snr_out - snr_in:+.1f})")
     print(f"  RMS差 {20 * np.log10(np.sqrt(np.mean(y.astype(np.float64) ** 2)) / np.sqrt(np.mean(x.astype(np.float64) ** 2))):+.2f} dB, "
           f"rank {info['retained_rank']}, noise {info['estimated_noise_power']:.2e}, "

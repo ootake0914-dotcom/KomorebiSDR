@@ -217,6 +217,29 @@ dsp.bm_sr_enabled = True      # C (副経路のみ。スケルチ自動反映な
 - 主観評価用WAV (temp): weak775_off/notch/all、deepfade800_off/all。
   RMTのSide定位・ノッチの番組影響は耳で確認すること (未実施)。
 
+## ゴールデン (全機能ONの実録音AB・確定値)
+
+- `testdata/golden_all.json`: 5条件×OFF/ON。遅延整合つき比較
+  (RMTの15サンプル固定遅延をlag探索で吸収。未整合だと1kHz位相ずれで
+  見かけの劣化が出るため)。
+- 弱局: present 0.98/conf 0.92、RMS +0.01dB、高域 -1.13dB (軽微なNR効果)。
+- 強局/深フェード: RMS ±0.02dB、高域 ±0.5dB以内。完全透明。
+- 局間: present 0.00、RMS +0.13dB。誤検出なし。
+- 遅延: 全条件 p99<57.3ms・超過率0.00 (本走行)。
+- RMT遅延整合の修正: バイパス毎に遅延が入抜して15サンプルの
+  タイムジャンプ (1kHzで0.45FS段差) が出ていたのを、
+  全経路で一定遅延にして解消 (回帰テストあり)。
+- ベンチ指標の修正: 定常部評価 (後半1/4)＋トーン基準高域＋
+  case7の遅延整合。fresh-instanceのS-meter立上り過渡を除外。
+
+## C高速化 (sdr_dft_bins)
+
+- `sdr_dft_bins` (C, version 6): 複数DFTビン一括計算。
+  cyclo 9ビン・notch 25ドット・SRを1コール化。
+- 実測: notch 6.5→0.9ms/block。cycloは横ばい (Python側の残りが支配的)。
+- `dsp_native.dft_bins`＋numpy代替 (旧DLL互換)。等価性1.7e-9で検証。
+- DLLはgitignoreのため、他環境では`build_native.bat`で再ビルドすること。
+
 ## Phase 0実証基盤 (録音IQハーネス＋ゴールデンデータ)
 
 - `python tools/ab_benchmark.py <iq...> [--bm cyclo|rmt|sr|all] [--out json]`:

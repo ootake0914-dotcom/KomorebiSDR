@@ -373,7 +373,6 @@ class SdrDspPipeline:
         self.bm_flutter_std = 0.15
         self._bm_params = None
         self._bm_last_rmt_info = None
-        self._bm_sr_tw = None  # SR用19kHz単一ビンtwiddleキャッシュ
 
         # ===== RDS (57kHz) =====
         self.rds_enabled = True
@@ -1216,19 +1215,18 @@ class SdrDspPipeline:
                 if (self.bm_sr is not None and _sr_active
                         and len(demod) >= 1024):
                     n_sr = len(demod)
-                    if self._bm_sr_tw is None or self._bm_sr_tw[0] != n_sr:
-                        k_sr = int(round(19000.0 * n_sr / float(self.if_rate)))
-                        k_sr = min(max(k_sr, 1), n_sr - 1)
-                        self._bm_sr_tw = (
-                            n_sr,
-                            np.exp(-2j * np.pi * k_sr * np.arange(n_sr) / n_sr))
-                    _tw = self._bm_sr_tw[1]
 
-                    def _bm_base(v, _tw=_tw, _n=n_sr):
+                    def _bm_base(v, _n=n_sr):
                         vv = np.asarray(v, dtype=np.float64).reshape(-1)
                         if len(vv) != _n:
                             return False
-                        return bool(abs(np.dot(vv, _tw)) * (2.0 / _n) > 0.02)
+                        try:
+                            from dsp_native import dft_bins
+                            r = dft_bins(vv, [19000.0], float(self.if_rate))
+                            return bool(abs(complex(float(r[0, 0]),
+                                                    float(r[0, 1]))) > 0.02)
+                        except Exception:
+                            return False
 
                     _uq = getattr(self, "ultra_squelch", None)
                     floor = 10.0 ** (float(getattr(_uq, "noise_db", -40.0)) / 20.0)

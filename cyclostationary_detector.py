@@ -36,7 +36,6 @@ class CyclostationaryPilotDetector:
         self.min_dwell_blocks = int(max(1, min_dwell_blocks))
         self.narrow_db = float(narrow_db)
         self.abs_floor = float(10.0 ** (abs_floor_dbfs / 20.0))
-        self._twiddles = {}
         self.reset()
 
     def reset(self):
@@ -57,19 +56,28 @@ class CyclostationaryPilotDetector:
 
     def _goertzel(self, x, k):
         """単一DFTビンの複素振幅 (正規化: 正弦振幅=|X|*2/N)。
-        漸化式ではなくキャッシュ済み複素指数との内積で計算しベクトル化する
-        (逐次ループでは66k×多ビンで100ms級になるため)。"""
-        n = len(x)
-        if k <= 0 or k >= n:
+        Cコア (sdr_dft_bins) 優先、なければnumpy。後方互換のため残すが、
+        update()は一括計算を使う (9回の個別呼出しは無駄なため)。"""
+        try:
+            from dsp_native import dft_bins
+            n = len(x)
+            r = dft_bins(x, [float(k) * self.fs / max(n, 1)], self.fs)
+            return complex(float(r[0, 0]), float(r[0, 1]))
+        except Exception:
             return 0.0 + 0.0j
-        key = (int(n), int(k))
-        tw = self._twiddles.get(key)
-        if tw is None or len(tw) != n:
-            tw = np.exp(-2j * np.pi * float(k) * np.arange(n) / float(n))
-            if len(self._twiddles) >= 24:
-                self._twiddles.clear()
-            self._twiddles[key] = tw
-        return complex(np.dot(np.asarray(x, dtype=np.float64), tw) * (2.0 / n))
+
+    def _bins_batch(self, xa, ks):
+        """複数ビンを一括計算 → {k: complex}。Cコア1コールで済ませる。"""
+        n = len(xa)
+        ks = [int(k) for k in ks]
+        try:
+            from dsp_native import dft_bins
+            freqs = [kk * self.fs / n for kk in ks]
+            r = dft_bins(xa, freqs, self.fs)
+            return {kk: complex(float(r[j, 0]), float(r[j, 1]))
+                    for j, kk in enumerate(ks)}
+        except Exception:
+            return {kk: self._goertzel(xa, kk) for kk in ks}
 
     def update(self, x):
         """1ブロックを評価し、検出辞書を返す (入力配列は変更しない)。"""
@@ -100,10 +108,18 @@ class CyclostationaryPilotDetector:
         k0 = min(max(k0, 4), n - 5)
         # 追従中心ビン (オフセット時は隣接ビンへ寄る)
         kc = min(max(k0 + self._koff, 2), n - 3)
-        # 狭帯域判定用に隣接ビンも評価 (広帯域ノイズの19kHz誤認防止)
-        c0 = self._goertzel(xa, kc)
-        cm = self._goertzel(xa, kc - 1)
-        cp = self._goertzel(xa, kc + 1)
+        # 全ビンを一括計算 (Cコア1コール。個別9回より高速)
+        nbs = [min(max(kc + int(round(off_hz * n / self.fs)), 1), n - 2)
+               for off_hz in (1000.0, -1000.0, 1500.0, -1500.0, 2500.0, -2500.0)]
+        B = self._bins_batch(xa, [kc - 1, kc, kc + 1] + nbs)
+        cm = B[kc - 1]
+        c0 = B[kc]
+        cp = B[kc + 1]
+        # ノイズ床は離調6ビン (±1/±1.5/±2.5kHz相当) の中央値
+        # (平均では単一ビンのたまたまの盛り上がりでSNRが跳ねて誤検出するため。
+        # ±1kHzは矩形窓の19kHzサイドローブが無視できる距離)
+        nb = [abs(B[kb]) for kb in nbs]
+        noise_amp = max(float(np.median(nb)), 1e-12)
         # 周波数追従: 隣接ビン支配が3ブロック連続したら中心を1ビン移動
         # (範囲±2ビン。単発スパイクでは動かず、真のオフセットに追従する)
         a_m, a_0, a_p = abs(cm), abs(c0), abs(cp)
@@ -122,14 +138,6 @@ class CyclostationaryPilotDetector:
         elif self._dn_n >= 3 and self._koff > -2:
             self._koff -= 1
             self._dn_n = 0
-        # ノイズ床は離調6ビン (±1/±1.5/±2.5kHz相当) の中央値
-        # (平均では単一ビンのたまたまの盛り上がりでSNRが跳ねて誤検出するため。
-        # ±1kHzは矩形窓の19kHzサイドローブが無視できる距離)
-        nb = []
-        for off_hz in (1000.0, -1000.0, 1500.0, -1500.0, 2500.0, -2500.0):
-            kb = min(max(kc + int(round(off_hz * n / self.fs)), 1), n - 2)
-            nb.append(abs(self._goertzel(xa, kb)))
-        noise_amp = max(float(np.median(nb)), 1e-12)
 
         pilot_amp = abs(c0)
         amp_m = abs(cm)

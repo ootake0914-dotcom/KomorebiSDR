@@ -140,11 +140,26 @@ class SafeRmtDenoiser:
             info["bypass_reason"] = "non-finite"
             self._eff_strength *= 0.5
             return x, info
+        # 遅延整合は全経路で一定にする: d (lookahead分だけ進む) との
+        # ブレンド相手だけでなく、バイパス出力も同量遅延させる。
+        # バイパス毎に遅延が入抜すると15サンプルのタイムジャンプ
+        # (1kHzで0.45FSの段差クリック) が生じることを実測して修正。
+        # 0.3msの固定遅延。ブロック境界はtailで連続。
+        D = int(min(max(getattr(self.core, "half_taps", 0), 0), n - 1))
+        if D > 0:
+            tail = self._delay.get(ch)
+            if tail is None or len(tail) != D:
+                tail = np.zeros(D, dtype=np.float32)
+            x_ext = np.concatenate((tail, x))
+            self._delay[ch] = x_ext[-D:].copy()
+            xd = x_ext[:n]
+        else:
+            xd = x
         rms_in = float(np.sqrt(np.mean(x.astype(np.float64) ** 2)) + 1e-18)
         if rms_in < 1e-6:
             # 無音は増幅も処理もしない
             info["bypass_reason"] = "silent"
-            return x, info
+            return xd, info
         try:
             s_db = float(s_meter_dbfs)
         except (TypeError, ValueError):
@@ -155,11 +170,11 @@ class SafeRmtDenoiser:
             # 強信号はコア同様に完全バイパス (過剰処理の禁止)
             info["bypass_reason"] = "strong-signal"
             self._eff_strength = 0.0
-            return x, info
+            return xd, info
         if self.cpu_budget <= 0.0:
             info["bypass_reason"] = "cpu-budget"
             self.bypassed += 1
-            return x, info
+            return xd, info
 
         target = strength_for_snr(snr_db if snr_db is not None else s_db + 28.0,
                                   self.bands, self.max_strength)
@@ -173,7 +188,7 @@ class SafeRmtDenoiser:
         info["eff_strength"] = s
         if s < 0.01:
             info["bypass_reason"] = "strength-min"
-            return x, info
+            return xd, info
 
         try:
             d = np.asarray(self.core.process(x, ch=ch,
@@ -181,22 +196,10 @@ class SafeRmtDenoiser:
                            dtype=np.float32).reshape(-1)
         except Exception:
             info["bypass_reason"] = "core-error"
-            return x, info
+            return xd, info
         if len(d) != n or not bool(np.all(np.isfinite(d))):
             info["bypass_reason"] = "nan-output"
-            return x, info
-        # 遅延整合: dはlookahead分だけ進んでいるため、xを同量遅延させてから
-        # ブレンドする (0.3msの固定遅延。知覚不能・ブロック境界はtailで連続)。
-        D = int(min(max(getattr(self.core, "half_taps", 0), 0), n - 1))
-        if D > 0:
-            tail = self._delay.get(ch)
-            if tail is None or len(tail) != D:
-                tail = np.zeros(D, dtype=np.float32)
-            x_ext = np.concatenate((tail, x))
-            self._delay[ch] = x_ext[-D:].copy()
-            xd = x_ext[:n]
-        else:
-            xd = x
+            return xd, info
         y = ((1.0 - s) * xd + s * d).astype(np.float32)
 
         # 監視: RMS差と高域損失。過剰なら強度を自動で半減させる
@@ -204,7 +207,7 @@ class SafeRmtDenoiser:
         info["rms_diff_db"] = float(20.0 * math.log10(rms_out / rms_in))
         if rms_out > rms_in * 1.12:
             # 勝手な増幅は禁止: 入力へ戻す
-            y = x.copy()
+            y = xd.copy()
             info["bypass_reason"] = "auto-level"
             self._eff_strength *= 0.5
             return y, info
@@ -223,7 +226,7 @@ class SafeRmtDenoiser:
         if el_ms > budget_ms and budget_ms > 0.0:
             info["bypass_reason"] = "cpu-budget"
             self.bypassed += 1
-            return x, info
+            return xd, info
         return y, info
 
     def process_stereo(self, left, right, s_meter_dbfs=-40.0, snr_db=None):

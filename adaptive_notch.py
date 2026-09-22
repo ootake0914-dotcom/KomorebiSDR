@@ -47,19 +47,43 @@ class AdaptiveNotchCanceller:
         self._dwell = {}
         self.blocks = 0
 
-    def _line_snr(self, xa, freq):
-        """線振幅と近傍ノイズ床の比 (dB)。キャッシュなし内積で計算する。"""
+    def _lines_batch(self, xa, freqs):
+        """[(f, 線振幅, 床振幅)] を一括計算 (Cコア1コール＋numpy代替)。"""
         n = len(xa)
-        k = freq * n / self.fs
-        tw = np.exp(-2j * np.pi * k * np.arange(n) / n)
-        line = abs(np.dot(xa, tw)) * (2.0 / n)
-        nb = []
-        for off in (-30.0, -15.0, 15.0, 30.0):
-            kb = (freq + off) * n / self.fs
-            twb = np.exp(-2j * np.pi * kb * np.arange(n) / n)
-            nb.append(abs(np.dot(xa, twb)) * (2.0 / n))
-        floor = max(float(np.median(nb)), 1e-12)
-        return 20.0 * math.log10(line / floor + 1e-12), line
+        flist = [float(f) for f in freqs]
+        # 各線＋近傍4点 (±15/±30Hz) をまとめて要求する
+        req = []
+        for f in flist:
+            req.append(f)
+            for off in (-30.0, -15.0, 15.0, 30.0):
+                req.append(f + off)
+        mags = None
+        try:
+            from dsp_native import dft_bins
+            r = dft_bins(xa, req, self.fs)
+            mags = [abs(complex(float(r[j, 0]), float(r[j, 1]))) for j in range(len(req))]
+        except Exception:
+            pass
+        if mags is None:
+            # numpy代替 (旧DLL・DLL不在時)
+            idx = np.arange(n)
+            mags = []
+            for fq in req:
+                tw = np.exp(-2j * np.pi * fq * idx / self.fs)
+                mags.append(abs(np.dot(xa, tw)) * (2.0 / n))
+        out = []
+        for i, f in enumerate(flist):
+            line = mags[i * 5]
+            floor = max(float(np.median(mags[i * 5 + 1:i * 5 + 5])), 1e-12)
+            out.append((f, line, floor))
+        return out
+
+    def _line_snr(self, xa, freq):
+        """線振幅と近傍ノイズ床の比 (dB)。一括計算の薄いラッパ (後方互換)。"""
+        for f, line, floor in self._lines_batch(xa, [freq]):
+            if abs(f - freq) < 1e-9:
+                return 20.0 * math.log10(line / floor + 1e-12), line
+        return -99.0, 0.0
 
     def _harmonics(self):
         out = []
@@ -92,9 +116,15 @@ class AdaptiveNotchCanceller:
         # (単発8.6dBスパイクでの誤切替・連続位相でのwobbleを実測して修正)
         if self.base_hz:
             self._base = float(self.base_hz)
+            s50 = s60 = -99.0
         else:
-            s50, _ = self._line_snr(xa, 50.0)
-            s60, _ = self._line_snr(xa, 60.0)
+            # 50/60Hzの線＋床を一括で取り、SNR化する
+            got = {f: (line, floor) for f, line, floor
+                   in self._lines_batch(xa, [50.0, 60.0])}
+            l50, f50 = got[50.0]
+            l60, f60 = got[60.0]
+            s50 = 20.0 * math.log10(l50 / f50 + 1e-12)
+            s60 = 20.0 * math.log10(l60 / f60 + 1e-12)
             self._s50_ema = s50 if self._s50_ema is None else \
                 self._s50_ema + 0.25 * (s50 - self._s50_ema)
             self._s60_ema = s60 if self._s60_ema is None else \
@@ -111,9 +141,8 @@ class AdaptiveNotchCanceller:
                 self._confirmed.clear()
                 self._dwell.clear()
         snrs = {}
-        for f in self._harmonics():
-            s, _ = self._line_snr(xa, f)
-            snrs[f] = s
+        for f, line, floor in self._lines_batch(xa, self._harmonics()):
+            snrs[f] = 20.0 * math.log10(line / floor + 1e-12)
         # dwellつき確定: on閾値超で加算、off閾値割れで解除方向へ
         for f, s in snrs.items():
             d = self._dwell.get(f, 0)

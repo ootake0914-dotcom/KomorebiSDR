@@ -141,16 +141,37 @@ def pct(lat, q):
     return float(np.percentile(a, q)) if len(a) else 0.0
 
 
+def align_delay(a, b, maxlag=32):
+    """bをaに最大±maxlagで整合 (RMTの15サンプル固定遅延を吸収)。
+    遅延差を「差分」と誤認しないための前処理。"""
+    a = np.asarray(a, dtype=np.float64).reshape(-1)
+    b = np.asarray(b, dtype=np.float64).reshape(-1)
+    n = min(len(a), len(b))
+    a, b = a[:n], b[:n]
+    best_lag, best_e = 0, float(np.mean((a - b) ** 2))
+    for lag in range(-maxlag, maxlag + 1):
+        if lag >= 0:
+            e = float(np.mean((a[lag:] - b[:n - lag]) ** 2))
+        else:
+            e = float(np.mean((a[:n + lag] - b[-lag:]) ** 2))
+        if e < best_e:
+            best_e, best_lag = e, lag
+    if best_lag >= 0:
+        return a[best_lag:], b[:n - best_lag], best_lag
+    return a[:n + best_lag], b[-best_lag:], best_lag
+
+
 def compare(off, on):
-    """OFF/ON結果→指標辞書 (音声系は後半のみで定常比較)。"""
+    """OFF/ON結果→指標辞書 (音声系は後半のみで定常比較・遅延整合つき)。"""
     ao = np.asarray(off["audio"][:, 0], dtype=np.float64)
     an = np.asarray(on["audio"][:, 0], dtype=np.float64)
     n = min(len(ao), len(an))
     tail = slice(n // 2, n)
-    rms = 20.0 * float(np.log10((np.sqrt(np.mean(an[tail] ** 2)) + 1e-18)
-                                / (np.sqrt(np.mean(ao[tail] ** 2)) + 1e-18)))
-    hf = 10.0 * float(np.log10(band_energy(an[tail], 10000, 15000)
-                               / band_energy(ao[tail], 10000, 15000)))
+    ao_t, an_t, lag = align_delay(ao[tail], an[tail])
+    rms = 20.0 * float(np.log10((np.sqrt(np.mean(an_t ** 2)) + 1e-18)
+                                / (np.sqrt(np.mean(ao_t ** 2)) + 1e-18)))
+    hf = 10.0 * float(np.log10(band_energy(an_t, 10000, 15000)
+                               / band_energy(ao_t, 10000, 15000)))
     return {
         "present_rate_on": float(np.mean(on["presents"])) if len(on["presents"]) else 0.0,
         "conf_mean_on": float(np.mean(on["confs"])) if len(on["confs"]) else 0.0,
@@ -162,6 +183,7 @@ def compare(off, on):
         "chatter_on": chatter(on["blends"]),
         "rms_diff_db": rms,
         "hf_diff_db": hf,
+        "align_lag": int(lag),
         "lat_off": {"p50": pct(off["lat"], 50), "p95": pct(off["lat"], 95),
                     "p99": pct(off["lat"], 99),
                     "overrun": float(np.mean(np.asarray(off["lat"]) > BLOCK_MS))},
@@ -221,7 +243,8 @@ def main(argv):
               f"lock OFF {m['lock_mean_off']:.2f}/ON {m['lock_mean_on']:.2f}")
         print(f"  blend OFF {m['blend_mean_off']:.2f}/ON {m['blend_mean_on']:.2f} "
               f"chatter OFF {m['chatter_off']}/ON {m['chatter_on']}")
-        print(f"  RMS差 {m['rms_diff_db']:+.2f}dB 高域差 {m['hf_diff_db']:+.2f}dB")
+        print(f"  RMS差 {m['rms_diff_db']:+.2f}dB 高域差 {m['hf_diff_db']:+.2f}dB "
+              f"(lag {m.get('align_lag', 0)})")
         print(f"  遅延 OFF {fmt_lat(m['lat_off'])}")
         print(f"  遅延 ON  {fmt_lat(m['lat_on'])}")
         if m["rmt_bypass_on"]:

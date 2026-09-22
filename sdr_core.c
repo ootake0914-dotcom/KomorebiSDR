@@ -35,7 +35,7 @@
 
 SDR_EXPORT int sdr_version(void)
 {
-    return 5;
+    return 6;  /* 6: sdr_dft_bins 追加 */
 }
 
 /* denormal(非正規化数)対策: FTZ/DAZを有効化。
@@ -687,4 +687,47 @@ SDR_EXPORT int sdr_suppress_clicks(float *x, int n, float threshold)
 
     free(mask);
     return repaired;
+}
+
+/* ---- 複数DFTビン一括計算 (Goertzel系検出の共通ホットスポット) ----
+ * X[m] = (2/n) * sum_{i=0}^{n-1} x[i] * exp(-j*2*pi*freqs[m]/fs*i)
+ * 正規化はPython版の単一ビン内積と同一 (正弦振幅=|X|)。
+ * ビン毎に倍精度回転子で漸化式評価する (66k点でもドリフトは無視可能)。
+ * NaN入力は0として扱う。不正引数では何もしない。
+ */
+SDR_EXPORT void sdr_dft_bins(const float *x, int n, const double *freqs,
+                             double fs, int nf, float *out_re, float *out_im)
+{
+    if (!x || !freqs || !out_re || !out_im || n <= 0 || nf <= 0 || fs <= 0.0) {
+        return;
+    }
+    for (int m = 0; m < nf; ++m) {
+        double f = freqs[m];
+        if (!(f >= 0.0) || f >= fs) {
+            out_re[m] = 0.0f;
+            out_im[m] = 0.0f;
+            continue;
+        }
+        double w = SDR_TWO_PI_F * f / fs;
+        double cw = cos(w);
+        double sw = sin(w);
+        double pr = 1.0, pi = 0.0;
+        double acc_r = 0.0, acc_i = 0.0;
+        for (int i = 0; i < n; ++i) {
+            double v = (double)x[i];
+            if (v != v) {
+                v = 0.0;
+            }
+            acc_r += v * pr;
+            acc_i += v * pi;
+            double npr = pr * cw - pi * sw;
+            double npi = pr * sw + pi * cw;
+            pr = npr;
+            pi = npi;
+        }
+        /* 回転子は exp(+jwt) なので虚部の符号を反転して exp(-jwt) に合わせる */
+        double scale = 2.0 / (double)n;
+        out_re[m] = (float)(acc_r * scale);
+        out_im[m] = (float)(-acc_i * scale);
+    }
 }

@@ -63,7 +63,10 @@ def test_strong_signal_bypass():
     x, _ = _noisy_tone()
     y, info = dn.process_mono(x, s_meter_dbfs=-20.0, snr_db=35.0)
     assert info["bypass_reason"] == "strong-signal"
-    assert np.array_equal(np.asarray(y), np.asarray(x))
+    # バイパス出力も遅延整合済み (能動出力とのタイムジャンプ防止):
+    # y[D:] == x[:-D]
+    D = int(dn.core.half_taps)
+    assert np.array_equal(np.asarray(y)[D:], np.asarray(x)[:-D])
 
 
 def test_silence_not_amplified():
@@ -90,12 +93,31 @@ def test_no_clicks_at_boundaries():
     assert step < 0.1, f"境界クリック疑い: {step}"
 
 
+def test_bypass_transition_continuous():
+    # バイパス⇔能動の切替でタイムジャンプ段差が出ない (0.45FS欠陥の回帰)
+    dn = SafeRmtDenoiser(sample_rate=FS)
+    t = np.arange(N * 6) / FS
+    x = (0.3 * np.sin(2.0 * np.pi * 1000.0 * t)).astype(np.float32)
+    outs = []
+    for k in range(6):
+        # 強弱を交互にしてバイパス遷移を強制する
+        s_db = -20.0 if k % 2 == 0 else -40.0
+        y, _ = dn.process_mono(x[k * N:(k + 1) * N], s_meter_dbfs=s_db,
+                               snr_db=15.0)
+        outs.append(np.asarray(y))
+    cat = np.concatenate(outs)
+    step = float(np.max(np.abs(np.diff(cat.astype(np.float64)))))
+    print(f"[*] RMT 切替時最大段差: {step:.5f}")
+    assert step < 0.1, f"バイパス遷移クリック: {step}"
+
+
 def test_cpu_budget_bypass():
     dn = SafeRmtDenoiser(sample_rate=FS, cpu_budget_percent=0.0)
     x, _ = _noisy_tone()
     y, info = dn.process_mono(x, s_meter_dbfs=-40.0, snr_db=15.0)
     assert info["bypass_reason"] == "cpu-budget"
-    assert np.array_equal(np.asarray(y), np.asarray(x))
+    D = int(dn.core.half_taps)
+    assert np.array_equal(np.asarray(y)[D:], np.asarray(x)[:-D])
 
 
 def test_stereo_mid_side():
@@ -133,6 +155,8 @@ def main() -> int:
         print("[*] 境界無クリック OK")
         test_cpu_budget_bypass()
         print("[*] CPU予算バイパス OK")
+        test_bypass_transition_continuous()
+        print("[*] 切替無段差 OK")
         test_stereo_mid_side()
         print("[*] Mid/Side OK")
         test_strength_map()

@@ -140,6 +140,21 @@ def main() -> int:
     print(f"[{'OK' if err < 1e-4 else 'FAIL'}] pll demod: max diff {err:.2e}")
     ok &= err < 1e-4
 
+    # dft_bins: Cとnumpy代替の一致 (検出3モジュールの共通基盤)。
+    # 旧DLL (シンボルなし) ではnumpy代替同士の比較になる。
+    import dsp_native
+    rng2 = np.random.default_rng(7)
+    xb = (0.1 * np.sin(2 * np.pi * 19000.0 * np.arange(66048) / 288000.0)
+          + 0.001 * rng2.standard_normal(66048)).astype(np.float32)
+    freqs = [19000.0, 18995.0, 19005.0, 17500.0, 50.0]
+    r_helper = dsp_native.dft_bins(xb, freqs, 288000.0)
+    r_numpy = dsp_native._dft_bins_numpy(xb, freqs, 288000.0)
+    err = maxdiff(r_helper, r_numpy)
+    good = err < 1e-4
+    print(f"[{'OK' if good else 'FAIL'}] dft_bins helper/numpy: max diff {err:.2e} "
+          f"(native={'ON' if dsp_native.NATIVE_DFTBINS else 'OFF'})")
+    ok &= good
+
     print("OK" if ok else "FAILED")
     return 0 if ok else 1
 
