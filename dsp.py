@@ -2431,6 +2431,31 @@ class SdrDspPipeline:
             out[s:e] = (l * (1.0 - w) + r * w).astype(out.dtype)
         return out
 
+    def _am_agc_normalize(self, sig: np.ndarray) -> np.ndarray:
+        """AM搬送波レベルAGC (demodulate_am から純粋移動・動作同一)。
+
+        信号レベルやダイレクトサンプリングの低入力でも一定音量にする
+        (時定数 ~0.2sアタック / ~1sリリース。無信号時の過剰増幅は3000倍で制限)。
+        無信号フロア: レベル極小でAGC=0張り付き→gain3000→AMは-0.6のDC定数出力や
+        ノイズ爆音になるため、フロア以下では出力を滑らかにミュートする。
+        ハングタイマ: 単語間の息継ぎでゲインが跳ね上がる呼吸を防ぐため、
+        レベル低下後は約400ms(7ブロック)だけ減衰を保持してからリリースする。
+        """
+        level = float(np.mean(np.abs(sig)))
+        if self.am_agc_level <= 0.0:
+            self.am_agc_level = max(level, 2e-4)
+            self._am_agc_hang = 0
+        elif level > self.am_agc_level:
+            self.am_agc_level += 0.1 * (level - self.am_agc_level)
+            self._am_agc_hang = 20
+        elif self._am_agc_hang > 0:
+            self._am_agc_hang -= 1
+        else:
+            self.am_agc_level += 0.005 * (level - self.am_agc_level)
+        gain = min(1.0 / (self.am_agc_level + 1e-9), 3000.0)
+        fade = min(1.0, level / 2e-4)
+        return np.clip((sig * gain - 1.0) * 0.6, -1.0, 1.0) * fade
+
     def demodulate_am(self, iq_if: np.ndarray) -> np.ndarray:
         if len(iq_if) == 0:
             return np.zeros(0, dtype=np.float32)
@@ -2450,25 +2475,7 @@ class SdrDspPipeline:
                 sig = w * coherent + (1.0 - w) * env
 
         # 搬送波レベルAGC: 信号強度やダイレクトサンプリングの低入力でも一定音量にする
-        # (時定数 ~0.2sアタック / ~1sリリース。無信号時の過剰増幅は3000倍で制限)
-        # 無信号フロア: レベル極小でAGC=0張り付き→gain3000→AMは-0.6のDC定数出力や
-        # ノイズ爆音になるため、フロア以下では出力を滑らかにミュートする。
-        # ハングタイマ: 単語間の息継ぎでゲインが跳ね上がる呼吸を防ぐため、
-        # レベル低下後は約400ms(7ブロック)だけ減衰を保持してからリリースする。
-        level = float(np.mean(np.abs(sig)))
-        if self.am_agc_level <= 0.0:
-            self.am_agc_level = max(level, 2e-4)
-            self._am_agc_hang = 0
-        elif level > self.am_agc_level:
-            self.am_agc_level += 0.1 * (level - self.am_agc_level)
-            self._am_agc_hang = 20
-        elif self._am_agc_hang > 0:
-            self._am_agc_hang -= 1
-        else:
-            self.am_agc_level += 0.005 * (level - self.am_agc_level)
-        gain = min(1.0 / (self.am_agc_level + 1e-9), 3000.0)
-        fade = min(1.0, level / 2e-4)
-        audio_raw = np.clip((sig * gain - 1.0) * 0.6, -1.0, 1.0) * fade
+        audio_raw = self._am_agc_normalize(sig)
         if self.cognitive_enabled:
             fir_final = self._get_dynamic_filter("audio", min(self.applied_cutoff_hz, 8000.0))
         elif self.filter_mode == "wide":
