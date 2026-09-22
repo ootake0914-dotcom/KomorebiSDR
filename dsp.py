@@ -376,6 +376,13 @@ class SdrDspPipeline:
         self._nr_primed = False
         self._nr_s_w = 0.0                # 平滑化されたWiener適用度 (0=off, 1=full)
         self._nr_s = 0.0                  # 平滑化されたノイズ度 (0=クリーン, 1=ノイズ)
+        # モノラル番組検出 (M-S相関): 真のステレオでは直交するため、相関が高い=
+        # S成分が分離漏れ+ノイズ。モノラル番組ではS側を積極抑圧してヒスを消す
+        self._nr_mono_rho = 0.0
+        self._nr_mono_w = 0.0
+        self._nr_mono_primed = False
+        self._nr_sw_eff = 0.0             # 有効Wiener適用度 (モノラル判定反映)
+        self._nr_cut_eff = 15000.0        # 有効S側カットオフ (モノラル判定反映)
         self._nr_hist = deque(maxlen=100)  # 差分HFパワー履歴 (下位10%をノイズフロア推定に使用)
         self._nr_mf_smooth = 0.0  # 番組パワー平滑値 (未初期化=0で初回に即時セット)
         self._nr_cut_levels = np.array([2500.0, 4000.0, 6500.0, 10000.0, 15000.0])
@@ -641,6 +648,11 @@ class SdrDspPipeline:
         self._nr_hist.clear()
         self._nr_mf_smooth = 0.0
         self._nr_primed = False
+        self._nr_mono_rho = 0.0
+        self._nr_mono_w = 0.0
+        self._nr_mono_primed = False
+        self._nr_sw_eff = 0.0
+        self._nr_cut_eff = 15000.0
         self._wf_p = None
         self._wf_g = None
         self._nr_floor_pow = 0.0
@@ -1109,7 +1121,7 @@ class SdrDspPipeline:
                 # 38kHz位相オートトリム (L-R電力最大化。NR推定と同タイミングで観測)
                 self._update_stereo_trim(diff_raw, mono)
                 if self.stereo_nr_enabled:
-                    cut = self.stereo_cut_hz
+                    cut = self._nr_cut_eff
                     blend = self._stereo_blend * self.stereo_nr_gain
                     blend *= self.multipath_gain
                     diff = self._diff_lowpass(diff_raw, cut)
@@ -1262,6 +1274,29 @@ class SdrDspPipeline:
         # 固定高域ブレンド: 副搬送波ヒス対策で常時上限を適用 (適応側がそれ以上
         # 絞る場合はそちらを優先)
         self.stereo_cut_hz = min(self.stereo_cut_hz, self._nr_cut_fixed_hz)
+        # モノラル番組判定: 実際のステレオミックスでは M=(L+R)/2 と S=(L-R)/2 は
+        # 直交するため、M-S相関は「番組でないS成分」(分離漏れクロストーク+ノイズ)
+        # の割合を示す。相関が高ければS側を積極抑圧しても番組を損なわない
+        # (実測: ラッキーFM 94.6 の番組はモノラルで相関+0.63、S/M -24dB)。
+        # 真のステレオ番組 (相関≈0) では従来の控えめ設定を維持する。
+        mo = np.asarray(mono, dtype=np.float64)
+        di = np.asarray(diff, dtype=np.float64)
+        if len(mo) == len(di) and len(mo) > 0:
+            mo = mo - float(mo.mean())
+            di = di - float(di.mean())
+            den = float(np.sqrt(np.mean(mo * mo) * np.mean(di * di))) + 1e-12
+            rho = float(np.mean(mo * di)) / den
+            if not self._nr_mono_primed:
+                self._nr_mono_primed = True
+                self._nr_mono_rho = rho
+            else:
+                a_r = 1.0 - np.exp(-dt / 2.0)
+                self._nr_mono_rho += a_r * (rho - self._nr_mono_rho)
+        x_m = float(np.clip((self._nr_mono_rho - 0.15) / 0.35, 0.0, 1.0))
+        self._nr_mono_w = x_m * x_m * (3.0 - 2.0 * x_m)
+        # 有効値: モノラル番組ではWienerを全力(1.0)へ、S高域カットを8kHzへ寄せる
+        self._nr_sw_eff = max(self._nr_s_w, self._nr_mono_w)
+        self._nr_cut_eff = min(self.stereo_cut_hz, 13000.0 - 5000.0 * self._nr_mono_w)
 
     def _diff_lowpass(self, x: np.ndarray, cutoff_hz: float) -> np.ndarray:
         """差信号用の可変ローパス。同一長の線形位相FIRを2本クロスフェードし、
@@ -1316,7 +1351,7 @@ class SdrDspPipeline:
 
             c_noise = ((self._nr_floor_pow * self._nr_floor_bias * self._wf_scale)
                        / self._wf_hf_f2_mean)
-            sw = self._nr_s_w if self.stereo_nr_enabled else 0.0
+            sw = self._nr_sw_eff if self.stereo_nr_enabled else 0.0
             # 平滑再帰のみ逐次 (フレーム間依存のため。ベクトル演算のみでFFTなし)
             gmix = np.empty_like(specs, dtype=np.float32)
             for j in range(nframes):
@@ -1341,7 +1376,7 @@ class SdrDspPipeline:
                 gate = np.minimum(1.0, mask_thr / (noise_bin + 1e-12)).astype(np.float32)
                 g_use = np.maximum(self._wf_g, gate)
                 g_use[:3] = 1.0  # DC〜低域は保護
-                sw = self._nr_s_w if self.stereo_nr_enabled else 0.0
+                sw = self._nr_sw_eff if self.stereo_nr_enabled else 0.0
                 g_mix = 1.0 - sw * (1.0 - g_use)
                 gmix[j] = g_mix
             self.stereo_wiener_gain = float(np.mean(gmix[-1]))
