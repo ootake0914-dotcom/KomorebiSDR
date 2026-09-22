@@ -6,6 +6,7 @@
 
 import numpy as np
 
+from dsp_filters import design_fir_kaiser
 from dsp_native import (
     _NATIVE,
     _fptr,
@@ -163,3 +164,32 @@ class DspNfmMixin:
         audio = self._apply_voice_highpass(audio)
         audio = self._voice_bandwidth(audio, 3000.0, 2200.0)
         return audio.astype(np.float32)
+
+    def _init_nfm_state(self):
+        """NFM/SSB用FIR等の状態初期化 (__init__ から純粋移動)。"""
+        # ISS / アマチュア無線専用 NFM (ナローバンドFM) IFローパス (±8kHz Carson帯域幅)
+        cutoff_nfm_if = 8000.0 / self.rf_rate
+        self.fir_nfm = design_fir_kaiser(num_taps=97, cutoff_norm=cutoff_nfm_if, beta=7.0)
+
+        # NFM用 通信音声帯域ハイカットフィルタ (3.0kHz, 48kHzレート)
+        cutoff_nfm_audio = 3000.0 / self.audio_rate
+        self.fir_nfm_audio = design_fir_kaiser(num_taps=81, cutoff_norm=cutoff_nfm_audio, beta=7.0)
+        # SSB用 複素バンドパスを構成する実LPF (±1.5kHz通過, 48kHzレート)
+        # シフト→LPF→逆シフトで非対称バンドパスを作り、反対側波帯を除去する
+        # 反対側波帯は±1.8kHz以遠にあるため、急峻な401タップで十分な阻止特性を確保
+        cutoff_ssb_lp = 1350.0 / self.audio_rate
+        self.fir_ssb_lp = design_fir_kaiser(num_taps=401, cutoff_norm=cutoff_ssb_lp, beta=7.5)
+
+        # CW用 狭帯域LPF (±350Hz)
+        cutoff_cw_lp = 350.0 / self.audio_rate
+        self.fir_cw_lp = design_fir_kaiser(num_taps=481, cutoff_norm=cutoff_cw_lp, beta=8.0)
+        self.nfm_last_sample = 0.0 + 0.0j
+        self.nfm_afc_offset_hz = 0.0
+        self.nfm_afc_alpha = 0.08  # ISSドップラー追従用時定数
+        self._voice_hp_state = np.zeros(2, dtype=np.float32)
+        # ===== SSB / CW =====
+        self.bfo_offset_hz = 0.0     # BFO微調整 (SSB/CWのみ)
+        self.ssb_agc_level = 0.0
+        self._ssb_agc_hang = 0
+        self._ssb_bp_phase = 0.0
+        self._ssb_bfo_phase = 0.0

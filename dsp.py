@@ -149,59 +149,20 @@ class SdrDspPipeline(DspBlackMagicMixin, DspAmMixin, DspNfmMixin,
         cutoff_if_narrow = 60000.0 / self.rf_rate
         self.fir_if_narrow = design_fir_kaiser(num_taps=65, cutoff_norm=cutoff_if_narrow, beta=6.5)
 
-        # AM用ローパス (±6kHz: 中波放送用)
-        cutoff_am = 6000.0 / self.rf_rate
-        self.fir_am = design_fir_kaiser(num_taps=81, cutoff_norm=cutoff_am, beta=6.5)
 
-        # 短波放送用 狭帯域AMローパス (±3.5kHz: 短波HF帯の混信をカット)
-        cutoff_am_narrow = 3500.0 / self.rf_rate
-        self.fir_am_narrow = design_fir_kaiser(num_taps=97, cutoff_norm=cutoff_am_narrow, beta=7.0)
 
-        # ISS / アマチュア無線専用 NFM (ナローバンドFM) IFローパス (±8kHz Carson帯域幅)
-        cutoff_nfm_if = 8000.0 / self.rf_rate
-        self.fir_nfm = design_fir_kaiser(num_taps=97, cutoff_norm=cutoff_nfm_if, beta=7.0)
 
-        # NFM用 通信音声帯域ハイカットフィルタ (3.0kHz, 48kHzレート)
-        cutoff_nfm_audio = 3000.0 / self.audio_rate
-        self.fir_nfm_audio = design_fir_kaiser(num_taps=81, cutoff_norm=cutoff_nfm_audio, beta=7.0)
 
-        # 19kHzパイロットトーンを抑えるIF段オーディオフィルタ (288kHzレート)
-        # カットオフ 15kHz, 19kHzで -60dB以上の急峻減衰 (257タップ。
-        # 97タップでは19kHzで-25.8dBしかなく超音波漏洩していた)
-        cutoff_if_audio = 15000.0 / self.if_rate
-        self.fir_if_audio = design_fir_kaiser(num_taps=257, cutoff_norm=cutoff_if_audio, beta=7.0)
-
-        # 48kHzオーディオ段のアンチエイリアス・ハイカットフィルタ (48kHzレート)
-        # 14kHz: 音楽用Hi-Fiワイド (51タップ)
-        cutoff_audio_wide = 14000.0 / self.audio_rate
-        self.fir_audio_wide = design_fir_kaiser(num_taps=51, cutoff_norm=cutoff_audio_wide, beta=6.0)
-
-        # 8.5kHz: 強力ノイズクリーナー (ヒスノイズ「サー」を消滅させ人の声を鮮明化, 65タップ)
-        cutoff_audio_clean = 8500.0 / self.audio_rate
-        self.fir_audio_clean = design_fir_kaiser(num_taps=65, cutoff_norm=cutoff_audio_clean, beta=7.0)
-
-        # 5.5kHz: DXボイスフィルタ (微弱局のノイズフロアを抑え声の明瞭度を上げる, 65タップ)
-        cutoff_audio_narrow = 5500.0 / self.audio_rate
-        self.fir_audio_narrow = design_fir_kaiser(num_taps=65, cutoff_norm=cutoff_audio_narrow, beta=7.0)
-
-        # SSB用 複素バンドパスを構成する実LPF (±1.5kHz通過, 48kHzレート)
-        # シフト→LPF→逆シフトで非対称バンドパスを作り、反対側波帯を除去する
-        # 反対側波帯は±1.8kHz以遠にあるため、急峻な401タップで十分な阻止特性を確保
-        cutoff_ssb_lp = 1350.0 / self.audio_rate
-        self.fir_ssb_lp = design_fir_kaiser(num_taps=401, cutoff_norm=cutoff_ssb_lp, beta=7.5)
-
-        # CW用 狭帯域LPF (±350Hz)
-        cutoff_cw_lp = 350.0 / self.audio_rate
-        self.fir_cw_lp = design_fir_kaiser(num_taps=481, cutoff_norm=cutoff_cw_lp, beta=8.0)
-
-        # AM/SSB通信用 4kHzローパス (8.5kHzでは短波のヒスを通しすぎるため)
-        cutoff_am_audio = 4000.0 / self.audio_rate
-        self.fir_am_audio = design_fir_kaiser(num_taps=81, cutoff_norm=cutoff_am_audio, beta=7.0)
 
         # 適応型分数リサンプラ (SDRとサウンドカードのクロックドリフトを微小補正し音飛び抑制)
         self.resampler = AdaptiveDriftResampler(target_chunks=8.0, max_ppm=120.0)
 
-
+        # 復調器ごとの状態初期化は各mixinへ分散 (純粋移動・動作同一)。
+        # AMを先に作る (WFMのhistory_rdsがfir_am_narrowを参照するため)。
+        self._init_am_state()
+        self._init_wfm_state()
+        self._init_nfm_state()
+        self._init_bm_state()
 
         # ノイズフィルターモード ("clean", "wide", または "narrow")
         self.filter_mode = "clean"
@@ -218,29 +179,7 @@ class SdrDspPipeline(DspBlackMagicMixin, DspAmMixin, DspNfmMixin,
         self._if_snr_db = 10.0  # WFM復調前の局所チャンネルSNR推定（IFモーフィング用）
         self._fir_cache = OrderedDict()
 
-        # 4.5kHzクロスオーバーによる心理音響ハイシェルフ (FM三角雑音のみ連続減衰)
-        shelf_cut = 4500.0 / self.audio_rate
-        self.fir_shelf_lp = design_fir_kaiser(num_taps=81, cutoff_norm=shelf_cut, beta=6.5)
-        self.fir_shelf_hp = design_fir_highpass(num_taps=81, cutoff_norm=shelf_cut, beta=6.5)
-        self.history_shelf_lp = np.zeros(len(self.fir_shelf_lp) - 1, dtype=np.float32)
-        self.history_shelf_hp = np.zeros(len(self.fir_shelf_hp) - 1, dtype=np.float32)
 
-        # AFC (Automatic Frequency Control: 100Hz精度の自動搬送波追従)
-        self.afc_enabled = True
-        self.afc_offset_hz = 0.0
-        self.afc_alpha = 0.05  # 滑らかな追従時定数
-
-        self.fm_last_sample = 0.0 + 0.0j
-        self.nfm_last_sample = 0.0 + 0.0j
-        self.nfm_afc_offset_hz = 0.0
-        # PLL-FM復調状態 (fn=25kHz, ζ=1.0 の実測勝ち値。w=2πfn/fsで正規化設計)
-        _w = 2.0 * np.pi * 25000.0 / 288000.0
-        _den = 1.0 + _w + 0.25 * _w * _w
-        self._fm_pll_kp = 2.0 * _w / _den
-        self._fm_pll_ki = _w * _w / _den
-        self._fm_pll_state = np.zeros(2, dtype=np.float64)
-        self.fm_pll_enabled = False  # ワイドFMの過変調歪み・脱調防止のため通常は差分検波を標準使用
-        self.nfm_afc_alpha = 0.08  # ISSドップラー追従用時定数
 
         # FIRフィルタの境界連続性保持用バッファ
         self.history_if = np.zeros(len(self.fir_if) - 1, dtype=np.complex64)
@@ -257,257 +196,14 @@ class SdrDspPipeline(DspBlackMagicMixin, DspAmMixin, DspNfmMixin,
         self.history_am_audio = np.zeros(len(self.fir_am_audio) - 1, dtype=np.float32)
         self.history_final = np.zeros(len(self.fir_audio_clean) - 1, dtype=np.float32)
 
-        # ディエンファシス (地域設定: 日本/欧州=50μs, 米国/韓国=75μs)
-        # 1次双一次では高域ワープ歪み (15kHzで-3.55dB) が避けられないため、
-        # 実測フィットした2縦続1次IIRでアナログ特性に±0.03dBで一致させる。
-        # 各段は既存ネイティブ1次IIR (b0,b1,minus_a1) そのまま実行できる。
-        self.deemph_tau_us = 50.0
-        self.deemph_sections = _deemph_sections(50.0)
-        self.deemph_x1 = self.deemph_y1 = 0.0
-        self.deemph2_x1 = self.deemph2_y1 = 0.0
-        # ネイティブCコア用フィルタ状態 (x1, y1) ×2段
-        self._deemph_state = np.zeros(2, dtype=np.float32)
-        self._deemph2_state = np.zeros(2, dtype=np.float32)
         self._dc_hp_state = np.zeros(2, dtype=np.float32)
-        self._voice_hp_state = np.zeros(2, dtype=np.float32)
-        self._deemph_state_l = np.zeros(2, dtype=np.float32)
-        self._deemph_state_r = np.zeros(2, dtype=np.float32)
-        self._deemph2_state_l = np.zeros(2, dtype=np.float32)
-        self._deemph2_state_r = np.zeros(2, dtype=np.float32)
-        self._dc_hp_state_l = np.zeros(2, dtype=np.float32)
-        self._dc_hp_state_r = np.zeros(2, dtype=np.float32)
-        self.deemph_x1_l = self.deemph_y1_l = 0.0
-        self.deemph_x1_r = self.deemph_y1_r = 0.0
-        self.deemph2_x1_l = self.deemph2_y1_l = 0.0
-        self.deemph2_x1_r = self.deemph2_y1_r = 0.0
-        self.dc_hp_x1_l = self.dc_hp_y1_l = 0.0
-        self.dc_hp_x1_r = self.dc_hp_y1_r = 0.0
 
-        # ===== FMステレオMPXデコーダ (19kHzパイロットPLL + 38kHz同期検波) =====
-        self.stereo_enabled = True
-        self.is_stereo = False
-        self.stereo_blend = 0.0
-        self.stereo_pilot_lock = 0.0
-        self.stereo_pilot_ratio = 0.0
-        cutoff_pilot_lp = 20500.0 / self.if_rate
-        cutoff_pilot_hp = 17000.0 / self.if_rate
-        self.fir_pilot_lp = design_fir_kaiser(num_taps=97, cutoff_norm=cutoff_pilot_lp, beta=6.5)
-        self.fir_pilot_hp = design_fir_highpass(num_taps=97, cutoff_norm=cutoff_pilot_hp, beta=6.5)
-        self.history_pilot_lp = np.zeros(len(self.fir_pilot_lp) - 1, dtype=np.float32)
-        self.history_pilot_hp = np.zeros(len(self.fir_pilot_hp) - 1, dtype=np.float32)
-        self.history_lpr = np.zeros(len(self.fir_if_audio) - 1, dtype=np.float32)
-        self.history_lpr_q = np.zeros(len(self.fir_if_audio) - 1, dtype=np.float32)
-        self.history_rds = np.zeros(len(self.fir_am_narrow) - 1, dtype=np.float32)
-        self.history_final_l = np.zeros(len(self.fir_audio_clean) - 1, dtype=np.float32)
-        self.history_final_r = np.zeros(len(self.fir_audio_clean) - 1, dtype=np.float32)
-        self.history_shelf_lp_l = np.zeros(len(self.fir_shelf_lp) - 1, dtype=np.float32)
-        self.history_shelf_hp_l = np.zeros(len(self.fir_shelf_hp) - 1, dtype=np.float32)
-        self.history_shelf_lp_r = np.zeros(len(self.fir_shelf_lp) - 1, dtype=np.float32)
-        self.history_shelf_hp_r = np.zeros(len(self.fir_shelf_hp) - 1, dtype=np.float32)
-        self._pll_theta = 0.0
-        self._pll_integ = 0.0
-        self._pll_w0 = 2.0 * np.pi * 19000.0 / self.if_rate
-        # 低ジッターPLL設計 (fn=16Hz, ζ=0.85, ループフィルタ遮断 20Hz)
-        # 従来の過大帯域(205Hz)による低音変調漏れ・位相揺らぎ・定位のあるノイズを抑制
-        _fn_pll = 16.0
-        _wn_pll = 2.0 * np.pi * _fn_pll
-        self._pll_kp = float(2.0 * 0.85 * _wn_pll / self.if_rate)
-        self._pll_ki = float((_wn_pll / self.if_rate) ** 2)
-        self._pll_alpha = float(2.0 * np.pi * 20.0 / self.if_rate)
-        self._pll_ef = 0.0
-        self._last_cos2 = None
-        self._last_sin2 = None
-        self._last_cos3 = None
-        self._last_sin3 = None
 
-        # 適応カルマン・パイロット搬送波トラッカー (19kHz追従)
-        self.pilot_tracker = KalmanPilotTracker(sample_rate=self.if_rate)
 
-        # 高域高調波補完エキサイター (Harmonic Exciter: 15kHz以上の高域倍音付加)
-        # NOTE: 実機実測(ラッキーFM 94.6MHz 強電界)で無音時の12-15kHzを+18.7dB
-        # 持ち上げ、静かな場面に合成ヒスが乗ることを確認したため既定OFF。
-        # 再有効化は .enabled=True (弱局で空気感を出したい場合のみ推奨)。
-        self.holographic_enhancer = HolographicAudioEnhancer(sample_rate=self.audio_rate, air_gain=0.08)
-        self.holographic_enhancer.enabled = False
 
-        # 位相スリップ抑制型FM復調器 (特異点クリック防止)
-        self.riemann_demodulator = RiemannianTopologicalDemodulator(sample_rate=self.if_rate)
-
-        # 独立成分分析ステレオ復調器 (BSS / FastICA によるヒス低減)
-        self.bss_separator = SuperSpatialBssStereoSeparator(sample_rate=self.audio_rate)
-
-        # ハンケル行列SVD部分空間ノイズフィルター (SVD特異値しきい値処理)
-        # NOTE: 実機実測で番組の12-15kHzを+7.1dB変形 (入出力相関0.9916=非透明) し、
-        # 弱局でのノイズ低減効果も確認できなかったため既定OFF (CPUも節約)。
-        self.rmt_denoiser = RmtHankelDenoiser(sample_rate=self.audio_rate, embed_dim=24)
-        self.rmt_denoiser.enabled = False
-
-        # 単一ch スペクトル抑圧NR (帯域内ノイズの最小統計Wiener抑圧。
-        # 弱電界FMでハイカットでは消せない番組帯ノイズを低減。クリーン時は透明)
-        self.mono_nr = MonoNoiseSuppressor(sample_rate=self.audio_rate)
-        self.mono_nr_enabled = True
-
-        # ===== 黒魔法三点セット (弱電界検出補助。既定は全て無効) =====
-        # master=self.black_magic_enabled がFalseの間は一切動作せず、
-        # 既存経路とビット同一の出力を保つ (tests/test_black_magic.pyで検証)。
-        # 各インスタンスは遅延生成 (有効化時のみ) し、失敗時はNoneのまま
-        # 既存経路へフォールバックする。
-        self.black_magic_enabled = False
-        self.bm_cyclo_enabled = False
-        self.bm_rmt_enabled = False
-        self.bm_sr_enabled = False
-        self.bm_notch_enabled = False
-        self.bm_sq_assist_enabled = False
-        self.bm_sq_open_conf = 0.75
-        self.bm_sq_close_conf = 0.55
-        self.bm_sq_close_smeter_db = -25.0
-        self.bm_sq_open_smeter_db = -40.0
-        self.bm_sq_min_close_blocks = 20
-        self.bm_seek_enabled = False
-        self._bm_sq_open = True  # 起動時は開 (いきなりミュートしない)
-        self._bm_sq_gain = 1.0
-        self._bm_sq_hold = 0
-        self.cyclo_detector = None
-        self.bm_rmt = None
-        self.bm_sr = None
-        self.bm_notch = None
-        self.bm_controller = None
-        self.bm_cyclo_min_conf = 0.55
-        self.bm_cyclo_confidence = 0.0
-        self.bm_sr_confidence = 0.0
-        self.bm_rmt_cap = 0.65
-        # main.pyから渡される黒魔法パラメータ (configのblack_magic節)。
-        # 遅延生成インスタンスのコンストラクタに反映する。既定は空=内蔵既定。
-        self.bm_cfg = {}
-        # flutter検出用lock履歴 (直近32ブロック) と判定閾値
-        self._bm_lock_hist = deque(maxlen=32)
-        self.bm_flutter_std = 0.15
-        self._bm_params = None
-        self._bm_last_rmt_info = None
-
-        # ===== RDS (57kHz) =====
-        self.rds_enabled = True
-        self.rds = None            # 遅延生成 (rds.RdsDecoder)
-        self.rds_ps = ""
-        self.rds_rt = ""
-        self.rds_pi = 0
-        self.rds_pty = None
-        self.rds_groups = 0
-        # BS.450/EN 50067準拠キャリア生成のため追加回転は不要 (0.0)
-        self.rds_phase_offset = 0.0
-        self._stereo_blend = 0.0
-        # パイロット瞬断用フライホイール: ロック喪失直後はブレンドを凍結し、
-        # 短い発作 (1.4秒/25ブロックまで) ではステレオ像を維持する
-        self._pilot_hold_max = 25
-        self._pilot_hold_n = 0
-        # CコアのPLL 1サンプル進みが解消されたため、副搬送波オフセットは 0.0
-        self.stereo_phase_offset = 0.0
-        # 直交復調の残差 (位相誤差の符号付き観測用。MPXキャンセラ経路でのみ有効)
-        self._last_diff_q = None
-        # 38kHz再生位相オートトリム (ドングル個体差・温度ドリフトによる分離度劣化を
-        # L-R電力最大化サーボで吸収。stereo_phase_offsetをアクチュエータに使う)
-        self.stereo_trim_enabled = True
-        self._trim_dir = 1.0
-        self._trim_step_rad = float(np.deg2rad(0.5))
-        self._trim_max_rad = float(np.deg2rad(15.0))
-        self._trim_block = 0
-        self._trim_m_smooth = 0.0
-        self._trim_prev_m = 0.0
-        self._trim_primed = False
-        self._trim_err_ema = 0.0
         # ステレオ2ch同期 適応ドリフトリサンプラ (後方互換参照)
         self.resampler_r = self.resampler
 
-        # ===== ステレオノイズリダクション =====
-        # 弱電界でステレオ化すると増えるヒスノイズを、(L-R)差信号の高域/中域パワー比から
-        # 検出し、ノイズ量に応じて 1) サブバンドWiener抑圧 2) 可変ローパス
-        # 3) ブレンドでモノラルへ寄せる。実測はNR適用前の生差信号で行うため発振しない。
-        self.stereo_nr_enabled = True
-        self.stereo_status = "MONO"       # "STEREO" / "BLEND" / "MONO"
-        self.stereo_nr_gain = 1.0         # ノイズ由来ブレンド (1=フルステレオ, 0=モノラル)
-        self.stereo_cut_hz = 15000.0      # 差信号ローパス遮断周波数 (平滑)
-        self.stereo_hiss_db = -60.0       # (L-R)ヒス指標 (初期値=クリーン, NR不発動)
-        self._nr_cut_max_hz = 15000.0
-        self._nr_cut_min_hz = 5000.0
-        # 固定高域ブレンド上限: FMステレオ副搬送波(38kHz DSB)の三角雑音は
-        # 高域ほど大きく、強局でも12-15kHzで番組と同程度まで残る (実測: ラッキーFM
-        # 94.6MHz 強電界で S高域ノイズが番組-5dB)。ヒス指標に依らず常時S側を
-        # 13kHzで緩く減衰させる (カーラジオ標準の高域ブレンド。低域のステレオ感は不変)。
-        self._nr_cut_fixed_hz = 13000.0
-        # ブレンド量 (極端に弱い局のみモノラル化。通常はWienerが周波数別に処理)
-        self._nr_lo_db = -18.0
-        self._nr_hi_db = -4.0
-        # Wiener適用量 (これより上のノイズで段階的にサブバンド抑圧)
-        # 実測: 強局(ラッキーFM 94.6)でも副搬送波ヒスは-36dBあり、旧-40/-18では
-        # 適用度0.1しか立たず12-15kHzのヒスが残った。サブバンドWienerは
-        # 知覚マスキングゲート内蔵で番組高域を保護するため、適用域を下げて
-        # 「聞こえるヒス」を抑える (ブレンド側しきい値は据え置き=高域ブレンド不要)。
-        self._nr_wiener_lo_db = -46.0
-        self._nr_wiener_hi_db = -26.0
-        self._nr_primed = False
-        self._nr_s_w = 0.0                # 平滑化されたWiener適用度 (0=off, 1=full)
-        self._nr_s = 0.0                  # 平滑化されたノイズ度 (0=クリーン, 1=ノイズ)
-        # モノラル番組検出 (M-S相関): 真のステレオでは直交するため、相関が高い=
-        # S成分が分離漏れ+ノイズ。モノラル番組ではS側を積極抑圧してヒスを消す
-        self._nr_mono_rho = 0.0
-        self._nr_mono_w = 0.0
-        self._nr_mono_primed = False
-        self._nr_sw_eff = 0.0             # 有効Wiener適用度 (モノラル判定反映)
-        self._nr_cut_eff = 15000.0        # 有効S側カットオフ (モノラル判定反映)
-        self._nr_hist = deque(maxlen=100)  # 差分HFパワー履歴 (下位10%をノイズフロア推定に使用)
-        self._nr_mf_smooth = 0.0  # 番組パワー平滑値 (未初期化=0で初回に即時セット)
-        self._nr_cut_levels = np.array([2500.0, 4000.0, 6500.0, 10000.0, 15000.0])
-        self._nr_filters = [
-            design_fir_kaiser(num_taps=65, cutoff_norm=float(c) / self.audio_rate, beta=6.5)
-            for c in self._nr_cut_levels
-        ]
-        self.history_nr_lp = np.zeros(64, dtype=np.float32)
-        self._nr_delay = (len(self._nr_filters[0]) - 1) // 2  # 線形位相FIRの群遅延
-
-        # ===== サブバンドWiener NR (STFT 128pt / hop 64 / 平方根Hann(Sine窓) 50%オーバーラップ) =====
-        # 差信号を周波数ごとにWiener抑圧。低域(ノイズが少なく音が濃い)はステレオのまま、
-        # ノイズに埋もれた高域のみを選択的に落とすため、単一ローパスより音場が広い。
-        # 平方根Hann窓 (Sine窓: sin(pi*(n+0.5)/N)) を分析・合成の両面で適用することで、
-        # 50% OLAの二乗和が sin² + cos² ≡ 1.0 となり、再構成時の振幅変調リップル(750Hzとその倍音)が
-        # ほぼゼロ(0.000000dB)になる。
-        self._wf_n = 128
-        self._wf_hop = 64
-        self._wf_win = np.sin(np.pi * (np.arange(self._wf_n) + 0.5) / self._wf_n).astype(np.float32)
-        self._wf_cola = np.ones(self._wf_n, dtype=np.float32)
-        self._wf_in = np.zeros(0, dtype=np.float32)
-        self._wf_out = np.zeros(self._wf_hop, dtype=np.float32)  # 初期プリフィル=固定遅延
-        # STFTがゼロ埋めで生じた追加遅延。mono側を同量遅らせて時間整合を保つ
-        # (ブロック長がホップの倍数でない場合に分離度が崩壊するのを防ぐ)
-        self._wf_extra_delay = 0
-        self._wf_ola = np.zeros(self._wf_n, dtype=np.float32)
-        self._wf_p = None                  # 番組パワーの時間平滑
-        self._wf_g = None
-        self._wf_f2 = np.fft.rfftfreq(self._wf_n, 1.0 / self.audio_rate) ** 2
-        # 知覚マスキング行列 (Bark拡散・Schroeder): T = P @ S でビン別マスキング閾値。
-        # マスクされるノイズは抑圧不要 (g=1) とし、音楽性ノイズを設計上出さない。
-        _bf = np.fft.rfftfreq(self._wf_n, 1.0 / self.audio_rate)
-        _bk = 13.0 * np.arctan(0.76 * _bf / 1000.0) + 3.5 * np.arctan((_bf / 7500.0) ** 2)
-        _dz = _bk[:, None] - _bk[None, :]
-        _sp = 15.81 + 7.5 * (_dz + 0.474) - 17.5 * np.sqrt(1.0 + (_dz + 0.474) ** 2)
-        self._wf_spread = (10.0 ** (_sp / 10.0)).astype(np.float32)
-        self._wf_mask_offset = 0.1  # マスキング閾値オフセット (同時マスキング-10dB相当)
-        hf_mask = (np.fft.rfftfreq(self._wf_n, 1.0 / self.audio_rate) >= 6000.0) & \
-                  (np.fft.rfftfreq(self._wf_n, 1.0 / self.audio_rate) <= 15000.0)
-        self._wf_hf_f2_mean = float(np.mean(self._wf_f2[hf_mask]) + 1e-12)
-        # 1024点指標→STFTドメインへのパワースケール補正 (E|X|²=σ²Σw²)
-        self._wf_scale = float(np.sum(self._wf_win ** 2) / np.sum(np.hanning(1024) ** 2))
-        self._nr_floor_pow = 0.0           # ブロードバンド指標のノイズ床 (HF帯)
-        self._nr_floor_bias = 2.3          # 下位タイル→平均ノイズへの補正 (Sine窓特性に最適化)
-        self._nr_gmin = 0.05               # 最大抑圧 (-26dB)
-        self.stereo_wiener_gain = 1.0
-        self._nr_delay += self._wf_hop     # Wiener経路の遅延をmono側で補償
-        self.history_mono_delay = np.zeros(self._nr_delay, dtype=np.float32)
-        self._nr_window = np.hanning(1024).astype(np.float32)
-        # 周波数依存ブレンド用クロスオーバー状態 (1次相補: lo + hi = diff で再構成。
-        # blend=1時は_lo/_hiとも1.0で旧スカラー動作とビット一致)
-        self.freq_blend_enabled = True
-        self.freq_blend_xo_hz = 3500.0
-        self._blend_xo_y1 = 0.0
 
         # DCカット用ハイパスフィルタ状態 (30Hzカットオフ)
         # y[n] = x[n] - x[n-1] + R * y[n-1]
@@ -523,9 +219,6 @@ class SdrDspPipeline(DspBlackMagicMixin, DspAmMixin, DspNfmMixin,
         # スケルチ (放送受信中のバタつき・ブツブツ音防止のためデフォルトOFF)
         self.squelch_threshold = -85.0
         self.squelch_enabled = False
-        self.am_agc_level = 0.0  # AM搬送波レベルAGC状態
-        self._am_agc_hang = 0  # AGCハングタイマ (残ブロック数)
-        self.impulse_blanker_enabled = True  # AMインパルスノイズブランカ
         # 局間音量レベリング用スローAGC (全モード共通・L/R連動で音像保存。
         # 番組の緩急 (バース/サビ) には追従させず、局替わり等の持続的な
         # レベル差だけを均す: 時定数は秒〜十秒オーダー、範囲は±6dBに制限。
@@ -547,11 +240,6 @@ class SdrDspPipeline(DspBlackMagicMixin, DspAmMixin, DspNfmMixin,
         # 音声/音楽 認知型オートチルトEQ (トーク了解度 / 音楽フラットHi-Fi 自動追従)
         self.cognitive_eq = CognitiveSpeechMusicTracker(sample_rate=self.audio_rate)
         self._cog_wide = None  # トラッカー用広帯域タップ (_post_process_wfmが更新)
-        # 38kHz 直交副搬送波マルチパス適応キャンセラ (サ行シピシピ歪み・混濁の逆位相相殺)
-        self.mpx_canceller = QuadratureMpxCanceller(sample_rate=self.audio_rate)
-        # 拡張カルマンフィルタ (EKF) FM復調エンジン
-        self.ekf_demod = DeepSpaceEkfDemodulator(sample_rate=self.if_rate)
-        self.ekf_enabled = True
 
         # ===== オーディオ統合モジュール =====
         # 位相回転の少ないDCサーボ (20Hz〜300Hzの低音位相進み歪みの抑制)
@@ -560,66 +248,13 @@ class SdrDspPipeline(DspBlackMagicMixin, DspAmMixin, DspNfmMixin,
         self.dither = TpdfDitherNoiseShaper(sample_rate=self.audio_rate)
         self.dither.enabled = False  # 内部DSPの数学的等価性維持のためデフォルトOFF (set_audiophile_modeで切替)
         self.apodizing_enabled = False
-        self._linear_fir_audio_clean = self.fir_audio_clean.copy()
-        self._linear_fir_audio_narrow = self.fir_audio_narrow.copy()
-        self._linear_fir_am_audio = self.fir_am_audio.copy()
 
-        # ===== AM同期検波 (キャリア再生PLL) =====
-        # 選択性フェージング時のひずみを避けるため、包絡線検波ではなく
-        # キャリアに同期した同相検波を使う。ロックできない時は包絡線へ自動復帰。
-        self.am_sync_enabled = True
-        self.am_sync_lock = 0.0
-        # ===== SSB / CW =====
-        self.bfo_offset_hz = 0.0     # BFO微調整 (SSB/CWのみ)
-        self.ssb_agc_level = 0.0
-        self._ssb_agc_hang = 0
-        self._ssb_bp_phase = 0.0
-        self._ssb_bfo_phase = 0.0
 
-        # ===== FMマルチパス検出 =====
-        # 反射波(マルチパス)はFM波に振幅変動(PM→AM変換)を与える。IF信号の包絡線変動を
-        # 検出し、強い時はステレオ/帯域を絞って耳障りな歪みを抑える。
-        self.multipath_enabled = True
-        self.multipath_amount = 0.0
-        self.multipath_gain = 1.0
-        self._mp_var = 0.0
-        self.mp_lo = 0.10
-        self.mp_hi = 0.35
-        self.mp_depth = 0.7
-        # CMAブラインド等化器 (マルチパス・キャンセル)。手動は実機アンテナの安定性のためデフォルトOFF。
-        # cognitive時の強い反射波には、multipath量ヒステリシス＋信号存在ゲートで自動介入する。
-        self.multipath_cancel_enabled = False
-        self.multipath_auto_cancel = True
-        self._cma_auto = False
-        self._cma_taps = 33
-        # μは0.03→0.02へ (長遅延強エコー d=40/g=1.2で0.03はlock 0.18・
-        # 0.02は0.39・0.015は0.56。短エコー・flutterは同等以上。
-        # 0.015が最良だが実フラッターの追従速度を残すため0.02を採用)。
-        self._cma_mu = 0.02
-        self._cma_w = np.zeros(2 * self._cma_taps, dtype=np.float32)
-        self._cma_w[2 * (self._cma_taps // 2)] = 1.0  # 中央タップ=デルタ初期化
-        self._cma_hist = np.zeros(self._cma_taps - 1, dtype=np.complex64)
-        self.cma_active = False
 
-        # ===== AM/SSB 適応音声帯域 =====
-        # ヒスが多い時は音声帯域を狭めて了解度を上げる (自動トーンコントロール)
-        self.voice_auto_bw = True
-        self.voice_cut_hz = 4000.0
-        self._vc_ratio_db = -40.0
 
         # ===== Sメーター (チャンネル内電力。絶対校正はないため目安) =====
         self.s_meter_dbfs = -90.0
         self.s_units = 0.0
-        self._am_th = 0.0
-        self._am_ig = 0.0
-        self._am_ef = 0.0
-        self._am_sync_mix = 0.0
-        # ループ帯域 ~20Hz (搬送波のドリフトに追従しつつ変調側波帯は追わない)
-        self.am_kp = 3.0e-4
-        self.am_ki = 5.0e-8
-        # ループ帯域を約10Hz級へ狭帯域化 (旧100Hzでは低音音声がVCOを変調し
-        # 混変調歪みを誘発)。ロックが遅くなってもmixが包絡線へ自動復帰する。
-        self._am_alpha = 2.0 * np.pi * 30.0 / self.if_rate
 
         # スペクトラム表示設定
         self.fft_size = 1024

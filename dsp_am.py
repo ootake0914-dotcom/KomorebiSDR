@@ -8,6 +8,7 @@ import ctypes
 
 import numpy as np
 
+from dsp_filters import design_fir_kaiser
 from dsp_native import (
     _NATIVE,
     NATIVE_AM_SYNC,
@@ -209,3 +210,39 @@ class DspAmMixin:
         tau = 0.5 if target > self._am_sync_mix else 2.5
         self._am_sync_mix += (1.0 - np.exp(-dt / tau)) * (target - self._am_sync_mix)
         return out
+
+    def _init_am_state(self):
+        """AM用FIR・AGC・同期検波等の状態初期化 (__init__ から純粋移動)。"""
+        # AM用ローパス (±6kHz: 中波放送用)
+        cutoff_am = 6000.0 / self.rf_rate
+        self.fir_am = design_fir_kaiser(num_taps=81, cutoff_norm=cutoff_am, beta=6.5)
+
+        # 短波放送用 狭帯域AMローパス (±3.5kHz: 短波HF帯の混信をカット)
+        cutoff_am_narrow = 3500.0 / self.rf_rate
+        self.fir_am_narrow = design_fir_kaiser(num_taps=97, cutoff_norm=cutoff_am_narrow, beta=7.0)
+        # AM/SSB通信用 4kHzローパス (8.5kHzでは短波のヒスを通しすぎるため)
+        cutoff_am_audio = 4000.0 / self.audio_rate
+        self.fir_am_audio = design_fir_kaiser(num_taps=81, cutoff_norm=cutoff_am_audio, beta=7.0)
+        self.am_agc_level = 0.0  # AM搬送波レベルAGC状態
+        self._am_agc_hang = 0  # AGCハングタイマ (残ブロック数)
+        self.impulse_blanker_enabled = True  # AMインパルスノイズブランカ
+        # ===== AM同期検波 (キャリア再生PLL) =====
+        # 選択性フェージング時のひずみを避けるため、包絡線検波ではなく
+        # キャリアに同期した同相検波を使う。ロックできない時は包絡線へ自動復帰。
+        self.am_sync_enabled = True
+        self.am_sync_lock = 0.0
+        # ===== AM/SSB 適応音声帯域 =====
+        # ヒスが多い時は音声帯域を狭めて了解度を上げる (自動トーンコントロール)
+        self.voice_auto_bw = True
+        self.voice_cut_hz = 4000.0
+        self._vc_ratio_db = -40.0
+        self._am_th = 0.0
+        self._am_ig = 0.0
+        self._am_ef = 0.0
+        self._am_sync_mix = 0.0
+        # ループ帯域 ~20Hz (搬送波のドリフトに追従しつつ変調側波帯は追わない)
+        self.am_kp = 3.0e-4
+        self.am_ki = 5.0e-8
+        # ループ帯域を約10Hz級へ狭帯域化 (旧100Hzでは低音音声がVCOを変調し
+        # 混変調歪みを誘発)。ロックが遅くなってもmixが包絡線へ自動復帰する。
+        self._am_alpha = 2.0 * np.pi * 30.0 / self.if_rate

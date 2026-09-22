@@ -5,6 +5,7 @@
 """
 
 import math
+from collections import deque
 
 import numpy as np
 
@@ -187,3 +188,43 @@ class DspBlackMagicMixin:
             return 0.25
         except Exception:
             return 0.25
+
+    def _init_bm_state(self):
+        """黒魔法フラグ・履歴の初期化 (__init__ から純粋移動)。"""
+        # ===== 黒魔法三点セット (弱電界検出補助。既定は全て無効) =====
+        # master=self.black_magic_enabled がFalseの間は一切動作せず、
+        # 既存経路とビット同一の出力を保つ (tests/test_black_magic.pyで検証)。
+        # 各インスタンスは遅延生成 (有効化時のみ) し、失敗時はNoneのまま
+        # 既存経路へフォールバックする。
+        self.black_magic_enabled = False
+        self.bm_cyclo_enabled = False
+        self.bm_rmt_enabled = False
+        self.bm_sr_enabled = False
+        self.bm_notch_enabled = False
+        self.bm_sq_assist_enabled = False
+        self.bm_sq_open_conf = 0.75
+        self.bm_sq_close_conf = 0.55
+        self.bm_sq_close_smeter_db = -25.0
+        self.bm_sq_open_smeter_db = -40.0
+        self.bm_sq_min_close_blocks = 20
+        self.bm_seek_enabled = False
+        self._bm_sq_open = True  # 起動時は開 (いきなりミュートしない)
+        self._bm_sq_gain = 1.0
+        self._bm_sq_hold = 0
+        self.cyclo_detector = None
+        self.bm_rmt = None
+        self.bm_sr = None
+        self.bm_notch = None
+        self.bm_controller = None
+        self.bm_cyclo_min_conf = 0.55
+        self.bm_cyclo_confidence = 0.0
+        self.bm_sr_confidence = 0.0
+        self.bm_rmt_cap = 0.65
+        # main.pyから渡される黒魔法パラメータ (configのblack_magic節)。
+        # 遅延生成インスタンスのコンストラクタに反映する。既定は空=内蔵既定。
+        self.bm_cfg = {}
+        # flutter検出用lock履歴 (直近32ブロック) と判定閾値
+        self._bm_lock_hist = deque(maxlen=32)
+        self.bm_flutter_std = 0.15
+        self._bm_params = None
+        self._bm_last_rmt_info = None
