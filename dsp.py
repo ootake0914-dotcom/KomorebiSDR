@@ -351,12 +351,21 @@ class SdrDspPipeline:
         self.stereo_hiss_db = -60.0       # (L-R)ヒス指標 (初期値=クリーン, NR不発動)
         self._nr_cut_max_hz = 15000.0
         self._nr_cut_min_hz = 5000.0
+        # 固定高域ブレンド上限: FMステレオ副搬送波(38kHz DSB)の三角雑音は
+        # 高域ほど大きく、強局でも12-15kHzで番組と同程度まで残る (実測: ラッキーFM
+        # 94.6MHz 強電界で S高域ノイズが番組-5dB)。ヒス指標に依らず常時S側を
+        # 13kHzで緩く減衰させる (カーラジオ標準の高域ブレンド。低域のステレオ感は不変)。
+        self._nr_cut_fixed_hz = 13000.0
         # ブレンド量 (極端に弱い局のみモノラル化。通常はWienerが周波数別に処理)
         self._nr_lo_db = -18.0
         self._nr_hi_db = -4.0
         # Wiener適用量 (これより上のノイズで段階的にサブバンド抑圧)
-        self._nr_wiener_lo_db = -40.0
-        self._nr_wiener_hi_db = -18.0
+        # 実測: 強局(ラッキーFM 94.6)でも副搬送波ヒスは-36dBあり、旧-40/-18では
+        # 適用度0.1しか立たず12-15kHzのヒスが残った。サブバンドWienerは
+        # 知覚マスキングゲート内蔵で番組高域を保護するため、適用域を下げて
+        # 「聞こえるヒス」を抑える (ブレンド側しきい値は据え置き=高域ブレンド不要)。
+        self._nr_wiener_lo_db = -46.0
+        self._nr_wiener_hi_db = -26.0
         self._nr_primed = False
         self._nr_s_w = 0.0                # 平滑化されたWiener適用度 (0=off, 1=full)
         self._nr_s = 0.0                  # 平滑化されたノイズ度 (0=クリーン, 1=ノイズ)
@@ -1243,6 +1252,9 @@ class SdrDspPipeline:
         self.stereo_cut_hz = self._nr_cut_max_hz * (
             (self._nr_cut_min_hz / self._nr_cut_max_hz) ** self._nr_s
         )
+        # 固定高域ブレンド: 副搬送波ヒス対策で常時上限を適用 (適応側がそれ以上
+        # 絞る場合はそちらを優先)
+        self.stereo_cut_hz = min(self.stereo_cut_hz, self._nr_cut_fixed_hz)
 
     def _diff_lowpass(self, x: np.ndarray, cutoff_hz: float) -> np.ndarray:
         """差信号用の可変ローパス。同一長の線形位相FIRを2本クロスフェードし、
