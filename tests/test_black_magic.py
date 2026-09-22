@@ -283,17 +283,19 @@ def test_squelch_assist_config():
     assert bm["enabled"] is False
     assert bm["open_conf"] == 0.75 and bm["close_conf"] == 0.55
     assert bm["min_close_blocks"] == 20
+    assert DEFAULT_CONFIG["black_magic"]["seeking"]["enabled"] is False
     out = _clean_black_magic({"squelch_assist": {"enabled": True, "open_conf": 5.0,
                                                  "close_smeter_db": 99.0,
-                                                 "min_close_blocks": 999}})
+                                                 "min_close_blocks": 999},
+                              "seeking": {"enabled": True}})
     assert out["squelch_assist"]["enabled"] is True
     assert out["squelch_assist"]["open_conf"] == 1.0
     assert out["squelch_assist"]["close_smeter_db"] == 0.0
     assert out["squelch_assist"]["min_close_blocks"] == 200
+    assert out["seeking"]["enabled"] is True
 
 
-def test_squelch_min_close_hold():
-    # 深フェード呼吸: 最小閉保持で遷移が減り、ミュートが決定的になる
+def test_squelch_min_close_hold():    # 深フェード呼吸: 最小閉保持で遷移が減り、ミュートが決定的になる
     from dsp import SdrDspPipeline
     for hold, max_tr in ((0, 99), (20, 6)):
         dsp = SdrDspPipeline(1152000, 48000)
@@ -311,6 +313,52 @@ def test_squelch_min_close_hold():
         tr = sum(abs(int(b) - int(a)) for a, b in zip(states, states[1:]))
         assert tr <= max_tr, f"hold={hold}で遷移{tr}"
     assert min(gains) < 0.5, "閉保持中にgainが落ちない"
+
+
+def test_quality_and_seeker():
+    from black_magic import quality_score, ExtremumSeeker
+    # Q: 良条件ほど高く、chatter/damage/CPUで減点。非有限は安全側
+    q_good = quality_score(conf=0.9, blend=1.0)
+    q_bad = quality_score(conf=0.1, blend=0.0, chatter_event=True,
+                          cpu_percent=90.0, hf_loss_db=-8.0)
+    assert q_good > q_bad
+    assert quality_score(conf=float("nan")) <= q_good
+    assert quality_score(hf_loss_db=float("inf")) <= q_good
+    # Seeker: 放物線Qで最適点 (offset +0.1) に収束する
+    s = ExtremumSeeker(lo=-0.2, hi=0.2, step=0.05, eval_blocks=4,
+                       freeze_rounds=3)
+    for _ in range(200):
+        off = s.update(-((s.offset - 0.1) ** 2) + 1.0, 0.0)
+    assert abs(s.offset - 0.1) < 0.03, f"未収束: {s.offset}"
+    assert s.frozen is True  # 改善停止で凍結
+    # 範囲外に出ない
+    s2 = ExtremumSeeker(lo=-0.2, hi=0.2, step=0.05, eval_blocks=2)
+    for _ in range(60):
+        s2.update(10.0, 0.0)  # 単調増加でも上限止まり
+    assert -0.2 <= s2.offset <= 0.2
+    # 環境変化で再開
+    assert s.frozen is True
+    s.update(0.0, 20.0)
+    assert s.frozen is False
+    # 非有限入力で落ちない
+    s.update(float("nan"), 0.0)
+
+
+def test_controller_seek_integration():
+    # seek無効時は従来通り (既存挙動の保護)
+    c = BlackMagicController(enabled=True)
+    outs = [c.process_metrics({"snr_db": 0.0, "pilot_confidence": 0.5})
+            for _ in range(5)]
+    assert all("q_score" in o for o in outs)
+    base_caps = [o["rmt_cap"] for o in outs]
+    c2 = BlackMagicController(enabled=True, seek_enabled=True)
+    seen = [c2.process_metrics({"snr_db": 0.0, "pilot_confidence": 0.5})
+            for _ in range(40)]
+    caps = [o["rmt_cap"] for o in seen]
+    assert all(0.0 <= v <= 0.85 for v in caps)  # 範囲遵守
+    assert seen[-1]["q_score"] is not None
+    c2.reset()
+    assert c2.seeker.offset == 0.0 and c2.seeker.frozen is False
 
 
 def main() -> int:
@@ -345,6 +393,10 @@ def main() -> int:
         print("[*] スケルチ設定 OK")
         test_squelch_min_close_hold()
         print("[*] 最小閉保持 OK")
+        test_quality_and_seeker()
+        print("[*] Q関数・収束 OK")
+        test_controller_seek_integration()
+        print("[*] 収束統合 OK")
     except AssertionError as e:
         print(f"FAILED: {e}")
         return 1

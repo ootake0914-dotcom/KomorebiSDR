@@ -233,6 +233,9 @@ DEFAULT_CONFIG = {
             "open_smeter_db": -40.0,
             "min_close_blocks": 20,  # 一度閉じたら最低保持 (呼吸防止)
         },
+        "seeking": {
+            "enabled": False,      # 既定無効 (Q最適収束。RMT capの微調整のみ)
+        },
     },
 }
 
@@ -332,6 +335,10 @@ def _clean_black_magic(v) -> dict:
         _num(q, "close_smeter_db", -120.0, 0.0)
         _num(q, "open_smeter_db", -120.0, 0.0)
         _num(q, "min_close_blocks", 0, 200, integer=True)
+    sk = v.get("seeking")
+    if isinstance(sk, dict):
+        if isinstance(sk.get("enabled"), bool):
+            out["seeking"]["enabled"] = sk["enabled"]
     return out
 
 

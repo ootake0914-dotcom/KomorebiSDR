@@ -355,6 +355,7 @@ class SdrDspPipeline:
         self.bm_sq_close_smeter_db = -25.0
         self.bm_sq_open_smeter_db = -40.0
         self.bm_sq_min_close_blocks = 20
+        self.bm_seek_enabled = False
         self._bm_sq_open = True  # 起動時は開 (いきなりミュートしない)
         self._bm_sq_gain = 1.0
         self._bm_sq_hold = 0
@@ -2640,6 +2641,9 @@ class SdrDspPipeline:
                 if self.bm_controller is None and BlackMagicController is not None:
                     self.bm_controller = BlackMagicController(enabled=True)
                 if self.bm_controller is not None:
+                    self.bm_controller.seek_enabled = bool(
+                        getattr(self, "bm_seek_enabled", False))
+                if self.bm_controller is not None:
                     _bm_cpu = 0.0
                     try:
                         _bm_dt = len(iq_if) / float(self.if_rate)
@@ -2661,6 +2665,8 @@ class SdrDspPipeline:
                                                              1.0)),
                         "cpu_percent": float(min(max(_bm_cpu, 0.0), 100.0)),
                         "audio_degraded": bool(_bm_deg),
+                        "hf_loss_db": float(_bm_last.get("hf_loss_db", 0.0)),
+                        "rms_diff_db": float(_bm_last.get("rms_diff_db", 0.0)),
                     })
                     if not self._bm_params.get("bypass_all", True):
                         self.bm_rmt_cap = float(self._bm_params.get("rmt_cap", 0.0))

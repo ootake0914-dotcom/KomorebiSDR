@@ -136,6 +136,21 @@ dsp.bm_sr_enabled = True      # C (副経路のみ。スケルチ自動反映な
   `black_magic.adaptive_notch.enabled`＋`dsp.bm_notch_enabled`。
   ハーネスは`--bm notch`。
 
+## Q最適収束系 (調停者の完成)
+
+- `quality_score`: Q = 0.4conf＋0.3blend−0.5chatter−0.2cpu−0.5damage
+  (測れる量のみ。非有限は安全側)。
+- `ExtremumSeeker`: 1次元山登り (8blk評価・反転でstep×0.7・
+  3回停滞で凍結・SNR±6dBで再開・offset±0.2)。同時駆動禁止。
+- 統合: base方策は不変、seekerは±0.2のoffsetのみ
+  (`rmt_cap`に加算・上限0.85)。既定OFF
+  (`black_magic.seeking.enabled`＋`dsp.bm_seek_enabled`)。
+- 実測: 弱局録音でoffset +0.17まで適応後凍結、音声正常。
+  注意: 実番組ではQが平坦で bounds まで漂うことがある
+  (damage≈0のため)。凍結で発散はしない。
+- 同時駆動の禁止・時定数分離・凍結の3点が収束の条件
+  (詳細はコードの設計コメント参照)。
+
 ## ① cyclo→スケルチ統合 (推し筆頭・実装済み)
 
 - 二基準ヒステリシス: 開=conf>0.75 or S>-40dBFS、

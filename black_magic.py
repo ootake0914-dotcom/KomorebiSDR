@@ -27,6 +27,107 @@ def _f(v, default=0.0):
     return f if math.isfinite(f) else default
 
 
+def quality_score(conf=0.0, blend=0.0, chatter_event=False, cpu_percent=0.0,
+                  hf_loss_db=0.0, rms_diff_db=0.0,
+                  w_conf=0.4, w_blend=0.3, w_chatter=0.5, w_cpu=0.2,
+                  w_damage=0.5):
+    """受信品質Qの単一スカラー (単調・副作用なし)。
+
+    Q = w_conf*conf + w_blend*blend - w_chatter*chatter
+        - w_cpu*cpu/100 - w_damage*damage。
+    damageは音声劣化の超過分 (|hf|>1dB・|rms差|>1dBの超過を正規化)。
+    非有限入力は安全側 (低Q) に倒す。
+    """
+    try:
+        c = _f(conf)
+        b = _f(blend)
+        ch = 1.0 if chatter_event else 0.0
+        cpu = min(max(_f(cpu_percent), 0.0), 100.0) / 100.0
+        dmg = (max(0.0, abs(_f(hf_loss_db)) - 1.0) / 6.0
+               + max(0.0, abs(_f(rms_diff_db)) - 1.0) / 6.0)
+        for w in (w_conf, w_blend, w_chatter, w_cpu, w_damage):
+            if not math.isfinite(float(w)):
+                return 0.0
+        return (float(w_conf) * min(max(c, 0.0), 1.0)
+                + float(w_blend) * min(max(b, 0.0), 1.0)
+                - float(w_chatter) * ch
+                - float(w_cpu) * cpu
+                - float(w_damage) * min(dmg, 2.0))
+    except Exception:
+        return 0.0
+
+
+class ExtremumSeeker:
+    """1次元山登り (perturb-and-observe)。同時駆動はしない (干渉防止)。
+
+    Nブロック毎に平均Qを評価し、改善方向へstepを進める。
+    反転したらstepを減衰、下限で打止め。M回連続非改善で凍結し、
+    環境変化 (|snr差|>thresh) で再開する。出力はbound内のoffset。
+    """
+
+    def __init__(self, lo=-0.2, hi=0.2, step=0.05, eval_blocks=8,
+                 freeze_rounds=3, resume_snr_db=6.0):
+        self.lo = float(lo)
+        self.hi = float(hi)
+        self.step0 = float(step)
+        self.eval_blocks = int(max(2, eval_blocks))
+        self.freeze_rounds = int(max(1, freeze_rounds))
+        self.resume_thr = float(resume_snr_db)
+        self.reset()
+
+    def reset(self):
+        self.offset = 0.0
+        self.step = self.step0
+        self.direction = 1.0
+        self._q_sum = 0.0
+        self._q_n = 0
+        self._best = None
+        self._stale = 0
+        self.frozen = False
+        self._snr_frozen = None
+
+    def update(self, q, snr_db):
+        """1ブロック分のQを投入 → 現在のoffsetを返す。"""
+        try:
+            qf = float(q)
+            snr = float(snr_db)
+        except (TypeError, ValueError):
+            return float(self.offset)
+        if not (math.isfinite(qf) and math.isfinite(snr)):
+            return float(self.offset)
+        if self.frozen:
+            # 環境変化で再開
+            if (self._snr_frozen is not None
+                    and abs(snr - self._snr_frozen) > self.resume_thr):
+                self.frozen = False
+                self._stale = 0
+                self.step = self.step0
+            else:
+                return float(self.offset)
+        self._q_sum += qf
+        self._q_n += 1
+        if self._q_n < self.eval_blocks:
+            return float(self.offset)
+        mean_q = self._q_sum / self._q_n
+        self._q_sum = 0.0
+        self._q_n = 0
+        if self._best is None or mean_q > self._best + 1e-9:
+            self._best = mean_q
+            self._stale = 0
+            self.offset = min(max(self.offset + self.direction * self.step,
+                                  self.lo), self.hi)
+        else:
+            self._stale += 1
+            self.direction *= -1.0
+            self.step = max(self.step * 0.7, 0.01)
+            self.offset = min(max(self.offset + self.direction * self.step,
+                                  self.lo), self.hi)
+            if self._stale >= self.freeze_rounds:
+                self.frozen = True
+                self._snr_frozen = snr
+        return float(self.offset)
+
+
 # モード別プリセット (Phase 3-1: 自動プロファイルの表)。
 # 音声を壊しうる処理はAM/SSB等の非FMでは使わない。
 PROFILES = {
@@ -73,7 +174,7 @@ class BlackMagicController:
     def __init__(self, enabled=False, smooth_alpha=0.2,
                  strong_snr_db=30.0, weak_snr_db=12.0,
                  cpu_warn_percent=70.0, cpu_max_percent=90.0,
-                 rmt_strong_cap=0.05):
+                 rmt_strong_cap=0.05, seek_enabled=False):
         self.enabled = bool(enabled)
         self.alpha = float(min(max(smooth_alpha, 0.01), 1.0))
         self.strong_snr = float(strong_snr_db)
@@ -81,6 +182,8 @@ class BlackMagicController:
         self.cpu_warn = float(cpu_warn_percent)
         self.cpu_max = float(cpu_max_percent)
         self.rmt_strong_cap = float(rmt_strong_cap)
+        self.seek_enabled = bool(seek_enabled)
+        self.seeker = ExtremumSeeker()
         self.reset()
 
     def reset(self):
@@ -92,6 +195,8 @@ class BlackMagicController:
         self._clear_n = 0
         self.blocks = 0
         self._last_out = None
+        self._prev_blend = None
+        self.seeker.reset()
 
     def describe(self):
         """現在の状態を人間可読辞書で返す (Phase 3-2: チューニング表示用API)。
@@ -109,6 +214,10 @@ class BlackMagicController:
             "sr": "active" if o.get("sr_active") else "standby",
             "reason": str(o.get("reason", "disabled")),
             "blocks": int(self.blocks),
+            "q_score": o.get("q_score", None),
+            "seek": {"enabled": bool(self.seek_enabled),
+                     "offset": float(self.seeker.offset),
+                     "frozen": bool(self.seeker.frozen)},
         }
 
     def _ema(self, prev, target):
@@ -197,13 +306,28 @@ class BlackMagicController:
                   and self._cpu < self.cpu_max)
             # cyclo助言: 弱信号またはconfidence低で有効 (PLL置換ではなく助言)
             cyclo = weak or pilot_conf < 0.55
+            # Q評価＋収束 (seek有効時のみ。base方策は変えない)
+            blend_v = _f(metrics.get("stereo_blend", 0.0))
+            chatter_ev = (self._prev_blend is not None
+                          and (self._prev_blend > 0.5) != (blend_v > 0.5))
+            self._prev_blend = blend_v
+            q = quality_score(
+                conf=pilot_conf, blend=blend_v, chatter_event=chatter_ev,
+                cpu_percent=self._cpu,
+                hf_loss_db=_f(metrics.get("hf_loss_db", 0.0)),
+                rms_diff_db=_f(metrics.get("rms_diff_db", 0.0)))
+            rmt_final = float(max(0.0, self._rmt_cap))
+            if self.seek_enabled:
+                off = self.seeker.update(q, self._snr)
+                rmt_final = float(min(max(self._rmt_cap + off, 0.0), 0.85))
             out.update({
                 "bypass_all": False, "reason": reason,
                 "cyclo_active": bool(cyclo),
                 "blend_attack_limit": 0.05 if (cyclo and pilot_conf < 0.55) else 0.25,
-                "rmt_cap": float(max(0.0, self._rmt_cap)),
+                "rmt_cap": rmt_final,
                 "sr_active": bool(sr),
                 "snr_smooth": float(self._snr),
+                "q_score": float(q),
             })
         except Exception:
             out.update({"bypass_all": True, "reason": "failsafe-exception",
