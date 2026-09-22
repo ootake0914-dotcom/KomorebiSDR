@@ -349,6 +349,13 @@ class SdrDspPipeline:
         self.bm_rmt_enabled = False
         self.bm_sr_enabled = False
         self.bm_notch_enabled = False
+        self.bm_sq_assist_enabled = False
+        self.bm_sq_open_conf = 0.75
+        self.bm_sq_close_conf = 0.55
+        self.bm_sq_close_smeter_db = -25.0
+        self.bm_sq_open_smeter_db = -40.0
+        self._bm_sq_open = True  # 起動時は開 (いきなりミュートしない)
+        self._bm_sq_gain = 1.0
         self.cyclo_detector = None
         self.bm_rmt = None
         self.bm_sr = None
@@ -637,6 +644,10 @@ class SdrDspPipeline:
         self._stereo_blend = 0.0
         self.stereo_blend = 0.0
         self._pilot_hold_n = 0
+        # スケルチ統合も開状態から (前局のミュートを持ち越さない。
+        # AM等WFM外ではhelperが呼ばれないためここで戻す)
+        self._bm_sq_open = True
+        self._bm_sq_gain = 1.0
         self._trim_dir = 1.0
         self._trim_block = 0
         self._trim_primed = False
@@ -689,6 +700,8 @@ class SdrDspPipeline:
             pass
         self.bm_cyclo_confidence = 0.0
         self.bm_sr_confidence = 0.0
+        self._bm_sq_open = True
+        self._bm_sq_gain = 1.0
         try:
             if getattr(self, "_bm_lock_hist", None) is not None:
                 self._bm_lock_hist.clear()
@@ -1228,6 +1241,11 @@ class SdrDspPipeline:
                         self.bm_sr_confidence = base_conf
             except Exception:
                 pass
+
+        # 黒魔法①: cyclo→スケルチ統合 (既定OFF)。1ブロック遅れのconfidenceと
+        # S-meterで開閉を決め、ソフトフェードゲインに反映する。音声への適用は
+        # process()終端 (スローAGC後) で行う。音声自体は変えない。
+        self._bm_update_squelch_assist()
 
         # AFC (Automatic Frequency Control): 復調信号のDCバイアスから周波数偏差を推定してフィードバック
         if self.afc_enabled and len(demod) > 0:
@@ -1908,6 +1926,51 @@ class SdrDspPipeline:
             audio = self.mono_nr.process(audio, ch=ch)
 
         return audio.astype(np.float32)
+
+    def _bm_update_squelch_assist(self) -> float:
+        """cyclo検出→スケルチの二基準ヒステリシス＋ソフトフェード (既定OFF)。
+
+        開: conf>open_conf (pilot在り) または S>open_smeter (強信号)。
+        閉: conf<close_conf かつ S<close_smeter (弱い局間ノイズのみ)。
+        閉閾値は-25dBFS: それより強いノイズ (-16dB級の熱い局間) は
+        電力スケルチの仕事とし、ここでは閉じない (弱局-27dBFSとの
+        エネルギー重なりを避ける。conf側で分別する)。
+        モノラル強局 (conf=0だがS高) は開のまま＝誤ミュートしない。
+        開は速く (0.25/block)、閉は遅く (0.05/block) しchatterを防ぐ。
+        戻り値は0.0〜1.0のゲイン。例外時は現状維持 (跳ばせない)。
+        """
+        try:
+            if not (getattr(self, "black_magic_enabled", False)
+                    and getattr(self, "bm_sq_assist_enabled", False)):
+                self._bm_sq_open = True
+                self._bm_sq_gain = 1.0
+                return 1.0
+            conf = float(getattr(self, "bm_cyclo_confidence", 0.0))
+            s_db = float(getattr(self, "s_meter_dbfs", -90.0))
+            if not (math.isfinite(conf) and math.isfinite(s_db)):
+                return float(self._bm_sq_gain)
+            open_conf = float(getattr(self, "bm_sq_open_conf", 0.75))
+            close_conf = float(getattr(self, "bm_sq_close_conf", 0.55))
+            close_s = float(getattr(self, "bm_sq_close_smeter_db", -25.0))
+            open_s = float(getattr(self, "bm_sq_open_smeter_db", -40.0))
+            if conf > open_conf:
+                self._bm_sq_open = True
+            elif conf < close_conf and s_db < close_s:
+                self._bm_sq_open = False
+            elif s_db > open_s:
+                self._bm_sq_open = True
+            # else: 保持 (ヒステリシス)
+            target = 1.0 if self._bm_sq_open else 0.0
+            g = float(self._bm_sq_gain)
+            step = 0.25 if target > g else 0.05
+            g += max(-step, min(step, target - g))
+            self._bm_sq_gain = float(min(max(g, 0.0), 1.0))
+            return self._bm_sq_gain
+        except Exception:
+            try:
+                return float(self._bm_sq_gain)
+            except Exception:
+                return 1.0
 
     def _bm_attack_limit(self, lock: float) -> float:
         """黒魔法Aのblend上昇レート (既定0.25=従来動作)。
@@ -2638,6 +2701,21 @@ class SdrDspPipeline:
         # TPDFディザー & 音響心理ノイズシェーピング (微小信号の量子化高調波歪みを根絶)
         if getattr(self, "dither", None) is not None and self.dither.enabled:
             audio_clean = self.dither.process_float(audio_clean)
+
+        # 黒魔法①: cyclo→スケルチ統合の最終適用 (既定OFF)。
+        # スローAGCより後段に置く。前段だとAGCがミュートを持ち上げて
+        # 無効化することを実測で確認 (ノイズRMS 0.45のまま)。
+        # WFM以外では直前値を維持するが、選局・モード切替は必ず
+        # set_offset_freqを経由し開に戻るため漏れない。
+        try:
+            _sq = float(getattr(self, "_bm_sq_gain", 1.0)) if mode == "WFM" else 1.0
+        except Exception:
+            _sq = 1.0
+        if _sq < 0.999:
+            try:
+                audio_clean = (np.asarray(audio_clean) * _sq).astype(np.float32)
+            except Exception:
+                pass
 
         return audio_clean, spectrum_db
 

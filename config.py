@@ -225,6 +225,13 @@ DEFAULT_CONFIG = {
             "max_harmonic": 5,
             "line_on_db": 8.0,
         },
+        "squelch_assist": {
+            "enabled": False,      # 既定無効 (cyclo→スケルチ統合)
+            "open_conf": 0.75,     # これ超で開
+            "close_conf": 0.55,    # これ割れ＋S低で閉 (ヒステリシス)
+            "close_smeter_db": -25.0,
+            "open_smeter_db": -40.0,
+        },
     },
 }
 
@@ -314,6 +321,15 @@ def _clean_black_magic(v) -> dict:
         _num(a, "base_hz", 0.0, 100.0)
         _num(a, "max_harmonic", 1, 9, integer=True)
         _num(a, "line_on_db", 0.0, 40.0)
+    q = v.get("squelch_assist")
+    if isinstance(q, dict):
+        out_sub = out["squelch_assist"]
+        if isinstance(q.get("enabled"), bool):
+            out_sub["enabled"] = q["enabled"]
+        _num(q, "open_conf", 0.0, 1.0)
+        _num(q, "close_conf", 0.0, 1.0)
+        _num(q, "close_smeter_db", -120.0, 0.0)
+        _num(q, "open_smeter_db", -120.0, 0.0)
     return out
 
 

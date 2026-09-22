@@ -136,6 +136,20 @@ dsp.bm_sr_enabled = True      # C (副経路のみ。スケルチ自動反映な
   `black_magic.adaptive_notch.enabled`＋`dsp.bm_notch_enabled`。
   ハーネスは`--bm notch`。
 
+## ① cyclo→スケルチ統合 (推し筆頭・実装済み)
+
+- 二基準ヒステリシス: 開=conf>0.75 or S>-40dBFS、
+  閉=conf<0.55 かつ S<-25dBFS、開速0.25/閉遅0.05 per block。
+- モノラル強局はconf=0でもS高で開のまま (誤ミュートなし・検証済み)。
+- 適用はprocess終端 (スローAGC後)。前段だとAGCが持ち上げて無効化
+  されることを実測 (ノイズRMS 0.45のまま→終端移設で無音化)。
+- `bm_cyclo_enabled`併用が必須 (confidence源)。選局時は開から開始。
+- 実録音: 弱局77.5MHzで開率100%・遷移0 (従来blendは0-1で暴走)。
+  熱い局間 (-16dBFS級) は電力スケルチの仕事として開のまま (制限事項)。
+  冷たい局間 (合成S-40dBFS) は約1.4秒で無音化。
+- 設定: `black_magic.squelch_assist`＋`dsp.bm_sq_assist_enabled`
+  (いずれも既定OFF)。
+
 ## CMAゲート締め直し＋2-2評価 ( synth測定に基づく)
 
 - 症状: 77.5MHz実測で`multipath_amount=1.0`飽和→CMAが常時作動。

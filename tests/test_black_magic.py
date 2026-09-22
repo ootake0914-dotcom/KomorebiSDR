@@ -198,6 +198,98 @@ def test_profile_and_describe():
     assert d1["blocks"] == 1 and isinstance(d1["snr_db"], float)
 
 
+def test_squelch_assist_hysteresis():
+    # 二基準ヒステリシス: ノイズで閉じ、弱局・強モノラルで開く。既定OFFは素通し
+    from dsp import SdrDspPipeline
+    dsp = SdrDspPipeline(1152000, 48000)
+    assert dsp._bm_update_squelch_assist() == 1.0  # 既定OFF
+    dsp.black_magic_enabled = True
+    dsp.bm_sq_assist_enabled = True
+    # 局間ノイズ (conf低・S低) →閉じる
+    dsp.bm_cyclo_confidence = 0.1
+    dsp.s_meter_dbfs = -60.0
+    for _ in range(30):
+        g = dsp._bm_update_squelch_assist()
+    assert dsp._bm_sq_open is False and g == 0.0
+    # 弱ステレオ局 (conf高・S中) →速く開く
+    dsp.bm_cyclo_confidence = 0.9
+    dsp.s_meter_dbfs = -27.0
+    g1 = dsp._bm_update_squelch_assist()
+    assert dsp._bm_sq_open is True and g1 > 0.0
+    for _ in range(10):
+        g = dsp._bm_update_squelch_assist()
+    assert g == 1.0
+    # 強モノラル局 (conf=0だがS高) →開のまま (誤ミュート防止)
+    dsp.bm_cyclo_confidence = 0.0
+    dsp.s_meter_dbfs = -10.0
+    for _ in range(10):
+        g = dsp._bm_update_squelch_assist()
+    assert dsp._bm_sq_open is True and g == 1.0
+    # 中間帯の往復でチャタらない (保持)
+    dsp.bm_cyclo_confidence = 0.65
+    dsp.s_meter_dbfs = -45.0
+    states = set()
+    for _ in range(20):
+        dsp._bm_update_squelch_assist()
+        states.add(dsp._bm_sq_open)
+    assert len(states) == 1, f"中間帯でchatter: {states}"
+    # 非有限→現状維持 (跳ばない)
+    dsp.bm_cyclo_confidence = float("nan")
+    assert dsp._bm_update_squelch_assist() == 1.0
+
+
+def test_squelch_assist_pipeline():
+    # 実パイプライン: モノラル強局はミュートされない／ノイズは消える
+    from dsp import SdrDspPipeline
+    from test_stereo import make_raw, BLOCK, NBLK
+    raw_mono = make_raw(False)
+    outs = {}
+    for assist in (False, True):
+        dsp = SdrDspPipeline(1152000, 48000)
+        dsp.set_offset_freq(0.0)
+        dsp.afc_enabled = False
+        dsp.cognitive_enabled = False
+        dsp.black_magic_enabled = assist
+        dsp.bm_sq_assist_enabled = assist
+        chunks = []
+        for k in range(6):
+            audio, _ = dsp.process(raw_mono[k * BLOCK:(k + 1) * BLOCK], mode="WFM")
+            chunks.append(np.asarray(audio).reshape(-1))
+        outs[assist] = np.concatenate(chunks)
+    rms_off = float(np.sqrt(np.mean(outs[False] ** 2)))
+    rms_on = float(np.mean(np.abs(outs[True])))
+    assert rms_on > 0.3 * rms_off, f"モノラル強局がミュートされた: {rms_on:.4f}/{rms_off:.4f}"
+    # ノイズraw (冷たい局間相当・S約-40dBFS) は消える。
+    # 閉は0.05/blockのスローなため25ブロック回す (約1.4秒で無音化。急な
+    # ミュートでアタックを切らない設計)。
+    rng = np.random.default_rng(0)
+    raw_n = rng.integers(125, 131, BLOCK * 25).astype(np.uint8)
+    dsp = SdrDspPipeline(1152000, 48000)
+    dsp.set_offset_freq(0.0)
+    dsp.afc_enabled = False
+    dsp.cognitive_enabled = False
+    dsp.black_magic_enabled = True
+    dsp.bm_sq_assist_enabled = True
+    chunks = []
+    for k in range(25):
+        audio, _ = dsp.process(raw_n[k * BLOCK:(k + 1) * BLOCK], mode="WFM")
+        chunks.append(np.asarray(audio).reshape(-1))
+    tail = np.concatenate(chunks)[-2752 * 5:]
+    rms_n = float(np.sqrt(np.mean(tail ** 2)))
+    assert rms_n < 0.05, f"ノイズが消えない: {rms_n:.4f}"
+
+
+def test_squelch_assist_config():
+    bm = DEFAULT_CONFIG["black_magic"]["squelch_assist"]
+    assert bm["enabled"] is False
+    assert bm["open_conf"] == 0.75 and bm["close_conf"] == 0.55
+    out = _clean_black_magic({"squelch_assist": {"enabled": True, "open_conf": 5.0,
+                                                 "close_smeter_db": 99.0}})
+    assert out["squelch_assist"]["enabled"] is True
+    assert out["squelch_assist"]["open_conf"] == 1.0
+    assert out["squelch_assist"]["close_smeter_db"] == 0.0
+
+
 def main() -> int:
     try:
         test_disabled_bypass()
@@ -222,6 +314,12 @@ def main() -> int:
         print("[*] ラチェット防止 OK")
         test_profile_and_describe()
         print("[*] プロファイル・状態表示 OK")
+        test_squelch_assist_hysteresis()
+        print("[*] スケルチ統合ヒステリシス OK")
+        test_squelch_assist_pipeline()
+        print("[*] スケルチ実経路 OK")
+        test_squelch_assist_config()
+        print("[*] スケルチ設定 OK")
     except AssertionError as e:
         print(f"FAILED: {e}")
         return 1
