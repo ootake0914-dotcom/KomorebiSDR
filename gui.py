@@ -387,13 +387,10 @@ class SdrGui:
         lbl_tune = cached_text(self.font_title, t("tuning"), C_MUTED)
         baked.blit(lbl_tune, (self.tune_rect.x + 14, self.tune_rect.y + 8))
         lbl_mode = cached_text(self.font_tiny, t("mode"), C_MUTED)
-        baked.blit(lbl_mode, (self.tune_rect.x + 14, self.tune_rect.y + 156))
+        baked.blit(lbl_mode, (self.tune_rect.x + 14, self.tune_rect.y + 170))
 
         lbl_tele = cached_text(self.font_title, t("status"), C_MUTED)
         baked.blit(lbl_tele, (self.tele_rect.x + 14, self.tele_rect.y + 8))
-
-        baked.blit(cached_text(self.font_tiny, "FM", C_MUTED), (self.preset_rect.x + 16, 578))
-        baked.blit(cached_text(self.font_tiny, "AM", C_MUTED), (self.preset_rect.x + 16, 606))
 
         lbl_wf = cached_text(self.font_tiny, t("waterfall"), (110, 128, 150))
         baked.blit(lbl_wf, (self.wf_rect.x + 12, self.wf_rect.y + 6))
@@ -458,32 +455,33 @@ class SdrGui:
         tx, tw = self.tune_rect.x + 14, self.tune_rect.width - 28
         half = (tw - 8) // 2
         y_seek = self.tune_rect.y + 36
-        self.btn_seek_prev = Button((tx, y_seek, half, 32), "<< Auto Seek", lambda: self._seek(-1),
+        self.btn_seek_prev = Button((tx, y_seek, half, 34), t("seek_prev"), lambda: self._seek(-1),
                                     bg_color=(226, 235, 248), active_color=C_BTN_ACTIVE2)
-        self.btn_seek_next = Button((tx + half + 8, y_seek, half, 32), "Auto Seek >>", lambda: self._seek(1),
+        self.btn_seek_next = Button((tx + half + 8, y_seek, half, 34), t("seek_next"), lambda: self._seek(1),
                                     bg_color=(226, 235, 248), active_color=C_BTN_ACTIVE2)
-        fm_w = int((tw - 8) * 0.54)
+        fm_w = int((tw - 8) * 0.52)
         sw_w = tw - 8 - fm_w
-        y_scan = y_seek + 32 + 8
-        self.btn_scan_band = Button((tx, y_scan, fm_w, 32), t("scan_button"), self._request_scan,
+        y_scan = y_seek + 34 + 10
+        self.btn_scan_band = Button((tx, y_scan, fm_w, 34), t("scan_button"), self._request_scan,
                                     bg_color=(214, 240, 229), active_color=C_ACCENT)
-        self.btn_scan_sw = Button((tx + fm_w + 8, y_scan, sw_w, 32), t("scan_sw_button"),
+        self.btn_scan_sw = Button((tx + fm_w + 8, y_scan, sw_w, 34), t("scan_sw_button"),
                                    self._request_sw_scan, bg_color=(226, 236, 248), active_color=C_ACCENT)
         btns.extend([self.btn_seek_prev, self.btn_seek_next, self.btn_scan_band, self.btn_scan_sw])
-        # 検出局プルダウン (25局でもワンクリック選局)
-        y_list = y_scan + 32 + 8
-        self.btn_station_list = Button((tx, y_list, tw, 26), "▼ 検出局 (0)",
+
+        # 検出局プルダウン (誰でも一覧を見られる)
+        y_list = y_scan + 34 + 10
+        n_st = len(self.detected_stations)
+        self.btn_station_list = Button((tx, y_list, tw, 30), t("station_list_btn", n=n_st),
                                        self._toggle_station_list,
                                        bg_color=(232, 240, 250), active_color=C_BTN_ACTIVE2)
         btns.append(self.btn_station_list)
+
         gap = 4
         mw = (tw - 5 * gap) // 6
         mode_defs = [("WFM", (212, 236, 248)), ("AM", (212, 236, 248)), ("NFM", (212, 236, 248)),
                      ("USB", (226, 236, 250)), ("LSB", (226, 236, 250)), ("CW", (226, 236, 250))]
-        # ローカルで組んで最後に一括差し替え (描画スレッドのitems()反復中の
-        # dictサイズ変更によるRuntimeErrorを防止)
         mode_buttons = {}
-        y_mode = self.tune_rect.y + 176
+        y_mode = self.tune_rect.y + 192
         for i, (name, col) in enumerate(mode_defs):
             b = Button((tx + i * (mw + gap), y_mode, mw, 30), name,
                        (lambda m=name: self._set_mode(m)), bg_color=col)
@@ -493,30 +491,66 @@ class SdrGui:
         self.btn_wfm = self.mode_buttons["WFM"]
         self.btn_am = self.mode_buttons["AM"]
         self.btn_nfm = self.mode_buttons["NFM"]
-        # ステレオは自動ブレンドに一本化 (ボタン削除)。BFO微調整のみ (SSB・CW時に表示)
+
+        # BFO微調整 (SSB・CW時に表示)
         gap2 = 8
         hw = (tw - gap2) // 2
         y_bfo = y_mode + 30 + 10
-        self.btn_bfo_down = Button((tx, y_bfo, hw, 26), "BFO-",
+        self.btn_bfo_down = Button((tx, y_bfo, hw, 28), "BFO-",
                                    lambda: self._step_bfo(-50), bg_color=(240, 243, 248))
-        self.btn_bfo_up = Button((tx + hw + gap2, y_bfo, hw, 26), "BFO+",
+        self.btn_bfo_up = Button((tx + hw + gap2, y_bfo, hw, 28), "BFO+",
                                  lambda: self._step_bfo(50), bg_color=(240, 243, 248))
         btns.extend([self.btn_bfo_down, self.btn_bfo_up])
 
-        # ---- GAIN / AUDIOパネルは廃止 (自動＋システム音量)。
-        # DX行・524行目も空き (将来の状態表示用に確保)。
-
-        # ---- プリセット (地域/スキャン結果に応じて動的に設定される) ----
-        fw, fgap, fx0 = 100, 4, self.preset_rect.x + 36
-        for i, p in enumerate(self.presets_fm[:10]):
-            f, m = int(p["freq_hz"]), p.get("mode", "WFM")
-            cb = (lambda freq=f, mode=m: self._tune(freq, mode))
-            btns.append(Button((fx0 + i * (fw + fgap), 572, fw, 26), p["name"], cb))
-        aw = 144
-        for i, p in enumerate(self.presets_am[:7]):
-            f, m = int(p["freq_hz"]), p.get("mode", "AM")
-            cb = (lambda freq=f, mode=m: self._tune(freq, mode))
-            btns.append(Button((fx0 + i * (aw + fgap), 600, aw, 26), p["name"], cb))
+        # ---- チャンネルカード / プリセット (どこでも・だれでも・どんなアンテナでも) ----
+        self.preset_buttons = []
+        has_presets = bool(self.presets_fm or self.presets_am)
+        if not has_presets:
+            # 未スキャン時: 白紙にせず、ワンクリックでスキャンできる大きなウェルカムボタンを配置
+            px = self.preset_rect.x + 20
+            py = self.preset_rect.y + 16
+            pw = (self.preset_rect.width - 56) // 2
+            self.btn_welcome_fm = Button(
+                (px, py, pw, 42),
+                t("welcome_scan_fm"),
+                self._request_scan,
+                bg_color=(216, 242, 230), active_color=C_ACCENT
+            )
+            self.btn_welcome_sw = Button(
+                (px + pw + 16, py, pw, 42),
+                t("welcome_scan_sw"),
+                self._request_sw_scan,
+                bg_color=(228, 238, 252), active_color=C_ACCENT
+            )
+            btns.extend([self.btn_welcome_fm, self.btn_welcome_sw])
+        else:
+            # スキャン完了後: 検出局を美しいカードタイルとして均等配置
+            if self.presets_fm:
+                n_fm = min(10, len(self.presets_fm))
+                gap_p = 6
+                fw = (self.preset_rect.width - 60 - (n_fm - 1) * gap_p) // n_fm
+                fx0 = self.preset_rect.x + 48
+                for i, p in enumerate(self.presets_fm[:n_fm]):
+                    f, m = int(p["freq_hz"]), p.get("mode", "WFM")
+                    cb = (lambda freq=f, mode=m: self._tune(freq, mode))
+                    b = Button((fx0 + i * (fw + gap_p), self.preset_rect.y + 8, fw, 27),
+                               p["name"], cb, bg_color=(235, 242, 250))
+                    b.freq_hz = f
+                    self.preset_buttons.append(b)
+                    btns.append(b)
+            if self.presets_am:
+                n_am = min(8, len(self.presets_am))
+                gap_a = 6
+                aw = (self.preset_rect.width - 60 - (n_am - 1) * gap_a) // n_am
+                ax0 = self.preset_rect.x + 48
+                for i, p in enumerate(self.presets_am[:n_am]):
+                    f, m = int(p["freq_hz"]), p.get("mode", "AM")
+                    cb = (lambda freq=f, mode=m: self._tune(freq, mode))
+                    b = Button((ax0 + i * (aw + gap_a), self.preset_rect.y + 39, aw, 27),
+                               p["name"], cb, bg_color=(238, 240, 246))
+                    b.freq_hz = f
+                    self.preset_buttons.append(b)
+                    btns.append(b)
 
         # アトミックに差し替え (スキャン完了時の再構築と描画の競合防止)
         self.buttons = btns
@@ -1195,21 +1229,43 @@ class SdrGui:
             pygame.draw.lines(self.screen, (0, 220, 184), False, bot, 1)
 
     def _draw_telemetry(self):
+        # 初心者にもわかる電波クオリティ判定バッジ (どんなアンテナでも状況把握)
+        if self.s_units >= 9.0:
+            qual_text = "● 受信クリア"
+            qual_col = (16, 160, 100)
+        elif self.s_units >= 5.0:
+            qual_text = "● 受信良好"
+            qual_col = (20, 140, 170)
+        elif self.s_units >= 2.0:
+            qual_text = "▲ 受信中 (並)"
+            qual_col = (200, 130, 20)
+        elif self.s_units > 0.5:
+            qual_text = "△ 微弱電波"
+            qual_col = (180, 100, 80)
+        else:
+            qual_text = "○ 探索中"
+            qual_col = C_MUTED
+        qual_surf = cached_text(self.font_tiny, qual_text, qual_col)
+        self.screen.blit(qual_surf, (self.tele_rect.right - qual_surf.get_width() - 14, self.tele_rect.y + 8))
+
         parts = [p.strip() for p in self.telemetry_text.split("|") if p.strip()]
 
         # 2列×3行の整然としたキー・バリュー形式で表示 (左列・右列が被らない固定座標)
         for i, part in enumerate(parts[:6]):
             col, row = i // 3, i % 3
             x = self.tele_rect.x + (14 if col == 0 else 146)
-            y = self.tele_rect.y + 27 + row * 18
+            y = self.tele_rect.y + 30 + row * 20
             surf = cached_text(self.font_tiny, part, C_TEXT)
             self.screen.blit(surf, (x, y))
 
-        # 音量/ゲインのバー表示は廃止 (システム音量＋自動感度に一本化)。
-
     def _draw_controls(self):
-        # 注意: TUNING, MODE, GAIN/AUDIO, FM, AM 等の見出しラベルは
-        # _bake_static_scene() に事前描画済みのため、毎フレームの重複blitを排除 (文字潰れ・滲み防止)
+        # プリセットが存在する場合のみ、左端にバンドタグを描画
+        if self.presets_fm:
+            self.screen.blit(cached_text(self.font_tiny, "FM", C_MUTED),
+                             (self.preset_rect.x + 16, self.preset_rect.y + 14))
+        if self.presets_am:
+            self.screen.blit(cached_text(self.font_tiny, "AM", C_MUTED),
+                             (self.preset_rect.x + 16, self.preset_rect.y + 45))
 
         # ステータスバー (右端の検出局数と被らないよう幅をガード)
         max_st_w = self.status_rect.width - 150
@@ -1226,6 +1282,8 @@ class SdrGui:
         # 全ボタン描画 (アクティブ状態更新)
         for name, b in self.mode_buttons.items():
             b.is_active = (self.mode == name)
+        for b in getattr(self, "preset_buttons", []):
+            b.is_active = (hasattr(b, "freq_hz") and abs(self.center_freq - b.freq_hz) < 50000)
         for btn in self.buttons:
             if btn.visible:
                 btn.draw(self.screen, self.font_small)
@@ -1243,7 +1301,7 @@ class SdrGui:
         self._draw_waveform(audio_pcm)
         self._draw_telemetry()
         if hasattr(self, "btn_station_list"):
-            self.btn_station_list.text = f"▼ 検出局 ({len(self.detected_stations)})"
+            self.btn_station_list.text = t("station_list_btn", n=len(self.detected_stations))
         self._draw_controls()
         self._draw_station_list()
 

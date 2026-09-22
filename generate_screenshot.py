@@ -13,9 +13,30 @@ from gui import SdrGui
 def generate_screenshot(output_path="assets/screenshot.png"):
     gui = SdrGui()
     gui.current_freq = 80000000
+    gui.center_freq = 80000000
     gui.station_name = "TOKYO FM"
+    gui.s_units = 8.5
     gui.scan_status_text = "Receiving: 80.00 MHz - TOKYO FM (Stereo Hi-Fi)"
     gui.telemetry_text = "SNR: 28.5dB | IQ: 48 | DSP: OK | Gain: Auto | Lock: Fixed | SIC: -18.2dB"
+
+    # スキャンにより検出された放送局のシミュレーション (どこでも・誰でも・スキャン探索後)
+    fm_presets = [
+        {"name": "TOKYO 80.0", "freq_hz": 80000000, "mode": "WFM"},
+        {"name": "J-WAVE 81.3", "freq_hz": 81300000, "mode": "WFM"},
+        {"name": "NHK-FM 82.5", "freq_hz": 82500000, "mode": "WFM"},
+        {"name": "NHK水戸 83.2", "freq_hz": 83200000, "mode": "WFM"},
+        {"name": "FM群馬 86.4", "freq_hz": 86400000, "mode": "WFM"},
+        {"name": "TBS 90.5", "freq_hz": 90500000, "mode": "WFM"},
+        {"name": "文化放送 91.6", "freq_hz": 91600000, "mode": "WFM"},
+        {"name": "ニッポン 93.0", "freq_hz": 93000000, "mode": "WFM"},
+    ]
+    am_presets = [
+        {"name": "NHK第1 594k", "freq_hz": 594000, "mode": "AM"},
+        {"name": "AFN 810k", "freq_hz": 810000, "mode": "AM"},
+        {"name": "TBS 954k", "freq_hz": 954000, "mode": "AM"},
+        {"name": "短波日経 6.055M", "freq_hz": 6055000, "mode": "AM"},
+    ]
+    gui.set_presets(fm_presets, am_presets)
 
     # 美しいFM放送スペクトラムのシミュレーション
     freqs = np.linspace(-576, 576, 1024)
