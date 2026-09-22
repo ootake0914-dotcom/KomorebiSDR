@@ -75,6 +75,24 @@ def test_nan_spectrum_survival():
     print("[OK] nan spectrum survival")
 
 
+def test_gain_objective_inband_and_clip():
+    print("\n===== test_gain_objective_inband_and_clip =====")
+    q = HyperController._inband_gain_objective
+    clean = q(30.0, 30.0, True, 0.0, 0.0)
+    clipped = q(30.0, 30.0, True, 5.0, 0.06)
+    assert clipped < clean - 9.0, "ADC/オーディオ飽和へのペナルティが弱い"
+    low_prog = q(20.0, 10.0, True, 0.0, 0.0)
+    high_prog = q(20.0, 30.0, True, 0.0, 0.0)
+    assert high_prog > low_prog + 5.0, "同一C/Nで聴感SNRの反映が弱い"
+    no_audio = q(20.0, 0.0, False, 0.0, 0.0)
+    assert abs(no_audio - 20.0) < 1e-9, "音声欠落時のRFフォールバックが壊れた"
+    lawful = q(20.0, 30.0, True, 0.5, 0.002)
+    assert abs(lawful - high_prog) < 1e-9, "微小ノイズで減点してはならない"
+    print(f"[*] clean={clean:.1f}, clipped={clipped:.1f}, audio={high_prog:.1f}")
+    print("[OK] gain objective uses in-band SNR and clip penalty")
+
+
 if __name__ == "__main__":
     test_nan_spectrum_survival()
+    test_gain_objective_inband_and_clip()
     print("\nALL CONTROLLER ROBUSTNESS TESTS PASSED!")

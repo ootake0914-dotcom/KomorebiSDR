@@ -1,5 +1,5 @@
 @echo off
-rem Antigravity SDR native core build script (ASCII only)
+rem KomorebiSDR native core build script (ASCII only)
 setlocal
 set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
 set "VSDIR="

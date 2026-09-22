@@ -2,17 +2,18 @@
 Application configuration & region profiles.
 
 - 地域プロファイル (FM帯域・ステップ・ディエンファシス時定数・AMステップ)
-- 設定ファイルの読み書き (%APPDATA%/AntigravitySDR/config.json)
+- 設定ファイルの読み書き (%APPDATA%/KomorebiSDR/config.json)
 - OSロケールからの国・言語の自動判定
 """
 
 import json
 import locale
 import os
+import shutil
 import threading
 
 
-APP_NAME = "AntigravitySDR"
+APP_NAME = "KomorebiSDR"
 _CONFIG_LOCK = threading.Lock()
 
 

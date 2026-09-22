@@ -1,5 +1,5 @@
 /*
- * sdr_core.c - Antigravity SDR ネイティブ高速DSPコア
+ * sdr_core.c - KomorebiSDR ネイティブ高速DSPコア
  *
  * PythonループがGILを保持して音声処理を妨害していたホットスポットをCで実装。
  * ctypes経由で呼び出すため、計算中はGILが解放され、

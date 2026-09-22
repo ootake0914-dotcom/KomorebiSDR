@@ -15,7 +15,7 @@
 受信開始から10秒後に PowerShell で確認する。
 
 ```powershell
-dir "$env:APPDATA\AntigravitySDR"
+dir "$env:APPDATA\KomorebiSDR"
 ```
 
 `signal_log.csv` があり、更新時刻が現在なら記録中である。
@@ -28,7 +28,7 @@ dir "$env:APPDATA\AntigravitySDR"
 3. 要約コマンドを実行する（第2引数は周波数Hz。±50kHzで切り出す）
 
 ```powershell
-python signal_logger.py "$env:APPDATA\AntigravitySDR\signal_log.csv" 80000000
+python signal_logger.py "$env:APPDATA\KomorebiSDR\signal_log.csv" 80000000
 ```
 
 ### 自動ブランキングについて

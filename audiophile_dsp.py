@@ -1,5 +1,5 @@
 """
-Audiophile High-End DSP Modules for Antigravity SDR Radio.
+Audiophile High-End DSP Modules for KomorebiSDR Radio.
 高級オーディオ（Accuphase, Kenwood L-02T, dCS, Esoteric等）の設計思想に基づく
 極限ピュアオーディオ信号処理モジュール群。
 

@@ -100,7 +100,10 @@ def main() -> int:
     nr_idle = dsp.stereo_nr_gain > 0.95
     print(f"[{'OK' if nr_idle else 'FAIL'}] clean signal keeps full stereo "
           f"(NR gain={dsp.stereo_nr_gain:.2f}, cut={dsp.stereo_cut_hz:.0f}Hz)")
-    ok &= sep_ok and nr_idle
+    pilot_leak = 20 * np.log10(amp(left, 19000.0) / amp(left, 1000.0))
+    pilot_ok = pilot_leak <= -40.0
+    print(f"[{'OK' if pilot_ok else 'FAIL'}] 19kHz pilot leak {pilot_leak:+.1f} dB (need <= -40 dB)")
+    ok &= sep_ok and nr_idle and pilot_ok
 
     noisy = make_raw(stereo=True, snr_db=12.0)
     dsp_nr, pcm_nr = decode(noisy, nr=True)

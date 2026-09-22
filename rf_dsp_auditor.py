@@ -344,7 +344,7 @@ if __name__ == "__main__":
         freq = float(sys.argv[1]) * 1e6
 
     print("\n" + "#" * 70)
-    print("  ANTIGRAVITY SDR - PROFESSIONAL ENGINEERING AUDIT REPORT")
+    print("  KOMOREBISDR - PROFESSIONAL ENGINEERING AUDIT REPORT")
     print("#" * 70 + "\n")
 
     t1_res = run_tier1_ground_truth_benchmark()

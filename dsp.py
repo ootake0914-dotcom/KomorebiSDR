@@ -183,6 +183,7 @@ class SdrDspPipeline:
         self.target_hf_gain = 1.0
         self.hf_gain_applied = 1.0
         self.cognitive_alpha = 0.18  # 1フレームあたりの平滑追従率 (ポップノイズ根絶)
+        self._if_snr_db = 10.0  # WFM復調前の局所チャンネルSNR推定（IFモーフィング用）
         self._fir_cache = OrderedDict()
 
         # 4.5kHzクロスオーバーによる心理音響ハイシェルフ (FM三角雑音のみ連続減衰)
@@ -515,8 +516,11 @@ class SdrDspPipeline:
         self.mp_lo = 0.10
         self.mp_hi = 0.35
         self.mp_depth = 0.7
-        # CMAブラインド等化器 (マルチパス・キャンセル)。実機アンテナの安定性のためデフォルトOFF
+        # CMAブラインド等化器 (マルチパス・キャンセル)。手動は実機アンテナの安定性のためデフォルトOFF。
+        # cognitive時の強い反射波には、multipath量ヒステリシス＋信号存在ゲートで自動介入する。
         self.multipath_cancel_enabled = False
+        self.multipath_auto_cancel = True
+        self._cma_auto = False
         self._cma_taps = 33
         # μ sweep実測: 0.15は重度で悪化(55dB)、0.03が中度+28dB・クリーン透明の最良点
         self._cma_mu = 0.03
@@ -595,6 +599,7 @@ class SdrDspPipeline:
         self._cma_w[2 * (self._cma_taps // 2)] = 1.0
         self._cma_hist[:] = 0.0
         self.cma_active = False
+        self._cma_auto = False
         self.reset_stereo_nr()
         self.am_sync_lock = 0.0
         if hasattr(self, "ultra_squelch"):
@@ -753,13 +758,63 @@ class SdrDspPipeline:
         if if_bw_hz is not None:
             self.target_if_bw_hz = float(np.clip(if_bw_hz, 110000.0, 200000.0))
 
-    def _update_cognitive_morph(self):
-        """離散切替ではなくサンプル単位で滑らかにフィルタを変形 (クリック・ポップ根絶)"""
+    @staticmethod
+    def _wfm_if_snr_db(spectrum_db: np.ndarray, rf_rate: float):
+        """WFM復調前の局所チャンネル内SNR推定（IFダイナミクス用）。
+
+        Hyperの帯域内定義と同一: ±85kHz信号帯域とスペクトル下位25%タイル床を比較し、
+        弱電界では尖頭寄りで融合する。表示スムージング済みスペクトルでも動作する。
+        """
+        if spectrum_db is None:
+            return None
+        spec = np.asarray(spectrum_db, dtype=np.float64).reshape(-1)
+        if len(spec) < 128:
+            return None
+        spec = np.nan_to_num(spec, nan=-120.0, posinf=0.0, neginf=-120.0)
+        lin = np.power(10.0, spec / 10.0)
+        n = len(lin)
+        c = n // 2
+        bin_hz = float(rf_rate) / float(n)
+        ch_half = max(4, int(85000.0 / bin_hz))
+        g_in = max(ch_half + 2, int(115000.0 / bin_hz))
+        g_out = int(250000.0 / bin_hz)
+        g_out = min(g_out, c - 2)
+        g_in = min(g_in, g_out - 1)
+        if g_out <= g_in or c - g_out < 0:
+            return None
+        ch = lin[c - ch_half: c + ch_half + 1]
+        if len(ch) == 0:
+            return None
+        sig_mean = float(np.mean(ch))
+        sig_peak = float(np.max(ch))
+        noise_p = float(np.percentile(lin, 25))
+        mean_snr = 10.0 * np.log10((sig_mean + 1e-12) / (noise_p + 1e-12))
+        peak_snr = 10.0 * np.log10((sig_peak + 1e-12) / (noise_p + 1e-12))
+        snr_db = max(mean_snr, 0.35 * mean_snr + 0.65 * peak_snr)
+        if not np.isfinite(snr_db):
+            return None
+        return float(snr_db)
+
+    def _update_cognitive_morph(self, if_snr_db=None, mode="WFM"):
+        """離散切替ではなくサンプル単位で滑らかにフィルタを変形 (クリック・ポップ根絶)
+
+        WFMでは復調前の局所SNRでIF帯域だけに非対称スルーを掛ける。
+        低SNRでは狭窄を低速化し、回復時は開放を優先する。最終到達点は変えない。
+        """
         if not self.cognitive_enabled:
             return
         a = self.cognitive_alpha
         self.applied_cutoff_hz += a * (self.target_cutoff_hz - self.applied_cutoff_hz)
-        self.applied_if_bw_hz += a * (self.target_if_bw_hz - self.applied_if_bw_hz)
+        if mode == "WFM" and if_snr_db is not None and np.isfinite(if_snr_db):
+            q = float(if_snr_db)
+            self._if_snr_db = q
+            target = float(np.clip(self.target_if_bw_hz, 110000.0, 200000.0))
+            delta = target - self.applied_if_bw_hz
+            # 低SNRほど1ブロックあたりの変化量を絞り、履歴FIRの急変ショックを防ぐ。
+            limit = 2500.0 if q < 4.0 else (4000.0 if q < 8.0 else 8000.0)
+            self.applied_if_bw_hz += max(-limit, min(limit, delta))
+        else:
+            self.applied_if_bw_hz += a * (self.target_if_bw_hz - self.applied_if_bw_hz)
         self.hf_gain_applied += a * (self.target_hf_gain - self.hf_gain_applied)
 
     def _get_dynamic_filter(self, kind: str, cutoff_hz: float) -> np.ndarray:
@@ -907,6 +962,24 @@ class SdrDspPipeline:
             return np.nan_to_num(iq_if, nan=0.0, posinf=1.0, neginf=-1.0)
         return y
 
+    def _update_cma_auto_gate(self) -> bool:
+        """CMA自動介入ゲート（ヒステリシス＋信号存在条件）。
+
+        強い反射波でのみ作動し、弱まったら速やかに戻す。手動設定は常に尊重する。
+        cognitive無効時は自動介入しない（従来テスト/非認知経路の挙動を保護）。
+        """
+        if not self.multipath_auto_cancel or not self.cognitive_enabled:
+            self._cma_auto = bool(self.multipath_cancel_enabled)
+            return self._cma_auto
+        present = abs(float(self.stereo_pilot_lock)) > 0.2 or float(self.s_meter_dbfs) > -45.0
+        amt = float(self.multipath_amount)
+        if self._cma_auto:
+            hold = amt >= 0.18 and present
+        else:
+            hold = amt >= 0.30 and present
+        self._cma_auto = bool(self.multipath_cancel_enabled or hold)
+        return self._cma_auto
+
     def _apply_hard_limiter(self, iq_if: np.ndarray) -> np.ndarray:
         mag = np.abs(iq_if)
         mask = (mag > 1e-12) & np.isfinite(mag)
@@ -963,7 +1036,8 @@ class SdrDspPipeline:
             self.multipath_gain = 1.0 - self.mp_depth * self.multipath_amount
 
         # 1. CMA等化 (マルチパス・キャンセル) + ハードリミッター適用
-        if (self.multipath_cancel_enabled and _NATIVE is not None and NATIVE_CMA
+        use_cma = self._update_cma_auto_gate()
+        if (use_cma and _NATIVE is not None and NATIVE_CMA
                 and self.multipath_amount > 0.15
                 and (abs(self.stereo_pilot_lock) > 0.2 or self.s_meter_dbfs > -45.0)):
             # CMA等化 (ハードリミット前。リミット後は包絡線一定で誤差が出ない)。
@@ -2157,7 +2231,15 @@ class SdrDspPipeline:
         spectrum_db = self.compute_spectrum(iq_shifted)
 
         # Hyper連続認知制御: フィルタを離散切替ではなく無段階モーフィング
-        self._update_cognitive_morph()
+        # WFM復調部では同一ブロックのスペクトルから局所SNRを取り、IF狭窄の
+        # 過渡ショックだけを抑える（最終帯域＝Hyper目標のまま）。
+        if mode == "WFM" and self.cognitive_enabled:
+            self._update_cognitive_morph(
+                self._wfm_if_snr_db(spectrum_db, self.rf_rate),
+                mode="WFM",
+            )
+        else:
+            self._update_cognitive_morph()
 
         if mode == "NFM":
             # ISS / アマチュア無線用ナローバンドFM

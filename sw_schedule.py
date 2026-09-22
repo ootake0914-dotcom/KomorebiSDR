@@ -5,7 +5,7 @@
 ライセンス: 無償で利用・複製・配布・サードパーティソフトへの同梱が自由
 (README.TXT "Conditions of use" 参照)。
 
-- 初回はネットから取得し %APPDATA%/AntigravitySDR/ にキャッシュ (14日で更新)
+- 初回はネットから取得し %APPDATA%/KomorebiSDR/ にキャッシュ (14日で更新)
 - オフライン時はキャッシュのみ使用。無ければ空 (局名は Unknown のまま)
 """
 
@@ -47,7 +47,7 @@ def cache_path() -> str:
 
 
 def _http_get(url: str, timeout: float = 20.0) -> bytes:
-    req = urllib.request.Request(url, headers={"User-Agent": "AntigravitySDR/1.0"})
+    req = urllib.request.Request(url, headers={"User-Agent": "KomorebiSDR/1.0"})
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return resp.read()
 

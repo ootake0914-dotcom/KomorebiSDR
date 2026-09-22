@@ -80,7 +80,7 @@ def print_scan_table(stations: list[dict]):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Antigravity Full-Scratch SDR Radio (Smart Auto-Tuner & DX Edition)")
+    parser = argparse.ArgumentParser(description="KomorebiSDR (Smart Auto-Tuner & DX Edition)")
     parser.add_argument("freq", nargs="?", default="94.6M", help="周波数 (例: 94.6M, 83.2M) またはモード ('scan', 'auto', 'dx')")
     parser.add_argument("--mode", default="WFM", choices=["WFM", "AM"], help="復調方式")
     parser.add_argument("--gain", default="auto", help="ゲイン (auto/hyper [自律最適化] / cascade [従来版] / 数値dB)")
@@ -193,7 +193,7 @@ def main():
 
     st_name = match_station_name(current_freq)
     print("=" * 65)
-    print(f"📻 ANTIGRAVITY SDR RADIO (Smart Auto-Tuner & DX Edition)")
+    print(f"📻 KOMOREBISDR RADIO (Smart Auto-Tuner & DX Edition)")
     print("=" * 65)
     print(f"[*] 受信周波数: {current_freq / 1e6:.4f} MHz ({st_name})")
     print(f"[*] 復調モード: {args.mode} | DX超高感度: {'ON' if is_dx_mode else 'OFF'}")

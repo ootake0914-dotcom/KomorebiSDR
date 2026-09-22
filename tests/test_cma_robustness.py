@@ -60,7 +60,33 @@ def test_full_pipeline_extreme_inputs():
     print("[OK] パイプライン極限入力ストレステスト成功")
 
 
+def test_cma_auto_gate_hysteresis():
+    print("\n===== test_cma_auto_gate_hysteresis =====")
+    pipeline = SdrDspPipeline(1152000, 48000)
+    pipeline.multipath_cancel_enabled = False
+    pipeline.multipath_auto_cancel = True
+    pipeline.cognitive_enabled = True
+    pipeline.stereo_pilot_lock = 0.0
+    pipeline.s_meter_dbfs = -90.0
+    pipeline.multipath_amount = 0.9
+    assert pipeline._update_cma_auto_gate() is False, "無信号で自動CMAが作動した"
+
+    pipeline.s_meter_dbfs = -30.0
+    assert pipeline._update_cma_auto_gate() is True, "強反射波で自動CMAが作動しない"
+    pipeline.multipath_amount = 0.20
+    assert pipeline._update_cma_auto_gate() is True, "ヒステリシス保持が切れた"
+    pipeline.multipath_amount = 0.10
+    assert pipeline._update_cma_auto_gate() is False, "弱反射波で自動CMAが戻らない"
+
+    pipeline.multipath_amount = 0.90
+    pipeline.s_meter_dbfs = -30.0
+    pipeline.cognitive_enabled = False
+    assert pipeline._update_cma_auto_gate() is False, "非cognitiveで自動介入してはならない"
+    print("[OK] CMA auto gate hysteresis")
+
+
 if __name__ == "__main__":
     test_cma_stability()
     test_full_pipeline_extreme_inputs()
+    test_cma_auto_gate_hysteresis()
     print("\nALL ROBUSTNESS TESTS PASSED!")

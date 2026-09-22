@@ -294,6 +294,8 @@ class HyperController:
 
     def _measure_audio(self, audio: np.ndarray):
         """復調後オーディオの番組帯域 vs ヒス帯域パワー比（聴感品質の直接指標）"""
+        # 音声が無いフレームでは直前のオーディオクリップを残さない。
+        self.audio_clip_pct = 0.0
         if audio is None or len(audio) < 256:
             return None
         fft_n = 1024
@@ -326,6 +328,30 @@ class HyperController:
         if not np.isfinite(snr_db):
             return None
         return float(np.clip(snr_db, -20.0, 60.0))
+
+    @staticmethod
+    def _inband_gain_objective(chan_q: float, audio_q: float, have_audio: bool,
+                               adc_clip_pct: float, audio_clip_frac: float) -> float:
+        """ゲイン探索用の帯域内SNR目的関数。
+
+        RFチャンネル内C/Nを主軸にし、復調後オーディオの番組/ヒス比で補正する。
+        ADC飽和や復調後クリップはSNR比較を無効化するため強いペナルティを与える。
+        """
+        chan = float(np.clip(float(chan_q), -30.0, 80.0))
+        if have_audio and audio_q is not None and np.isfinite(audio_q):
+            aud = float(np.clip(float(audio_q), -30.0, 60.0))
+            base = 0.62 * chan + 0.38 * aud
+        else:
+            base = chan
+        adc = float(adc_clip_pct) if np.isfinite(adc_clip_pct) else 0.0
+        aud_clip = float(audio_clip_frac) if np.isfinite(audio_clip_frac) else 0.0
+        if adc >= 4.0 or aud_clip >= 0.05:
+            penalty = 20.0
+        elif adc >= 1.2 or aud_clip >= 0.01:
+            penalty = 10.0
+        else:
+            penalty = 0.0
+        return float(base - penalty)
 
     # ================================================================
     # ゲイン探索 (モデルベース・グローバル探索)
@@ -665,8 +691,15 @@ class HyperController:
         self.state_clip_pct = 0.5 * clip_pct + 0.5 * self.state_clip_pct
         if noise_floor is not None:
             self.state_noise_floor = 0.2 * noise_floor + 0.8 * self.state_noise_floor
-        # 制御目的関数: 無音・音楽の曲調に左右されない純粋なRFチャンネル内C/N
-        self.state_quality = float(self.state_channel_snr)
+        # 制御目的関数: 帯域内SNR（RF C/N主軸＋聴感オーディオ比）から算出し、
+        # ADC/オーディオ飽和をペナルティで除外する。IF/カットオフ側の独立状態は温存する。
+        self.state_quality = self._inband_gain_objective(
+            self.state_channel_snr,
+            self.state_audio_snr,
+            audio_snr is not None,
+            clip_pct,
+            self.audio_clip_pct,
+        )
 
         # ---- ゲイン制御 ----
         if self.available_gains:
