@@ -1126,9 +1126,8 @@ class SdrDspPipeline:
                 and abs(self.stereo_pilot_lock) > 0.2
                 and self.s_meter_dbfs > -60.0):
             # CMA等化 (ハードリミット前。リミット後は包絡線一定で誤差が出ない)。
-            # 信号存在ゲート: lock必須 (S-meterだけでの作動は深フェードで
-            # blendを下げるため廃止。ゲート側と条件を一致させる)。
-            # 信号存在ゲート: ノイズ上での無意味な適応・発散を防ぐ。
+            # 信号存在ゲート: lock必須＋ノイズ床veto (S-meterだけでの作動は
+            # 深フェードでblendを下げるため廃止。ゲート側と条件を一致させる)。
             iq_if = self._apply_cma(iq_if)
             self.cma_active = True
         else:
