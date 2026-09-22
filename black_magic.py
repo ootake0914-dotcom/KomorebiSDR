@@ -27,6 +27,46 @@ def _f(v, default=0.0):
     return f if math.isfinite(f) else default
 
 
+# モード別プリセット (Phase 3-1: 自動プロファイルの表)。
+# 音声を壊しうる処理はAM/SSB等の非FMでは使わない。
+PROFILES = {
+    "WFM": {"cyclo": True, "rmt": True, "sr": True, "notch": True},
+    "NFM": {"cyclo": False, "rmt": True, "sr": False, "notch": True},
+    "AM": {"cyclo": False, "rmt": True, "sr": False, "notch": True},
+    "AM_NARROW": {"cyclo": False, "rmt": True, "sr": False, "notch": True},
+    "USB": {"cyclo": False, "rmt": True, "sr": False, "notch": False},
+    "LSB": {"cyclo": False, "rmt": True, "sr": False, "notch": False},
+    "CW": {"cyclo": False, "rmt": False, "sr": False, "notch": False},
+}
+
+
+def profile_for(mode, snr_db):
+    """受信モード＋SNR→推奨フラグ (GUIが表示・適用するための提案。副作用なし)。
+
+    強信号 (SNR>30) では検出補助のみ残し、処理系は落とす。
+    未知モードは全OFF (安全側)。
+    """
+    try:
+        base = dict(PROFILES.get(str(mode), {}))
+    except Exception:
+        base = {}
+    if not base:
+        return {"cyclo": False, "rmt": False, "sr": False, "notch": False,
+                "reason": "unknown-mode"}
+    try:
+        snr = float(snr_db)
+    except (TypeError, ValueError):
+        snr = 0.0
+    if not math.isfinite(snr):
+        snr = 0.0
+    if snr > 30.0:
+        base.update({"rmt": False, "sr": False, "notch": False,
+                     "reason": "strong-signal"})
+    else:
+        base["reason"] = "weak-signal" if snr <= 12.0 else "normal"
+    return base
+
+
 class BlackMagicController:
     """process_metrics(metrics)→params。metricsキーはすべて任意 (欠損=安全側)。"""
 
@@ -51,6 +91,25 @@ class BlackMagicController:
         self._degraded_latch = False
         self._clear_n = 0
         self.blocks = 0
+        self._last_out = None
+
+    def describe(self):
+        """現在の状態を人間可読辞書で返す (Phase 3-2: チューニング表示用API)。
+        GUIがそのまま表示できる形式。DSP状態には触らない。"""
+        o = self._last_out or {}
+        try:
+            snr = self._snr
+        except Exception:
+            snr = None
+        return {
+            "enabled": bool(self.enabled),
+            "snr_db": None if snr is None else float(snr),
+            "cyclo": "active" if o.get("cyclo_active") else "standby",
+            "rmt": ("capped %.2f" % o.get("rmt_cap", 0.0)) if not o.get("bypass_all", True) else "bypass",
+            "sr": "active" if o.get("sr_active") else "standby",
+            "reason": str(o.get("reason", "disabled")),
+            "blocks": int(self.blocks),
+        }
 
     def _ema(self, prev, target):
         # 初回は安全側0から開始 (いきなり目標値へ跳ばせない)
@@ -151,4 +210,5 @@ class BlackMagicController:
                         "cyclo_active": False, "rmt_cap": 0.0,
                         "sr_active": False})
         out["processing_ms"] = (time.perf_counter() - t0) * 1000.0
+        self._last_out = dict(out)
         return out

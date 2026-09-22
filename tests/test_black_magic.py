@@ -147,8 +147,7 @@ def test_all_off_matches_baseline():
     assert np.array_equal(outs[0], outs[1]), "既定OFFで出力が変動した"
 
 
-def test_attack_limit_ratchet_guard():
-    # ラチェット対策: flutter中は介入せず0.25、安定弱信号でのみ鈍化
+def test_attack_limit_ratchet_guard():    # ラチェット対策: flutter中は介入せず0.25、安定弱信号でのみ鈍化
     from dsp import SdrDspPipeline
     from collections import deque
     dsp = SdrDspPipeline(1152000, 48000)
@@ -177,6 +176,28 @@ def test_attack_limit_ratchet_guard():
     assert dsp._bm_attack_limit(float("nan")) == 0.25
 
 
+def test_profile_and_describe():
+    from black_magic import profile_for
+    wfm_weak = profile_for("WFM", 5.0)
+    assert wfm_weak["cyclo"] is True and wfm_weak["rmt"] is True
+    assert wfm_weak["reason"] == "weak-signal"
+    wfm_strong = profile_for("WFM", 40.0)
+    assert wfm_strong["rmt"] is False and wfm_strong["sr"] is False
+    assert wfm_strong["cyclo"] is True  # 検出補助のみ残る
+    assert profile_for("AM", 5.0)["cyclo"] is False  # 非FMでcycloなし
+    assert profile_for("CW", 5.0)["rmt"] is False
+    unk = profile_for("NOPE", 5.0)
+    assert unk["reason"] == "unknown-mode" and not any(
+        unk[k] for k in ("cyclo", "rmt", "sr", "notch"))
+    c = BlackMagicController(enabled=True)
+    d0 = c.describe()
+    assert d0["enabled"] is True and d0["reason"] == "disabled"
+    c.process_metrics({"snr_db": 0.0, "pilot_confidence": 0.5})
+    d1 = c.describe()
+    assert d1["cyclo"] == "active" and d1["sr"] == "active"
+    assert d1["blocks"] == 1 and isinstance(d1["snr_db"], float)
+
+
 def main() -> int:
     try:
         test_disabled_bypass()
@@ -199,6 +220,8 @@ def main() -> int:
         print("[*] 全OFF同一性 OK")
         test_attack_limit_ratchet_guard()
         print("[*] ラチェット防止 OK")
+        test_profile_and_describe()
+        print("[*] プロファイル・状態表示 OK")
     except AssertionError as e:
         print(f"FAILED: {e}")
         return 1
