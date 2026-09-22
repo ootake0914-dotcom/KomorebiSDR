@@ -258,8 +258,8 @@ class SdrGui:
         self.on_seek_change = None      # lambda direction: ...
         self.on_scan_request = None     # lambda: ...
         self.on_sw_scan_request = None  # lambda: ...
-        self.on_ppm_cal_request = None  # lambda: ...
-        self.on_stereo_toggle = None    # lambda: ...
+        # PPM手動較正は廃止 (背景自動収集＋自動適用に一本化)。
+        # ステレオは自動ブレンドに一本化 (ボタン削除・木漏れ日整理)。
         self.on_bfo_change = None       # lambda delta_hz: ...
         # AFCは常時ON固定・DXはC/N連動の自動絞り (ボタン削除・木漏れ日整理)。
 
@@ -275,7 +275,7 @@ class SdrGui:
         self.current_rssi = -50.0
         self.is_stereo = False
         self.stereo_status = "MONO"
-        self.stereo_enabled = True
+        self.stereo_enabled = True  # 常時True固定 (自動ブレンドに一本化)
         # NRは常時ON固定 (ボタン削除・木漏れ日整理)。nr_enabled属性は廃止。
         # 描画用の事前確保バッファ (毎フレームの確保を排除)
         self._wave_xs = None
@@ -435,16 +435,7 @@ class SdrGui:
         if presets_am is not None:
             self.presets_am = am[:7]
         self._init_controls()
-        # _init_controls はボタンを新規作成するため、トグルの表示状態を再同期する
-        # (スキャンのたびにステレオ/NR/DX表示が既定値に戻る問題の修正)
-        self._sync_control_states()
-
-    def _sync_control_states(self):
-        """トグル系ボタンの表示を現在の内部状態に合わせる (set_presets等の再構築後)。"""
-        if hasattr(self, "btn_stereo"):
-            self.btn_stereo.text = t("stereo") if self.stereo_enabled else t("mono")
-            self.btn_stereo.bg_color = (206, 240, 226) if self.stereo_enabled else (246, 228, 228)
-        # ゲイン状態チップはworker側statsで確定上書きされるため再同期不要 (自動固定)。
+        # トグル系ボタンは全廃止したため再同期不要 (_sync_control_states削除)。
 
     @staticmethod
     def _clean_presets(items, default_mode: str) -> list:
@@ -483,17 +474,13 @@ class SdrGui:
                                     bg_color=(226, 235, 248), active_color=C_BTN_ACTIVE2)
         self.btn_seek_next = Button((tx + half + 6, 300, half, 28), "Auto Seek >>", lambda: self._seek(1),
                                     bg_color=(226, 235, 248), active_color=C_BTN_ACTIVE2)
-        fm_w = int((tw - 12) * 0.45)
-        sw_w = int((tw - 12) * 0.33)
+        fm_w = int((tw - 6) * 0.55)
+        sw_w = tw - fm_w - 6
         self.btn_scan_band = Button((tx, 332, fm_w, 30), t("scan_button"), self._request_scan,
                                     bg_color=(214, 240, 229), active_color=C_ACCENT)
         self.btn_scan_sw = Button((tx + fm_w + 6, 332, sw_w, 30), t("scan_sw_button"),
                                    self._request_sw_scan, bg_color=(226, 236, 248), active_color=C_ACCENT)
-        self.btn_ppm_cal = Button((tx + fm_w + sw_w + 12, 332, tw - fm_w - sw_w - 12, 30),
-                                  t("ppm_button"), self._request_ppm_cal,
-                                  bg_color=(240, 230, 250), active_color=C_ACCENT)
-        btns.extend([self.btn_seek_prev, self.btn_seek_next, self.btn_scan_band, self.btn_scan_sw,
-                     self.btn_ppm_cal])
+        btns.extend([self.btn_seek_prev, self.btn_seek_next, self.btn_scan_band, self.btn_scan_sw])
         # 検出局プルダウン (25局でもワンクリック選局)
         self.btn_station_list = Button((tx, 360, tw, 20), "▼ 検出局 (0)",
                                        self._toggle_station_list,
@@ -515,16 +502,14 @@ class SdrGui:
         self.btn_wfm = self.mode_buttons["WFM"]
         self.btn_am = self.mode_buttons["AM"]
         self.btn_nfm = self.mode_buttons["NFM"]
-        # ステレオ/モノラル切替 / BFO微調整 (SSB・CW用。NRは常時ONでボタンなし)
+        # ステレオは自動ブレンドに一本化 (ボタン削除)。BFO微調整のみ (SSB・CW時に表示)
         gap2 = 6
-        hw = (tw - 2 * gap2) // 3
-        self.btn_stereo = Button((tx, 412, hw, 24), t("stereo"), self._toggle_stereo,
-                                 bg_color=(206, 240, 226), active_color=C_ACCENT)
-        self.btn_bfo_down = Button((tx + hw + gap2, 412, hw, 24), "BFO-",
+        hw = (tw - gap2) // 2
+        self.btn_bfo_down = Button((tx, 412, hw, 24), "BFO-",
                                    lambda: self._step_bfo(-50), bg_color=(240, 243, 248))
-        self.btn_bfo_up = Button((tx + 2 * (hw + gap2), 412, hw, 24), "BFO+",
+        self.btn_bfo_up = Button((tx + hw + gap2, 412, hw, 24), "BFO+",
                                  lambda: self._step_bfo(50), bg_color=(240, 243, 248))
-        btns.extend([self.btn_stereo, self.btn_bfo_down, self.btn_bfo_up])
+        btns.extend([self.btn_bfo_down, self.btn_bfo_up])
 
         # ---- GAIN / AUDIOパネル ----
         gx, gy = self.gain_rect.x + 12, self.gain_rect.y
@@ -604,10 +589,6 @@ class SdrGui:
         if self.on_sw_scan_request:
             self.scan_status_text = t("sw_scanning")
             self.on_sw_scan_request()
-
-    def _request_ppm_cal(self):
-        if self.on_ppm_cal_request:
-            self.on_ppm_cal_request()
 
     # ---- 検出局プルダウン ----
     _SL_ROW_H = 26
@@ -711,25 +692,9 @@ class SdrGui:
                                (110, 128, 150))
             self.screen.blit(hint, (panel.x + 14, panel.bottom - 20))
 
-    def _toggle_stereo(self):
-        # worker往復まで無反応に見えるため表示だけ楽観更新 (実権はworker)
-        try:
-            self.set_stereo_enabled(not bool(getattr(self, "stereo_enabled", True)))
-        except Exception:
-            pass
-        if self.on_stereo_toggle:
-            self.on_stereo_toggle()
-
     def _step_bfo(self, delta):
         if self.on_bfo_change:
             self.on_bfo_change(delta)
-
-    def set_stereo_enabled(self, enabled: bool):
-        """ステレオ/モノラル切替ボタンの表示を更新"""
-        self.stereo_enabled = bool(enabled)
-        if hasattr(self, "btn_stereo"):
-            self.btn_stereo.text = t("stereo") if self.stereo_enabled else t("mono")
-            self.btn_stereo.bg_color = (206, 240, 226) if self.stereo_enabled else (246, 228, 228)
 
     def handle_events(self):
         cursor_hand = False

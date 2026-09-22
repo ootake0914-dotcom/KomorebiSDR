@@ -20,7 +20,7 @@ from gui import SdrGui, show_message_screen
 from cascade_controller import CascadeController
 from hyper_controller import HyperController
 from auto_tuner import AutoTuner, match_station_name
-from ppm_cal import PpmCalibrator, pick_ppm_stations
+from ppm_cal import PpmCalibrator
 from signal_logger import SignalLogger, is_settled as _sig_settled
 import sw_schedule
 from rt_profile import RtProfile
@@ -70,10 +70,9 @@ class SdrApp:
         self.driver = RtlSdrDriver()
         # DSPパイプライン
         self.dsp = SdrDspPipeline(self.sample_rate, self.audio_rate)
-        # 地域規格 (ディエンファシス 50/75μs) とステレオ設定を適用
+        # 地域規格 (ディエンファシス 50/75μs) を適用。
         self.dsp.set_deemphasis(self.profile["deemphasis_us"])
-        self.dsp.set_stereo_enabled(self.config.get("stereo", True))
-        self.dsp.set_stereo_nr(self.config.get("stereo_nr", True))
+        # ステレオ・NRは常時ON固定 (保存済み設定に依らず上書き)。
         self.dsp.sic_enabled = bool(self.config.get("sic", True))
         self._apply_black_magic_config()
         # オーディオ出力
@@ -122,14 +121,10 @@ class SdrApp:
         self.gui.on_seek_change = lambda d: self.cmd_queue.put(("SEEK", d))
         self.gui.on_scan_request = lambda: self.cmd_queue.put(("SCAN", None))
         self.gui.on_sw_scan_request = lambda: self.cmd_queue.put(("SW_SCAN", None))
-        self.gui.on_ppm_cal_request = lambda: self.cmd_queue.put(("PPM_CAL", None))
-        self.gui.on_stereo_toggle = lambda: self.cmd_queue.put(("STEREO_TOGGLE", None))
         self.gui.on_bfo_change = lambda d: self.cmd_queue.put(("BFO", d))
         # DXはC/N連動の自動絞りに一本化 (ボタン削除・木漏れ日整理)。
         # AFCは常時ON固定 (GUIボタン削除・木漏れ日整理)。
-        # 起動時のステレオ状態をボタン表示へ反映。NRは常時ON固定。
-        self.gui.set_stereo_enabled(self.config.get("stereo", True))
-        self.dsp.set_stereo_nr(True)
+        # ステレオ・NRは常時ON固定 (自動ブレンドに一本化)。保存済みOFF設定も上書きする。
 
         self.gui.center_freq = self.freq
         self.gui.mode = self.mode
@@ -669,88 +664,6 @@ class SdrApp:
                 self.gui.scan_status_text = t("sw_scan_none")
             return stations
 
-        def safe_ppm_cal():
-            """PPM較正スキャン: 強局リストを順に巡回し、各局でAFC定常残差を
-            標本化して中央値PPMを推定・適用する。USBストリームは継続したまま
-            同調だけ切り替えるため受信は止まらない (音声は巡回局に追従する)。
-            終了後は元の選局へ復帰する。"""
-            # 局リストが無ければ先にFM帯スキャン (USB安全停止・復帰つき)
-            if not self.tuner.discovered_stations:
-                safe_band_scan(t("scanning", start=f"{self.profile['fm_start']:g}",
-                                 end=f"{self.profile['fm_end']:g}"))
-            cands = pick_ppm_stations(self.tuner.discovered_stations, n=5)
-            if len(cands) < PpmCalibrator.MIN_SAMPLES:
-                self.gui.scan_status_text = t("ppm_none")
-                return []
-            saved_freq, saved_mode = self.freq, self.mode
-            self.ppm_cal.clear()
-            self.gui.scan_status_text = t("ppm_scanning", n=len(cands))
-            # 高速収束のためAFC追従を一時的に強める (終了後に復元。AFC自体は常時ON)
-            alpha_was = float(getattr(self.dsp, "afc_alpha", 0.05))
-            try:
-                self.dsp.afc_alpha = 0.20
-            except Exception:
-                pass
-            collected = 0
-            try:
-                for st in cands:
-                    if not self.running:
-                        break
-                    self._apply_frequency_and_mode(int(st["freq_hz"]), "WFM")
-                    self.gui.center_freq = self.freq
-                    afc_prev = None
-                    stable_since = None
-                    t_start = time.monotonic()
-                    settled = False
-                    while self.running and (time.monotonic() - t_start) < 6.0:
-                        try:
-                            raw_bytes = raw_queue.get(timeout=0.5)
-                        except queue.Empty:
-                            continue
-                        try:
-                            self.dsp.update_resampler_feedback(
-                                float(self.audio.get_queue_size()))
-                            t_dsp = time.perf_counter()
-                            audio_pcm, spectrum_db = self.dsp.process(
-                                raw_bytes, mode="WFM")
-                            self.rt_profile.add((time.perf_counter() - t_dsp) * 1000.0)
-                            self.audio.put_audio(audio_pcm)
-                            with self.spectrum_lock:
-                                self.latest_spectrum = spectrum_db
-                                self.latest_audio = audio_pcm
-                        except Exception:
-                            continue
-                        afc = float(getattr(self.dsp, "afc_offset_hz", 0.0))
-                        now_m = time.monotonic()
-                        if afc_prev is not None and abs(afc - afc_prev) < 30.0:
-                            if stable_since is None:
-                                stable_since = now_m
-                            elif now_m - stable_since >= 1.0:
-                                settled = True
-                                break
-                        else:
-                            stable_since = None
-                        afc_prev = afc
-                    if settled:
-                        collected = self.ppm_cal.collect(int(st["freq_hz"]), afc)
-            finally:
-                try:
-                    self.dsp.afc_alpha = alpha_was
-                except Exception:
-                    pass
-                try:
-                    self._apply_frequency_and_mode(saved_freq, saved_mode)
-                    self.gui.center_freq = self.freq
-                    self.gui.mode = self.mode
-                    self.gui._sync_bfo_visibility()
-                except Exception as e:
-                    print(f"[ERROR] PPM cal restore failed: {e}", file=sys.stderr)
-            if collected >= PpmCalibrator.MIN_SAMPLES:
-                self._ppm_try_apply(collected, "scan")
-            else:
-                self.gui.scan_status_text = t("ppm_none")
-            return collected
-
         t_usb = start_usb_stream()
         self._worker_t0 = time.monotonic()
 
@@ -797,16 +710,6 @@ class SdrApp:
                     elif cmd == "SW_SCAN":
                         # 短波(HF)放送バンドスキャン (ダイレクトサンプリング)
                         safe_hf_scan(t("sw_scanning"))
-                    elif cmd == "PPM_CAL":
-                        # PPM較正スキャン (強局巡回・ストリーム継続のまま同調だけ切替)
-                        safe_ppm_cal()
-                    elif cmd == "STEREO_TOGGLE":
-                        enabled = not bool(getattr(self.dsp, "stereo_enabled", True))
-                        self.dsp.set_stereo_enabled(enabled)
-                        self.config["stereo"] = enabled
-                        save_config(self.config)
-                        self.gui.set_stereo_enabled(enabled)
-                        self.gui.scan_status_text = t("stereo_on_msg") if enabled else t("mono_on_msg")
                     elif cmd == "BFO":
                         bfo = float(np.clip(self.dsp.bfo_offset_hz + float(val), -2000.0, 2000.0))
                         self.dsp.bfo_offset_hz = bfo
