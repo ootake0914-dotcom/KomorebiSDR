@@ -75,7 +75,7 @@ def main() -> int:
     # 複数ブロック比較は差分法に固定して厳密等価を確認する。
     # PLL自体の等価性は下記の単ブロック試験で確認する。
     d_native.fm_pll_enabled = False
-    # EKF/リーマン等のPython専用適応は
+    # EKF/位相スリップ抑制等のPython専用適応処理は
     # ネイティブ等価の対象外のため無効化 (有効だと原理的に差分が出る)
     for _attr in ("ekf_enabled", "cognitive_enabled", "riemann_always"):
         try:

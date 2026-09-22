@@ -1,5 +1,5 @@
 """
-Unit tests for TopologicalClickSuppressor (Topological Data Analysis FM demodulator).
+Unit tests for TopologicalClickSuppressor (Phase-Slip Click Suppressor).
 """
 
 import os
@@ -36,8 +36,8 @@ def test_clean_signal_transparency():
 
 def test_synthetic_click_suppression():
     """
-    弱電界フェージングで発生する原点包囲トポロジカル特異点 (Phase Slip / クリックスパイク) を注入し、
-    検出と局所微分同相写像によるスパイク抑圧性能を検証。
+    弱電界フェージングで発生する位相スリップ (Phase Slip / クリックスパイク) を注入し、
+    検出と補間によるスパイク抑圧性能を検証。
     """
     fs = 288000.0
     t = np.arange(2048, dtype=np.float64) / fs

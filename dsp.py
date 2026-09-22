@@ -287,23 +287,23 @@ class SdrDspPipeline:
         self._last_cos3 = None
         self._last_sin3 = None
 
-        # NASA DSN方式 自律適応カルマン・パイロット搬送波追従器 (AKCTL)
+        # 適応カルマン・パイロット搬送波トラッカー (19kHz追従)
         self.pilot_tracker = KalmanPilotTracker(sample_rate=self.if_rate)
 
-        # ホログラフィック・ハイレゾ倍音外挿エンジン (15kHz〜22kHz エアバンド再合成)
+        # 高域高調波補完エキサイター (Harmonic Exciter: 15kHz以上の高域倍音付加)
         # NOTE: 実機実測(ラッキーFM 94.6MHz 強電界)で無音時の12-15kHzを+18.7dB
         # 持ち上げ、静かな場面に合成ヒスが乗ることを確認したため既定OFF。
         # 再有効化は .enabled=True (弱局で空気感を出したい場合のみ推奨)。
         self.holographic_enhancer = HolographicAudioEnhancer(sample_rate=self.audio_rate, air_gain=0.08)
         self.holographic_enhancer.enabled = False
 
-        # リーマン多様体トポロジカル測地線復調器 (特異点位相スリップ幾何学遮断)
+        # 位相スリップ抑制型FM復調器 (特異点クリック防止)
         self.riemann_demodulator = RiemannianTopologicalDemodulator(sample_rate=self.if_rate)
 
-        # 超空間独立成分ステレオ復調器 (BSS / FastICA ステレオ逆相三角ヒスノイズ直交消去)
+        # 独立成分分析ステレオ復調器 (BSS / FastICA によるヒス低減)
         self.bss_separator = SuperSpatialBssStereoSeparator(sample_rate=self.audio_rate)
 
-        # ランダム行列特異値切除ノイズクリーナー (Random Matrix Theory & Marchenko-Pastur Law ノイズ切除)
+        # ハンケル行列SVD部分空間ノイズフィルター (SVD特異値しきい値処理)
         # NOTE: 実機実測で番組の12-15kHzを+7.1dB変形 (入出力相関0.9916=非透明) し、
         # 弱局でのノイズ低減効果も確認できなかったため既定OFF (CPUも節約)。
         self.rmt_denoiser = RmtHankelDenoiser(sample_rate=self.audio_rate, embed_dim=24)
@@ -1008,7 +1008,7 @@ class SdrDspPipeline:
                 if len(demod_ekf) == len(demod):
                     demod = ((1.0 - w_ekf) * demod + w_ekf * demod_ekf).astype(np.float32)
 
-        # リーマン多様体トポロジカル測地線正則化 (Hyper自律最適化時: フェージング特異点クリックの幾何学的遮断)
+        # 位相スリップ防止FM復調 (弱電界フェージング時のクリック雑音抑制)
         if (getattr(self, "riemann_demodulator", None) is not None
                 and self.riemann_demodulator.enabled
                 and (self.cognitive_enabled or getattr(self, "riemann_always", False))
@@ -1018,7 +1018,7 @@ class SdrDspPipeline:
             if len(demod_riemann) == len(demod):
                 demod = ((1.0 - w_riemann) * demod + w_riemann * demod_riemann).astype(np.float32)
 
-        # 超音波三角ノイズ比追従型 コグニティブ・オートスケルチ
+        # 超音波三角ノイズ比追従型 オートスケルチ
         ultra_gain = 1.0
         if getattr(self, "ultra_squelch", None) is not None and self.ultra_squelch.enabled:
             ultra_gain, _ = self.ultra_squelch.process(demod)
@@ -1578,8 +1578,8 @@ class SdrDspPipeline:
             fir_final = self.fir_audio_clean
 
         # decimate_with_history (factor=1) を用いることで、フィルタ長変更時にもサンプル数の一致を保証
-        # ホログラフィック用の広帯域ソースをカット前にタップ (カット後に種を取ると
-        # 8〜14k成分が無くエア生成がno-opになる。生成した16〜22kはカット後に足す)
+        # 高域エキサイター用の広帯域ソースをカット前にタップ (カット後に種を取ると
+        # 8〜14k成分が無く倍音生成がno-opになる。生成した16〜22kはカット後に足す)
         wide_src = np.asarray(audio).astype(np.float32)
         if ch in ("", "_l"):
             # トラッカー用の広帯域タップ (Lのみで十分。process末尾でanalyzeする)
@@ -1595,7 +1595,7 @@ class SdrDspPipeline:
         elif self.filter_mode == "narrow":
             audio = self._apply_noise_expander(audio, threshold=0.09)
 
-        # ホログラフィック・ハイレゾ倍音外挿 (Hyper自律最適化時: 15kHz〜22kHz エアバンド再合成)
+        # 高域高調波補完 (15kHz〜22kHzの高域倍音付加)
         if (getattr(self, "holographic_enhancer", None) is not None
                 and self.holographic_enhancer.enabled
                 and (self.cognitive_enabled or getattr(self, "holographic_always", False))):
@@ -1604,7 +1604,7 @@ class SdrDspPipeline:
             audio = self.holographic_enhancer.process(audio, ch=ch, speech_prob=speech_p, s_meter_dbfs=s_meter,
                                                       source=wide_src)
 
-        # ランダム行列特異値切除ノイズクリーナー (Marchenko-Pastur則による弱電界ランダム雑音切除)
+        # SVD部分空間ノイズ除去 (特異値しきい値による弱電界ノイズ低減)
         if (getattr(self, "rmt_denoiser", None) is not None
                 and self.rmt_denoiser.enabled
                 and (self.cognitive_enabled or getattr(self, "rmt_always", False))):

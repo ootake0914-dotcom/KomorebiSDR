@@ -339,7 +339,7 @@ def test_holographic_audio_enhancer():
     enhancer._histories["_l"] = np.zeros(len(enhancer.fir_hp15k) - 1, dtype=np.float32)
     out_weak = enhancer.process(sig, ch="_l", speech_prob=0.0, s_meter_dbfs=-50.0)
     assert np.allclose(out_weak, sig, atol=1e-5), "弱電界ノイズ環境で保護バイパスされていません"
-    print("[OK] ホログラフィック・ハイレゾ倍音外挿テスト成功")
+    print("[OK] 高域高調波補完エキサイターテスト成功")
 
 
 def test_riemannian_topological_demodulator():
@@ -360,7 +360,7 @@ def test_riemannian_topological_demodulator():
     demod_clean = demodulator.demodulate(clean_iq)
     ref_norm = (2.0 * np.pi * dev_hz / fs) * mod_audio
     corr_clean = float(np.corrcoef(demod_clean[100:], ref_norm[100:])[0, 1])
-    print(f"[*] クリーンFM波のリーマン測地線復調相関度: {corr_clean:.6f} (期待値 > 0.999)")
+    print(f"[*] クリーンFM波の位相スリップ防止復調相関度: {corr_clean:.6f} (期待値 > 0.999)")
     assert corr_clean > 0.999, f"クリーン波形の追従精度が不十分です: {corr_clean}"
 
     # 2. 分岐切断 (±π) 横断クリックの除去検証
@@ -386,7 +386,7 @@ def test_riemannian_topological_demodulator():
 
     assert riemann_clicks < naive_clicks, "分岐切断クリックが除去されていません"
     assert corr_riemann >= corr_naive - 0.01, "アンラップで波形が劣化しています"
-    print("[OK] リーマン多様体トポロジカル測地線復調テスト成功")
+    print("[OK] 位相スリップ防止FM復調テスト成功")
 
 
 def test_super_spatial_bss_stereo_separator():
@@ -515,7 +515,7 @@ def test_rmt_hankel_denoiser():
     print(f"[*] 分割処理 vs 一括処理の最大差分: {diff_split:.2e} (完全一致)")
     assert diff_split < 1e-6, f"境界不連続が生じています: {diff_split}"
 
-    print("[OK] ランダム行列特異値切除ノイズクリーナーテスト成功")
+    print("[OK] ハンケル行列SVDノイズ除去テスト成功")
 
 
 if __name__ == "__main__":

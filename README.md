@@ -97,4 +97,4 @@ python main.py --freq 9.75 --mode AM
 
 ## License
 
-This project is licensed under the [MIT License](LICENSE).
+This project is licensed under the [GNU General Public License v2.0 (GPL-2.0)](LICENSE) due to the inclusion of `librtlsdr`. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for details on bundled third-party components.

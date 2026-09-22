@@ -184,14 +184,14 @@ class CognitiveSpeechMusicTracker:
 
 
 class HolographicAudioEnhancer:
-    """ホログラフィック・ハイレゾ倍音外挿エンジン (Holographic Audio Enhancer)
+    """高域高調波補完エキサイター (Harmonic Audio Enhancer)
 
-    FM放送規格 (15kHz急峻遮断) により物理的に失われた 15kHz〜22kHz の超高域空気感 (エアバンド) を、
-    原音の調和構造から非線形音響物理モデルでホログラフィックに再合成する。
+    FM放送規格 (15kHz急峻遮断) により失われる 15kHz〜22kHz の高域成分に対して、
+    原音の8kHz〜14kHz帯域から2次高調波を生成し、エアバンドとして付加する。
 
-    - 8kHz〜14kHz帯域の瞬時微細倍音から、調和関係を崩さない純粋な2次・3次高調波を生成。
-    - 15kHz急峻ハイパスFIRフィルタにより、エアバンドのみを抽出し原音へ位相同期ブレンド。
-    - コグニティブ保護: 音楽区間かつ強〜中電界時のみ適応的に作用し、アナウンサーのトークや弱電界ノイズ時は完全バイパス (原音100%ビットパーフェクト)。
+    - 8kHz〜14kHz帯域の成分から、調和関係を崩さない高調波を生成。
+    - 15kHz急峻ハイパスFIRフィルタにより、高域のみを抽出して原音へブレンド。
+    - 音楽区間かつ中〜強電界時のみ適応的に作用し、トーク時や弱電界時はバイパス。
     """
 
     def __init__(self, sample_rate: float = 48000.0, air_gain: float = 0.08):
@@ -216,7 +216,7 @@ class HolographicAudioEnhancer:
 
     def process(self, audio: np.ndarray, ch: str = "", speech_prob: float = 0.0, s_meter_dbfs: float = -20.0,
                 source: np.ndarray = None) -> np.ndarray:
-        """ホログラフィック倍音外挿処理を実行。
+        """高域倍音補完処理を実行。
 
         source: 倍音の種にする広帯域信号。Noneならaudio自身を使う。
         パイプラインでは最終ハイカット後のaudioに、ハイカット前のsourceから
@@ -254,25 +254,20 @@ class HolographicAudioEnhancer:
         air = np.convolve(buf, self.fir_hp15k, mode='valid').astype(np.float32)
         self._histories[ch] = buf[len(audio):].astype(np.float32)
 
-        # 4. 原音へホログラフィック・ブレンド
+        # 4. 原音へブレンド
         out = audio + air * (self.air_gain * factor)
         return out.astype(np.float32)
 
 
 class RmtHankelDenoiser:
-    """ランダム行列特異値切除ノイズクリーナー (Random Matrix Theory Hankel Denoiser)
+    """ハンケル行列SVDノイズリデューサー (Hankel Subspace Denoiser)
 
-    音声時系列からハンケル軌道行列を構築し、ウィシャート共分散行列の固有値分布に対して
-    ランダム行列理論のマルチェンコ・パスツール則 (Marchenko-Pastur Law) を適用。
-    真の信号成分（調和振動・フォルマント）と純粋な白色・三角雑音を幾何学的に分離し、
-    MP理論上限 lambda_+ 以下の雑音固有値のみを数学的に切除（BBP相転移特異値収縮）する。
+    音声時系列からハンケル軌道行列を構築し、共分散行列の固有値分布に対して
+    ランダム行列理論 (マルチェンコ・パスツール則) に基づく特異値しきい値処理を適用。
+    主成分と雑音部分空間を分離し、ノイズ成分を抑制する。
 
-    - 反対角対角平均化定理 (Hankel Anti-Diagonal Projector Theorem) により、
-      射影行列 P を等価な 2L-1 タップの厳密ゼロ位相空間核フィルタ h_rmt(m) へ解析的縮約。
-    - 周波数フィルタのように音声を曇らせることなく、微小なボーカルや残響を無傷で保持。
-    - クリーン信号 (強電界・高SNR) でのビット一致性: 1.000000 (完全バイパス)
-    - 弱電界ノイズ下でのSNR改善: +5.0dB 〜 +8.0dB
-    - 準定常適応追従 (4ブロックに1回固有値分解更新 & 0.05ms 超高速ゼロ位相FIR)
+    - 反対角平均化により、射影行列 P を等価な 2L-1 タップの厳密ゼロ位相FIRフィルタへ縮約。
+    - クリーン信号 (強電界・高SNR) では完全バイパス。
     - Overlap-Lookahead によるブロック境界誤差 0.00e+00 (完全シームレス)
     """
 

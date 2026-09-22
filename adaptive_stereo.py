@@ -4,7 +4,7 @@ Stereo/subcarrier adaptive modules (extracted from adaptive_dsp.py).
 ステレオ・副搬送波系の適応モジュール群の正準の保持場所:
 - QuadratureMpxCanceller (MPX直交キャンセラ)
 - SuperSpatialBssStereoSeparator (Side調性保護付きステレオ分離)
-- QuaternionMpxDecoupler (四元数MPX直交デカップラー)
+- QuaternionMpxDecoupler (MPX直交位相・クロストーク補正器)
 
 `adaptive_dsp.py` は後方互換のため同名を再エクスポートする。
 """
@@ -219,28 +219,15 @@ class SuperSpatialBssStereoSeparator:
 
 class QuaternionMpxDecoupler:
     """
-    四元数代数 (Quaternion Algebra / H多元数系) に基づく
-    ステレオMPX 4次元直交デカップラー。
+    ステレオMPX 直交位相・クロストーク適応補正器。
 
-    【数理的背景: 4次元剛体回転と直交性保存】
-    FMステレオMPX信号は、(1) 和信号 L+R、(2) パイロット 19kHz、
-    (3) ステレオ副搬送波同相成分 (L-R)_I、(4) 直交漏洩成分 (L-R)_Q という
-    4つの直交物理量から構成されます。
-    中間周波フィルタの群遅延非対称性や都市部マルチパス反射により、
-    これら 4 軸間に相互干渉（回転・スキュー・漏洩）が生じ、
-    ステレオセパレーション低下や中高域の混濁（シピシピ音）を引き起こします。
+    【背景: 直交位相スキューと漏洩】
+    FMステレオMPX信号では、IFフィルタの群遅延非対称性やマルチパスにより、
+    副搬送波の同相成分 (L-R)_I と直交成分 (L-R)_Q の間に位相スキューが生じ、
+    セパレーション低下や混濁音の原因となります。
 
-    本クラスでは、4信号を四元数:
-        q = w + x*i + y*j + z*k   (w: L+R, x: Pilot, y: (L-R)_I, z: (L-R)_Q)
-    としてモデル化し、四元数単位ローター:
-        u = cos(phi/2) + i * sin(phi/2)
-    によるサンドイッチ積 q' = u * q * u* (4次元直交剛体回転) を適応制御します。
-
-    【効果】
-    - ノルム完全保存: 4次元空間のエネルギー総量を一切損なわず、純粋な回転変換のみを適用。
-    - 直交漏洩消去: (L-R)_I に混入した (L-R)_Q 成分を代数的に一括消去。
-    - 和差クロストーク完全遮断: L+R と L-R 間の不要な漏洩を遮断し、ステレオセパレーションを
-      理論極限 (-40dB 〜 -50dB) へ劇的に改善。
+    本クラスでは、同相・直交成分間の位相回転角を適応追従して直交性を補正し、
+    和信号と差信号間のクロストークを低減します。
     """
 
     def __init__(self, sample_rate: float = 48000.0, mu_rot: float = 0.05, mu_leak: float = 0.02):
