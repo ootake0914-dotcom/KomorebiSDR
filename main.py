@@ -112,30 +112,28 @@ class SdrApp:
         self.latest_audio = np.zeros(1024, dtype=np.float32)
         self.running = False
         self.sdr_thread = None
-        self.manual_gain_db = None  # 手動ゲイン値 (スキャン復元用)
+        # ゲインはHyper自動に一本化 (手動操作削除・木漏れ日整理)。
 
         # GUIコールバック登録
         self.gui.on_freq_change = self.set_frequency
         self.gui.on_mode_change = self.set_mode
-        self.gui.on_gain_change = self.set_gain
-        self.gui.on_gain_lock_toggle = lambda: self.cmd_queue.put(("GAIN_LOCK_TOGGLE", None))
         self.gui.on_volume_change = self.audio.set_volume
-        self.gui.on_filter_change = lambda m: self.cmd_queue.put(("FILTER", m))
+        # Filterはclean固定 (GUIボタン削除・木漏れ日整理)。
         self.gui.on_seek_change = lambda d: self.cmd_queue.put(("SEEK", d))
         self.gui.on_scan_request = lambda: self.cmd_queue.put(("SCAN", None))
         self.gui.on_sw_scan_request = lambda: self.cmd_queue.put(("SW_SCAN", None))
         self.gui.on_ppm_cal_request = lambda: self.cmd_queue.put(("PPM_CAL", None))
         self.gui.on_stereo_toggle = lambda: self.cmd_queue.put(("STEREO_TOGGLE", None))
-        self.gui.on_nr_toggle = lambda: self.cmd_queue.put(("NR_TOGGLE", None))
         self.gui.on_bfo_change = lambda d: self.cmd_queue.put(("BFO", d))
-        self.gui.on_dx_toggle = lambda en: self.cmd_queue.put(("DX", en))
-        self.gui.on_afc_toggle = lambda en: self.cmd_queue.put(("AFC", en))
-        # 起動時のステレオ/NR状態をボタン表示へ反映
+        # DXはC/N連動の自動絞りに一本化 (ボタン削除・木漏れ日整理)。
+        # AFCは常時ON固定 (GUIボタン削除・木漏れ日整理)。
+        # 起動時のステレオ状態をボタン表示へ反映。NRは常時ON固定。
         self.gui.set_stereo_enabled(self.config.get("stereo", True))
-        self.gui.set_nr_enabled(self.config.get("stereo_nr", True))
+        self.dsp.set_stereo_nr(True)
 
         self.gui.center_freq = self.freq
         self.gui.mode = self.mode
+        self.gui._sync_bfo_visibility()
         self.gui.sample_rate = self.sample_rate
 
     def _region_defaults(self) -> tuple:
@@ -244,11 +242,9 @@ class SdrApp:
         except Exception as e:
             print(f"[WARN] PPM restore failed: {e}", file=sys.stderr)
 
-        # コントローラ初期化
+        # コントローラ初期化 (ゲインは常に自動)
         self.controller.init_gains()
-        self.gui.gains_list = self.controller.available_gains
         self.gui.is_auto_gain = True
-        self.gui.gain_auto_label = self._ctrl_label()
         self.gui.btn_gain_auto.text = self._ctrl_label()
         print(f"[*] {self._ctrl_label()} autonomous optimization engine enabled")
 
@@ -270,7 +266,7 @@ class SdrApp:
 
     # 合体可能コマンド: 滞留中の同種は最新のみ適用 (スキャン中のスライダ連打対策)。
     # BFOは差分(±50Hz)コマンドのため合体すると押した分が消える→除外。
-    _COALESCE_CMDS = ("FREQ", "MODE", "GAIN", "FILTER")
+    _COALESCE_CMDS = ("FREQ", "MODE", "FILTER")
 
     def _drain_commands(self):
         """キューを全排出して陳腐化コマンドを合体する。
@@ -399,9 +395,6 @@ class SdrApp:
 
     def set_mode(self, mode: str):
         self.cmd_queue.put(("MODE", mode))
-
-    def set_gain(self, auto_gain: bool, gain_val: float):
-        self.cmd_queue.put(("GAIN", (auto_gain, gain_val)))
 
     def _ppm_background_tick(self, now: float):
         """PPM背景収集 (ワーカーから2秒毎)。強力FMステレオ局のAFC定常残差を
@@ -553,15 +546,8 @@ class SdrApp:
                 print(f"[ERROR] restore freq/mode failed: {e}", file=sys.stderr)
             try:
                 if self.use_controller:
-                    # 自動モード: コントローラの探索へ戻す
+                    # 自動モード: コントローラの探索へ戻す (手動ゲイン廃止のため常に自動)
                     self.controller.init_gains()
-                elif self.manual_gain_db is not None:
-                    # 手動モード: ユーザーが設定した手動ゲインを復元 (スキャン中の33.8dB固定から戻す)
-                    try:
-                        self.driver.set_gain_mode(True)
-                        self.driver.set_gain(self.manual_gain_db)
-                    except Exception:
-                        pass
             except Exception as e:
                 print(f"[ERROR] restore gains failed: {e}", file=sys.stderr)
 
@@ -675,6 +661,7 @@ class SdrApp:
                 self._apply_frequency_and_mode(best["freq_hz"], "AM")
                 self.gui.center_freq = best["freq_hz"]
                 self.gui.mode = "AM"
+                self.gui._sync_bfo_visibility()
                 self.gui.scan_status_text = t(
                     "sw_scan_done", n=len(stations),
                     freq=f"{best['freq_mhz']:.3f}", snr=f"{best['snr_db']:+.1f}")
@@ -698,10 +685,8 @@ class SdrApp:
             saved_freq, saved_mode = self.freq, self.mode
             self.ppm_cal.clear()
             self.gui.scan_status_text = t("ppm_scanning", n=len(cands))
-            # 高速収束のためAFC追従を一時的に強める (終了後に復元)
-            afc_was = bool(getattr(self.dsp, "afc_enabled", True))
+            # 高速収束のためAFC追従を一時的に強める (終了後に復元。AFC自体は常時ON)
             alpha_was = float(getattr(self.dsp, "afc_alpha", 0.05))
-            self.dsp.afc_enabled = True
             try:
                 self.dsp.afc_alpha = 0.20
             except Exception:
@@ -750,7 +735,6 @@ class SdrApp:
                         collected = self.ppm_cal.collect(int(st["freq_hz"]), afc)
             finally:
                 try:
-                    self.dsp.afc_enabled = afc_was
                     self.dsp.afc_alpha = alpha_was
                 except Exception:
                     pass
@@ -758,6 +742,7 @@ class SdrApp:
                     self._apply_frequency_and_mode(saved_freq, saved_mode)
                     self.gui.center_freq = self.freq
                     self.gui.mode = self.mode
+                    self.gui._sync_bfo_visibility()
                 except Exception as e:
                     print(f"[ERROR] PPM cal restore failed: {e}", file=sys.stderr)
             if collected >= PpmCalibrator.MIN_SAMPLES:
@@ -777,63 +762,6 @@ class SdrApp:
                         self._apply_frequency_and_mode(val, self.mode)
                     elif cmd == "MODE":
                         self._apply_frequency_and_mode(self.freq, val)
-                    elif cmd == "GAIN_LOCK_TOGGLE":
-                        # 手動ゲイン中だった場合は、コントローラを再有効化して自動最適化へ復帰
-                        if not self.use_controller:
-                            self.use_controller = True
-                            self.controller.enabled = True
-                            # 古い観測値ではなく新たにベイズ的スウィートスポットから再探索
-                            self.controller.reset_tracking()
-                            self.gui.is_auto_gain = True
-                            self.gui.manual_gain_db = None
-                            self.gui.scan_status_text = t("auto_gain_resumed")
-                        elif hasattr(self.controller, "set_hard_lock"):
-                            current_locked = getattr(self.controller, "hard_lock", False)
-                            new_locked = not current_locked
-                            self.controller.set_hard_lock(new_locked)
-                            if new_locked:
-                                if self.controller.available_gains:
-                                    g_val = self.controller.available_gains[self.controller.current_gain_idx]
-                                    self.gui.scan_status_text = t("gain_locked_msg", db=f"{g_val:.1f}")
-                            else:
-                                self.gui.scan_status_text = t("gain_research_msg")
-                    elif cmd == "GAIN":
-                        auto_gain, gain_val = val
-                        if auto_gain:
-                            self.use_controller = True
-                            self.controller.enabled = True
-                            if hasattr(self.controller, "set_hard_lock"):
-                                self.controller.set_hard_lock(False)
-                            self.gui.is_auto_gain = True
-                            self.gui.manual_gain_db = None
-                            self.gui.scan_status_text = t("auto_gain_resumed")
-                        else:
-                            self.use_controller = False
-                            self.controller.enabled = False
-                            self.manual_gain_db = float(gain_val)
-                            self.driver.set_gain_mode(True)
-                            self.driver.set_gain(gain_val)
-                            self.gui.is_auto_gain = False
-                            self.gui.is_hard_locked = True
-                            self.gui.manual_gain_db = float(gain_val)
-                            self.gui.btn_gain_auto.text = t("gain_manual", db=f"{gain_val:.1f}")
-                            self.gui.btn_gain_auto.bg_color = (206, 236, 224)
-                            self.gui.scan_status_text = t("manual_gain_set", db=f"{gain_val:.1f}")
-                    elif cmd == "FILTER":
-                        self.gui.filter_mode = val
-                        if val == "auto":
-                            # 適応制御へ復帰 (Hyperはoverride解除、dspは既定モードへ)
-                            self.dsp.filter_mode = "clean"
-                            if hasattr(self.controller, "set_filter_override"):
-                                self.controller.set_filter_override(None)
-                            if self.controller_type == "hyper" and hasattr(self.controller, "reset_tracking"):
-                                self.controller.reset_tracking()
-                        else:
-                            self.dsp.filter_mode = val
-                            # Cascade式の離散モード切替ではなく、Hyperは連続カットオフの手動固定として反映
-                            # cascadeにもfilter_overrideを移植したため共通で呼ぶ
-                            if hasattr(self.controller, "set_filter_override"):
-                                self.controller.set_filter_override(val)
                     elif cmd == "SEEK":
                         # 次局/前局シーク (AM/短波ではSW局リスト、FM/その他ではFM局リスト)
                         direction = val
@@ -883,25 +811,6 @@ class SdrApp:
                         bfo = float(np.clip(self.dsp.bfo_offset_hz + float(val), -2000.0, 2000.0))
                         self.dsp.bfo_offset_hz = bfo
                         self.gui.scan_status_text = t("bfo_msg", hz=f"{bfo:+.0f}")
-                    elif cmd == "NR_TOGGLE":
-                        enabled = not bool(getattr(self.dsp, "stereo_nr_enabled", True))
-                        self.dsp.set_stereo_nr(enabled)
-                        self.config["stereo_nr"] = enabled
-                        save_config(self.config)
-                        self.gui.set_nr_enabled(enabled)
-                        self.gui.scan_status_text = t("nr_on_msg") if enabled else t("nr_off_msg")
-
-                    elif cmd == "DX":
-                        # DX超高感度モード
-                        self.controller.dx_mode = val
-                        if val:
-                            self.dsp.filter_mode = "narrow"
-                        self.gui.scan_status_text = t("dx_on") if val else t("dx_off")
-                    elif cmd == "AFC":
-                        # AFC自動周波数追従
-                        self.dsp.afc_enabled = val
-                        self.gui.scan_status_text = t("afc_on") if val else t("afc_off")
-
                 except Exception as e:
                     # 1つのコマンド失敗で受信ワーカー全体を落とさない
                     print(f"[ERROR] Command '{cmd}' failed: {e}", file=sys.stderr)
@@ -946,8 +855,7 @@ class SdrApp:
                     else:
                         stats = self.controller.process_frame(raw_bytes, spectrum_db)
                     self.gui.gain_val = stats["gain_db"]
-                    if hasattr(self.gui, "btn_filter"):
-                        self.gui.btn_filter.text = f"Filter: {stats['filter_mode'].capitalize()}"
+                    # Filterボタン廃止済み (clean固定)。filter_mode報告はstats内のみ。
 
                     # ゲインボタンの表示を決め打ち（手動固定）・自動収束・探索状態に正確に同期
                     hard_locked = stats.get("hard_lock", False)

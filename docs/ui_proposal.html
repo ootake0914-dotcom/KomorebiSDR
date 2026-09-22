@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>KOMOREBI Radio — UI案（Tivoli風モック・改訂版）</title>
+<style>
+  :root{
+    --walnut:#5a3d26; --walnut-d:#3d2817; --cream:#f5eeda; --cream-d:#e9dec3;
+    --green:#2e5d43; --green-d:#1e4030; --gold:#c9a24b; --ink:#3a3227;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:#2b2620;color:var(--ink);
+    font-family:"Hiragino Kaku Gothic ProN","Yu Gothic",sans-serif;line-height:1.7}
+  header{max-width:960px;margin:0 auto;padding:28px 20px 8px;color:var(--cream)}
+  header h1{margin:0;font-size:26px;letter-spacing:.08em}
+  header p{margin:6px 0 0;color:#cbbfa5}
+  main{max-width:960px;margin:0 auto;padding:10px 20px 60px}
+  section{background:var(--cream);border-radius:14px;padding:22px 24px;margin:18px 0}
+  section h2{margin:0 0 4px;font-size:18px;color:var(--green-d)}
+  section .sub{margin:0 0 14px;color:#7a6f5c;font-size:13px}
+  .policy{background:#fff;border-left:4px solid var(--gold);border-radius:0 10px 10px 0;
+    padding:10px 16px;margin:0 0 14px;font-size:14px}
+  /* ===== radio mock ===== */
+  .radio{background:linear-gradient(160deg,var(--walnut),var(--walnut-d));
+    border-radius:18px;padding:26px;box-shadow:0 18px 50px rgba(0,0,0,.5);
+    display:grid;grid-template-columns:1fr 300px;gap:22px;color:var(--cream)}
+  .face{background:var(--cream-d);border-radius:12px;padding:18px;color:var(--ink)}
+  .station{font-size:13px;color:#7a6f5c;letter-spacing:.2em}
+  .station-name{font-size:34px;font-weight:700;color:var(--green-d);margin:2px 0}
+  .freq{font-size:15px;color:#4a4438}
+  .freq small{color:#7a6f5c}
+  .feel{margin-top:10px;display:inline-block;background:var(--green);color:#fff;
+    border-radius:999px;padding:4px 14px;font-size:13px}
+  .dial-wrap{display:flex;flex-direction:column;align-items:center;gap:10px}
+  .dial{width:220px;height:220px;border-radius:50%;
+    background:radial-gradient(circle at 35% 30%,#8a653f,#4a3018 70%);
+    border:6px solid var(--gold);position:relative;cursor:pointer;
+    box-shadow:0 6px 18px rgba(0,0,0,.45)}
+  .dial::after{content:"";position:absolute;left:50%;top:8px;width:6px;height:52px;
+    background:var(--cream);border-radius:3px;transform:translateX(-50%)}
+  .dial-row{display:flex;gap:10px}
+  button{border:0;border-radius:10px;padding:10px 18px;font-size:15px;cursor:pointer}
+  .btn-power{background:var(--green);color:#fff}
+  .btn-fav{background:transparent;border:2px solid var(--gold);color:var(--walnut-d)}
+  .vol{width:100%;accent-color:var(--green)}
+  .favs{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}
+  .fav{background:#fff;border:1px solid #d8cdae;border-radius:999px;
+    padding:6px 14px;font-size:13px;color:var(--ink)}
+  .ura{margin-top:16px;background:#efe6cf;border:1px dashed #b7a67e;border-radius:10px;
+    padding:12px 14px;font-size:13px;color:#6a5f4b}
+  /* ===== vocab table ===== */
+  table{width:100%;border-collapse:collapse;font-size:14px}
+  th,td{border-bottom:1px solid #d8cdae;padding:8px 10px;text-align:left}
+  th{background:var(--green);color:#fff}
+  td.old{color:#8a8172}
+  .copy{font-size:20px;color:var(--green-d);font-weight:700}
+  footer{max-width:960px;margin:0 auto;padding:0 20px 40px;color:#8d826c;font-size:12px}
+</style>
+</head>
+<body>
+<header>
+  <h1>KOMOREBI Radio — UI案（改訂版）</h1>
+  <p>方針：前提知識ゼロ向け。媚びない。数値は隠さず、読みやすく置く。</p>
+</header>
+<main>
+
+<section>
+  <h2>0. 言葉の方針（3区分）</h2>
+  <div class="policy">消す：dB・SNR・AFC・ゲイン値など、読めても生活で使わない略語と数値。<br>
+  残す：周波数・局名・ステレオ表示。見ればわかるものは堂々と置く。<br>
+  訳す：機能語だけ日常語に。赤ちゃん言葉にしない。</div>
+</section>
+
+<section>
+  <h2>1. ホーム画面モック（触れます）</h2>
+  <p class="sub">ダイヤルをクリックするたびに局が変わります。周波数は小さく併記します。</p>
+  <div class="radio">
+    <div class="face">
+      <div class="station">受信中</div>
+      <div class="station-name" id="stName">LuckyFM</div>
+      <div class="freq" id="stFreq">94.6 MHz <small>・ステレオ</small></div>
+      <div><span class="feel" id="stFeel">受信状態：良好</span></div>
+      <div class="favs">
+        <span class="fav">LuckyFM</span><span class="fav">NHK水戸</span>
+        <span class="fav">＋ お気に入り登録</span>
+      </div>
+      <div class="ura">🔧 詳細パネルを開く：電波の強さの数値・ノイズ低減・感度調整はこちら</div>
+    </div>
+    <div class="dial-wrap">
+      <div class="dial" id="dial" title="クリックで選局"></div>
+      <div>↑ ダイヤル（クリックで回す）</div>
+      <div class="dial-row">
+        <button class="btn-power">電源</button>
+        <button class="btn-fav">♥</button>
+      </div>
+      <div style="width:100%">音量<br><input class="vol" type="range" min="0" max="100" value="60"></div>
+    </div>
+  </div>
+</section>
+
+<section>
+  <h2>2. キャッチコピー案</h2>
+  <p class="sub">スペックは語らない。体験を語る。</p>
+  <p class="copy">「ダイヤルを回せば、午後3時の木漏れ日。」</p>
+  <p class="copy">「むずかしいことは、裏ぶたにしまいました。」</p>
+  <p class="copy">「雑音の向こうに、今日の光をみつけた。」</p>
+</section>
+
+<section>
+  <h2>3. 言葉の対応表（改訂版）</h2>
+  <p class="sub">左が現行の技術用語、右が表UIの表現。数値は消さず、読みどころに置く。</p>
+  <table>
+    <tr><th>現行の技術用語</th><th>表UIの表現</th><th>詳細パネルの表現</th></tr>
+    <tr><td class="old">Sメーター -27dBFS</td><td>受信状態：良好／やや弱い／弱い</td><td>電波の強さ（数値つき）</td></tr>
+    <tr><td class="old">スケルチ</td><td>無音時のミュート（ON/OFF）</td><td>無音時のミュート（しきい値つき）</td></tr>
+    <tr><td class="old">ステレオNR / Wiener</td><td>ノイズ低減（ON/OFF）</td><td>ノイズ低減（弱・中・強）</td></tr>
+    <tr><td class="old">ゲイン / AGC</td><td>感度：自動（表には出さない）</td><td>感度（自動／手動）</td></tr>
+    <tr><td class="old">AFC</td><td>（表には出さない・自動）</td><td>周波数の自動追従</td></tr>
+    <tr><td class="old">94.6MHz</td><td>LuckyFM ＋ 94.6MHz併記</td><td>周波数・モード表示</td></tr>
+    <tr><td class="old">スペクトラム計測表示</td><td>電波のようす（装飾＋目安）</td><td>スペクトラム表示</td></tr>
+  </table>
+</section>
+
+<section>
+  <h2>4. 画面構成（2層化）</h2>
+  <ul>
+    <li><b>ホーム</b>：局名・周波数・ダイヤル・電源・音量・お気に入り・受信状態</li>
+    <li><b>詳細パネル</b>：現行UI相当（数値・ノイズ低減・感度・スキャン等）を全格納</li>
+    <li><b>初回</b>：3ステップ案内（挿す→電源→ダイヤル）＋地域プリセット自動提示</li>
+  </ul>
+</section>
+
+<section>
+  <h2>5. 実装メモ（開発者向け）</h2>
+  <ul>
+    <li>既存pygame GUIは「詳細パネル」として温存し、ホーム画面を新レイヤーとして追加する</li>
+    <li>ダイヤル操作→既存 `_tune()` に接続。局名解決はプリセット＋RDS</li>
+    <li>受信状態文（良好／やや弱い／弱い）は S-meter・lock・NR量から生成する関数を新設</li>
+    <li>製品表記は <b>KOMOREBI Radio</b> を推奨（SDRの語を表に出さない）</li>
+  </ul>
+</section>
+
+</main>
+<footer>docs/ui_proposal.html — KomorebiSDR UI案モック（静的HTML・実装前レビュー用）</footer>
+
+<script>
+const stations=[
+  ["LuckyFM","94.6 MHz <small>・ステレオ</small>","受信状態：良好"],
+  ["NHK水戸","83.2 MHz <small>・ステレオ</small>","受信状態：良好"],
+  ["（局名不明）","77.5 MHz <small>・モノラル</small>","受信状態：やや弱い"],
+  ["（短波）","7.3 MHz <small>・モノラル</small>","受信状態：弱い"]
+];
+let i=0;
+document.getElementById("dial").addEventListener("click",()=>{
+  i=(i+1)%stations.length;
+  document.getElementById("stName").textContent=stations[i][0];
+  document.getElementById("stFreq").innerHTML=stations[i][1];
+  document.getElementById("stFeel").textContent=stations[i][2];
+});
+</script>
+</body>
+</html>

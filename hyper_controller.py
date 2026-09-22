@@ -59,7 +59,8 @@ class HyperController:
         self.audio = audio
 
         self.enabled = True
-        self.dx_mode = False
+        # DX手動モードは廃止 (木漏れ日整理)。弱電界では下のC/N連動マップが
+        # 自動でDX相当 (4300Hz/0.14/122kHz) まで絞る。cascade流の snr<9 判定と同等。
         self.available_gains = []
         self.current_gain_idx = 0
 
@@ -128,7 +129,7 @@ class HyperController:
             "estimated_snr": 0.0,
             "filter_mode": "clean",
             "converged": False,
-            "dx_mode": False,
+            "dx_auto": True,
         }
 
         self.rf_rate = float(getattr(dsp, "rf_rate", 1152000))
@@ -585,19 +586,15 @@ class HyperController:
             return
 
         s = self.state_channel_snr
-        if self.dx_mode:
-            cutoff = 4300.0
-            hf = 0.14
-            if_bw = 122000.0
-        else:
-            # 実機実測(弱電界C/N 1〜6dB)に基づく再校正: 弱電界では狭帯域へ、十分強ければ開放
-            sig_c = 1.0 / (1.0 + np.exp(-0.28 * (s - 10.0)))
-            sig_a = 1.0 / (1.0 + np.exp(-0.30 * (self.state_audio_snr - 13.0)))
-            cutoff = 4500.0 + 10000.0 * (0.55 * sig_c + 0.45 * sig_a)
-            # 実機A/B試聴の結果、中〜強電界ではハイシェルフを早めに全開放し
-            # 5-8kHzの存在感を保持する特性を採用 (弱電界のみ抑圧)
-            hf = float(np.clip((s - 2.0) / 8.0, 0.14, 1.0))
-            if_bw = 130000.0 + 60000.0 / (1.0 + np.exp(-0.25 * (s - 10.0)))
+        # 実機実測(弱電界C/N 1〜6dB)に基づく再校正: 弱電界では狭帯域へ、十分強ければ開放。
+        # 弱端は旧DX相当 (4300Hz/hf0.14/122kHz) に寄せ、手動切替なしで自動到達する。
+        sig_c = 1.0 / (1.0 + np.exp(-0.28 * (s - 10.0)))
+        sig_a = 1.0 / (1.0 + np.exp(-0.30 * (self.state_audio_snr - 13.0)))
+        cutoff = 4300.0 + 10200.0 * (0.55 * sig_c + 0.45 * sig_a)
+        # 実機A/B試聴の結果、中〜強電界ではハイシェルフを早めに全開放し
+        # 5-8kHzの存在感を保持する特性を採用 (弱電界のみ抑圧)
+        hf = float(np.clip((s - 2.0) / 8.0, 0.14, 1.0))
+        if_bw = 122000.0 + 68000.0 / (1.0 + np.exp(-0.25 * (s - 10.0)))
 
         if mode == "NFM":
             # ISS / アマチュア無線 NFM: 通信音声帯域 (3000Hz) & 16kHz IF帯域
@@ -757,7 +754,7 @@ class HyperController:
             "filter_mode": label,
             "converged": self.locked,
             "hard_lock": self.hard_lock,
-            "dx_mode": self.dx_mode,
+            "dx_auto": True,
             "channel_snr_db": round(self.state_channel_snr, 1),
             "audio_snr_db": round(self.state_audio_snr, 1),
             "quality": round(self.state_quality, 1),

@@ -166,6 +166,7 @@ class Button:
         self.hover = False
         self.pressed = False
         self.radius = 8
+        self.visible = True  # SSB/CW時のみ表示するボタン用 (BFO±)
 
     def handle_event(self, event):
         if event.type == pygame.MOUSEMOTION:
@@ -250,19 +251,17 @@ class SdrGui:
         # パラメータコールバック
         self.on_freq_change = None
         self.on_mode_change = None
-        self.on_gain_change = None
-        self.on_gain_lock_toggle = None  # lambda: 決め打ち/再探索トグル
+        # ゲインはHyper自動に一本化 (手動操作削除・木漏れ日整理)。
+        # btn_gain_autoは状態表示専用チップ (探索中/収束/固定)。
         self.on_volume_change = None
-        self.on_filter_change = None
+        # Filterはclean固定 (ボタン削除・木漏れ日整理)。
         self.on_seek_change = None      # lambda direction: ...
         self.on_scan_request = None     # lambda: ...
         self.on_sw_scan_request = None  # lambda: ...
         self.on_ppm_cal_request = None  # lambda: ...
         self.on_stereo_toggle = None    # lambda: ...
-        self.on_nr_toggle = None        # lambda: ...
         self.on_bfo_change = None       # lambda delta_hz: ...
-        self.on_dx_toggle = None        # lambda enabled: ...
-        self.on_afc_toggle = None       # lambda enabled: ...
+        # AFCは常時ON固定・DXはC/N連動の自動絞り (ボタン削除・木漏れ日整理)。
 
         # 内部状態
         self.center_freq = 80000000  # 80.0 MHz
@@ -270,19 +269,14 @@ class SdrGui:
         self.mode = "WFM"
         self.volume = 0.5
         self.is_auto_gain = True
-        self.is_hard_locked = False     # 収束決め打ち中フラグ
-        self.gain_auto_label = "Hyper: ON"
-        self.gain_val = 30.0
-        self.manual_gain_db = None      # 手動ゲイン値 (表示再同期用)
-        self.filter_mode = "clean"      # フィルタ表示再同期用
+        self.is_hard_locked = False     # 収束決め打ち中フラグ (表示用)
+        self.filter_mode = "clean"      # 常時clean固定 (ボタン廃止)
         self.gains_list = []
         self.current_rssi = -50.0
-        self.is_dx_mode = False
-        self.is_afc_enabled = True
         self.is_stereo = False
         self.stereo_status = "MONO"
         self.stereo_enabled = True
-        self.nr_enabled = True
+        # NRは常時ON固定 (ボタン削除・木漏れ日整理)。nr_enabled属性は廃止。
         # 描画用の事前確保バッファ (毎フレームの確保を排除)
         self._wave_xs = None
         self._spec_px = None
@@ -442,7 +436,7 @@ class SdrGui:
             self.presets_am = am[:7]
         self._init_controls()
         # _init_controls はボタンを新規作成するため、トグルの表示状態を再同期する
-        # (スキャンのたびにステレオ/NR/AFC/DX表示が既定値に戻る問題の修正)
+        # (スキャンのたびにステレオ/NR/DX表示が既定値に戻る問題の修正)
         self._sync_control_states()
 
     def _sync_control_states(self):
@@ -450,29 +444,7 @@ class SdrGui:
         if hasattr(self, "btn_stereo"):
             self.btn_stereo.text = t("stereo") if self.stereo_enabled else t("mono")
             self.btn_stereo.bg_color = (206, 240, 226) if self.stereo_enabled else (246, 228, 228)
-        if hasattr(self, "btn_nr"):
-            self.btn_nr.text = f"{t('nr')}: {'ON' if self.nr_enabled else 'OFF'}"
-            self.btn_nr.bg_color = (226, 236, 248) if self.nr_enabled else (236, 238, 244)
-        if hasattr(self, "btn_afc"):
-            self.btn_afc.text = "AFC: ON" if self.is_afc_enabled else "AFC: OFF"
-            self.btn_afc.bg_color = (212, 232, 248) if self.is_afc_enabled else (236, 238, 244)
-        if hasattr(self, "btn_dx_mode"):
-            self.btn_dx_mode.text = "DX Boost: ON" if self.is_dx_mode else "DX: OFF"
-            self.btn_dx_mode.bg_color = (234, 224, 246) if self.is_dx_mode else (240, 243, 248)
-        # ゲイン/フィルタ表示も再構築で既定へ戻るため再同期する
-        # (手動ゲイン中にスキャンすると「Hyper: ON」表示に戻る問題の修正)
-        if hasattr(self, "btn_gain_auto") and hasattr(self, "is_auto_gain"):
-            if self.is_auto_gain:
-                self.btn_gain_auto.text = getattr(self, "gain_auto_label", "Hyper: ON")
-                self.btn_gain_auto.bg_color = (230, 240, 250)
-            else:
-                db = getattr(self, "manual_gain_db", None)
-                if db is not None:
-                    self.btn_gain_auto.text = t("gain_manual", db=f"{db:.1f}")
-                self.btn_gain_auto.bg_color = (206, 236, 224)
-        if hasattr(self, "btn_filter") and hasattr(self, "filter_mode"):
-            label = "Auto" if self.filter_mode == "auto" else self.filter_mode.capitalize()
-            self.btn_filter.text = f"Filter: {label}"
+        # ゲイン状態チップはworker側statsで確定上書きされるため再同期不要 (自動固定)。
 
     @staticmethod
     def _clean_presets(items, default_mode: str) -> list:
@@ -543,34 +515,27 @@ class SdrGui:
         self.btn_wfm = self.mode_buttons["WFM"]
         self.btn_am = self.mode_buttons["AM"]
         self.btn_nfm = self.mode_buttons["NFM"]
-        # ステレオ/モノラル切替 / NR切替 / BFO微調整 (SSB・CW用)
+        # ステレオ/モノラル切替 / BFO微調整 (SSB・CW用。NRは常時ONでボタンなし)
         gap2 = 6
-        hw = (tw - 3 * gap2) // 4
+        hw = (tw - 2 * gap2) // 3
         self.btn_stereo = Button((tx, 412, hw, 24), t("stereo"), self._toggle_stereo,
                                  bg_color=(206, 240, 226), active_color=C_ACCENT)
-        self.btn_nr = Button((tx + hw + gap2, 412, hw, 24),
-                             f"{t('nr')}: ON", self._toggle_nr,
-                             bg_color=(226, 236, 248), active_color=C_ACCENT)
-        self.btn_bfo_down = Button((tx + 2 * (hw + gap2), 412, hw, 24), "BFO-",
+        self.btn_bfo_down = Button((tx + hw + gap2, 412, hw, 24), "BFO-",
                                    lambda: self._step_bfo(-50), bg_color=(240, 243, 248))
-        self.btn_bfo_up = Button((tx + 3 * (hw + gap2), 412, hw, 24), "BFO+",
+        self.btn_bfo_up = Button((tx + 2 * (hw + gap2), 412, hw, 24), "BFO+",
                                  lambda: self._step_bfo(50), bg_color=(240, 243, 248))
-        btns.extend([self.btn_stereo, self.btn_nr, self.btn_bfo_down, self.btn_bfo_up])
+        btns.extend([self.btn_stereo, self.btn_bfo_down, self.btn_bfo_up])
 
         # ---- GAIN / AUDIOパネル ----
         gx, gy = self.gain_rect.x + 12, self.gain_rect.y
-        self.btn_gain_auto = Button((gx, 470, 142, 25), "Hyper: ON", self._toggle_gain_auto,
+        # ゲイン状態チップ (表示専用。Hyper自動の状態をworker側が上書きする)
+        self.btn_gain_auto = Button((gx, 470, 254, 25), "感度: 自動", lambda: None,
                                     bg_color=(230, 240, 250))
-        self.btn_gain_up = Button((gx + 148, 470, 50, 25), "G+", lambda: self._step_gain(1))
-        self.btn_gain_down = Button((gx + 204, 470, 50, 25), "G-", lambda: self._step_gain(-1))
-        btns.extend([self.btn_gain_auto, self.btn_gain_up, self.btn_gain_down])
+        btns.extend([self.btn_gain_auto])
         self.btn_vol_down = Button((gx, 497, 46, 25), "V-", lambda: self._adjust_vol(-0.1))
         self.btn_vol_up = Button((gx + 52, 497, 46, 25), "V+", lambda: self._adjust_vol(0.1))
-        self.btn_filter = Button((gx + 104, 497, 150, 25), "Filter: Clean", self._toggle_filter)
-        btns.extend([self.btn_vol_down, self.btn_vol_up, self.btn_filter])
-        self.btn_afc = Button((gx, 524, 125, 25), "AFC: ON", self._toggle_afc, bg_color=(212, 232, 248))
-        self.btn_dx_mode = Button((gx + 131, 524, 123, 25), "DX: OFF", self._toggle_dx, bg_color=(234, 224, 246))
-        btns.extend([self.btn_afc, self.btn_dx_mode])
+        btns.extend([self.btn_vol_down, self.btn_vol_up])
+        # DX行は廃止 (C/N連動の自動絞りに一本化)。524行目は空き。
 
         # ---- プリセット (地域/スキャン結果に応じて動的に設定される) ----
         fw, fgap, fx0 = 100, 4, self.preset_rect.x + 36
@@ -586,6 +551,7 @@ class SdrGui:
 
         # アトミックに差し替え (スキャン完了時の再構築と描画の競合防止)
         self.buttons = btns
+        self._sync_bfo_visibility()
 
     # ================================================================
     # 操作ハンドラ
@@ -598,65 +564,31 @@ class SdrGui:
 
     def _set_mode(self, mode):
         self.mode = mode
+        self._sync_bfo_visibility()
         if self.on_mode_change:
             self.on_mode_change(self.mode)
+
+    def _sync_bfo_visibility(self):
+        """BFO±はSSB/CW選択時のみ表示 (木漏れ日整理)。"""
+        show = self.mode in ("USB", "LSB", "CW")
+        for name in ("btn_bfo_down", "btn_bfo_up"):
+            btn = getattr(self, name, None)
+            if btn is not None:
+                btn.visible = show
 
     def _tune(self, freq, mode):
         self.center_freq = freq
         self.mode = mode
+        self._sync_bfo_visibility()
         if self.on_freq_change:
             self.on_freq_change(self.center_freq)
         if self.on_mode_change:
             self.on_mode_change(self.mode)
 
-    def _toggle_gain_auto(self):
-        # クリック直後に暫定表示を即時反映し、worker/statsで確定上書きする (DX/AFCと同パターン)
-        try:
-            if bool(getattr(self, "is_auto_gain", True)):
-                self.btn_gain_auto.text = "切替中…"
-            else:
-                self.btn_gain_auto.text = "探索中…"
-        except Exception:
-            pass
-        if self.on_gain_lock_toggle:
-            self.on_gain_lock_toggle()
-        elif self.on_gain_change:
-            self.is_auto_gain = not self.is_auto_gain
-            self.btn_gain_auto.text = self.gain_auto_label if self.is_auto_gain else f"Gain: {self.gain_val:.1f}dB"
-            self.on_gain_change(self.is_auto_gain, self.gain_val)
-
-    def _step_gain(self, dir_step):
-        if not self.gains_list:
-            return
-        min_idx = min(range(len(self.gains_list)), key=lambda i: abs(self.gains_list[i] - 12.5))
-        idx = min(range(len(self.gains_list)), key=lambda i: abs(self.gains_list[i] - self.gain_val))
-        idx = max(min_idx, min(len(self.gains_list) - 1, idx + dir_step))
-        self.gain_val = self.gains_list[idx]
-        self.is_hard_locked = True
-        # worker側GAINハンドラと同一値を即時反映し、ヘッダー表示乖離を防ぐ
-        self.is_auto_gain = False
-        self.manual_gain_db = float(self.gain_val)
-        self.btn_gain_auto.text = f"手動 {self.gain_val:.1f}dB"
-        self.btn_gain_auto.bg_color = (216, 240, 230)
-        if self.on_gain_change:
-            self.on_gain_change(False, self.gain_val)
-
     def _adjust_vol(self, delta):
         self.volume = max(0.0, min(1.0, self.volume + delta))
         if self.on_volume_change:
             self.on_volume_change(self.volume)
-
-    def _toggle_filter(self):
-        if not hasattr(self, "filter_mode"):
-            self.filter_mode = "clean"
-        # clean -> wide -> narrow -> auto(適応) -> clean の循環
-        order = ["clean", "wide", "narrow", "auto"]
-        i = order.index(self.filter_mode) if self.filter_mode in order else 0
-        self.filter_mode = order[(i + 1) % len(order)]
-        label = "Auto" if self.filter_mode == "auto" else self.filter_mode.capitalize()
-        self.btn_filter.text = f"Filter: {label}"
-        if hasattr(self, "on_filter_change") and self.on_filter_change:
-            self.on_filter_change(self.filter_mode)
 
     def _seek(self, direction):
         if self.on_seek_change:
@@ -788,14 +720,6 @@ class SdrGui:
         if self.on_stereo_toggle:
             self.on_stereo_toggle()
 
-    def _toggle_nr(self):
-        try:
-            self.set_nr_enabled(not bool(getattr(self, "nr_enabled", True)))
-        except Exception:
-            pass
-        if self.on_nr_toggle:
-            self.on_nr_toggle()
-
     def _step_bfo(self, delta):
         if self.on_bfo_change:
             self.on_bfo_change(delta)
@@ -806,25 +730,6 @@ class SdrGui:
         if hasattr(self, "btn_stereo"):
             self.btn_stereo.text = t("stereo") if self.stereo_enabled else t("mono")
             self.btn_stereo.bg_color = (206, 240, 226) if self.stereo_enabled else (246, 228, 228)
-
-    def set_nr_enabled(self, enabled: bool):
-        """ステレオNR切替ボタンの表示を更新"""
-        self.nr_enabled = bool(enabled)
-        if hasattr(self, "btn_nr"):
-            self.btn_nr.text = f"{t('nr')}: {'ON' if self.nr_enabled else 'OFF'}"
-            self.btn_nr.bg_color = (226, 236, 248) if self.nr_enabled else (236, 238, 244)
-
-    def _toggle_dx(self):
-        self.is_dx_mode = not self.is_dx_mode
-        self.btn_dx_mode.text = "DX Boost: ON" if self.is_dx_mode else "DX: OFF"
-        if self.on_dx_toggle:
-            self.on_dx_toggle(self.is_dx_mode)
-
-    def _toggle_afc(self):
-        self.is_afc_enabled = not self.is_afc_enabled
-        self.btn_afc.text = "AFC: ON" if self.is_afc_enabled else "AFC: OFF"
-        if self.on_afc_toggle:
-            self.on_afc_toggle(self.is_afc_enabled)
 
     def handle_events(self):
         cursor_hand = False
@@ -944,13 +849,14 @@ class SdrGui:
                     if self.on_freq_change:
                         self.on_freq_change(self.center_freq)
 
-            # ボタンイベント処理
+            # ボタンイベント処理 (非表示ボタンは無視)
             for btn in self.buttons:
-                btn.handle_event(event)
+                if btn.visible:
+                    btn.handle_event(event)
 
         # カーソル形状の更新 (ボタンホバー中または周波数桁ホバー中は指先ハンドカーソル)
         mx, my = pygame.mouse.get_pos()
-        is_hover_btn = any(btn.rect.collidepoint(mx, my) for btn in self.buttons)
+        is_hover_btn = any(btn.visible and btn.rect.collidepoint(mx, my) for btn in self.buttons)
         is_hover_digit = (self.hovered_freq_digit is not None)
         # スペクトラム上のホバー周波数 (ワンクリック選局の照準表示)
         if self.spec_rect.collidepoint(mx, my) and self.spec_rect.width > 0:
@@ -1199,7 +1105,7 @@ class SdrGui:
         # 2. 情報パネル (ステータスバッジ + 本格SメーターLEDバー)
         x0 = self.info_rect.x + 14
         y0 = self.info_rect.y + 8
-        auto_name = self.gain_auto_label.split(":")[0]
+        auto_name = getattr(self, "gain_auto_label", "Hyper").split(":")[0]
         gain_txt = auto_name if self.is_auto_gain else f"{self.gain_val:.1f}dB"
         w1 = self._draw_chip(f"MODE {self.mode}", x0, y0, (210, 236, 246))
         w2 = self._draw_chip(f"VOL {int(self.volume * 100)}%", x0 + w1 + 6, y0, (226, 222, 246))
@@ -1388,7 +1294,8 @@ class SdrGui:
         for name, b in self.mode_buttons.items():
             b.is_active = (self.mode == name)
         for btn in self.buttons:
-            btn.draw(self.screen, self.font_small)
+            if btn.visible:
+                btn.draw(self.screen, self.font_small)
 
     def render(self, spectrum_db, audio_pcm=None):
         """1フレームの描画処理 (静的シーン事前ベイクで高速化)"""
