@@ -276,6 +276,7 @@ class SdrGui:
         self.on_seek_change = None      # lambda direction: ...
         self.on_scan_request = None     # lambda: ...
         self.on_sw_scan_request = None  # lambda: ...
+        self.on_ham_scan_request = None  # lambda: ...
         # PPM手動較正は廃止 (背景自動収集＋自動適用に一本化)。
         # ステレオは自動ブレンドに一本化 (ボタン削除・木漏れ日整理)。
         self.on_bfo_change = None       # lambda delta_hz: ...
@@ -487,13 +488,17 @@ class SdrGui:
         fixed = row_h["scan"] + row_h["seek"] + row_h["list"] + 2 * row_h["mode"] + 4 + row_h["bfo"]
         gap = max(6, (bottom - y - fixed) // 5)
         half = (tw - 8) // 2
-        # FM/短波スキャンを並列配置 (どちらも常時到達可能にする。片方だけ隠す破綻の修正)
-        self.btn_scan_band = Button((tx, y, half, row_h["scan"]), t("scan_button"), self._request_scan,
+        # FM/短波/ハムスキャンを3並列配置 (いずれも常時到達可能)
+        scan_w = (tw - 2 * 6) // 3
+        self.btn_scan_band = Button((tx, y, scan_w, row_h["scan"]), t("scan_button"), self._request_scan,
                                     bg_color=(196, 238, 226), active_color=C_ACCENT, radius=8)
-        self.btn_scan_sw = Button((tx + half + 8, y, half, row_h["scan"]), t("scan_sw_button"),
+        self.btn_scan_sw = Button((tx + scan_w + 6, y, scan_w, row_h["scan"]), t("scan_sw_button"),
                                   self._request_sw_scan,
                                   bg_color=(208, 230, 250), active_color=C_ACCENT, radius=8)
-        btns.extend([self.btn_scan_band, self.btn_scan_sw])
+        self.btn_scan_ham = Button((tx + 2 * (scan_w + 6), y, scan_w, row_h["scan"]), t("ham_button"),
+                                   self._request_ham_scan,
+                                   bg_color=(232, 226, 248), active_color=C_ACCENT, radius=8)
+        btns.extend([self.btn_scan_band, self.btn_scan_sw, self.btn_scan_ham])
         y += row_h["scan"] + gap
 
         # シークボタン (Prev / Next)
@@ -592,6 +597,11 @@ class SdrGui:
             self.scan_status_text = t("sw_scanning")
             self.on_sw_scan_request()
 
+    def _request_ham_scan(self):
+        if self.on_ham_scan_request:
+            self.scan_status_text = t("ham_scanning")
+            self.on_ham_scan_request()
+
     # ---- 検出局プルダウン ----
     _SL_ROW_H = 26
     _SL_HEADER_H = 30
@@ -616,6 +626,18 @@ class SdrGui:
                 for i in range(vis)]
         return panel, rows, total
 
+    @staticmethod
+    def _station_display_name(st) -> str:
+        """表示用局名。未同定センチネルは「不明な局」に変換する。
+        (内部センチネル "Unknown FM Station" はppm_cal・テストと共有のため維持)"""
+        try:
+            name = str(st.get("name", ""))
+        except Exception:
+            name = ""
+        if name == "Unknown FM Station" or not name:
+            return t("station_unknown")
+        return name
+
     def _station_list_click(self, mx: int, my: int) -> bool:
         """プルダウン開閉中のクリック処理。消費したらTrue。"""
         if not self.station_list_open:
@@ -637,7 +659,7 @@ class SdrGui:
                             continue
                         self.center_freq = int(fh)
                         self.scan_status_text = (
-                            f"局リスト選局: {st.get('name', '')} "
+                            f"局リスト選局: {self._station_display_name(st)} "
                             f"({st.get('freq_mhz', float(fh) / 1e6):.2f}MHz, "
                             f"SNR:+{st.get('snr_db', 0.0):.1f}dB)")
                         if self.on_freq_change:
@@ -680,7 +702,7 @@ class SdrGui:
                 continue
             if sel:
                 pygame.draw.rect(self.screen, (214, 236, 248), rc, border_radius=6)
-            name = str(st.get("name", ""))[:18]
+            name = self._station_display_name(st)[:18]
             try:
                 freq = st.get("freq_mhz", float(st.get("freq_hz", 0)) / 1e6)
             except Exception:
@@ -1022,7 +1044,9 @@ class SdrGui:
         else:
             for st in self.detected_stations:
                 if abs(st["freq_hz"] - self.center_freq) <= 50000:
-                    ticker_text = st["name"]
+                    # "Unknown FM Station"は未同定センチネル。短波等では帯域汎名へ落とす
+                    if st["name"] != "Unknown FM Station":
+                        ticker_text = st["name"]
                     break
             if not ticker_text:
                 try:
@@ -1088,13 +1112,14 @@ class SdrGui:
         unit_surf = cached_text(self.font_med, unit, C_ACCENT_DARK)
         self.screen.blit(unit_surf, (cur_x + 6, base_y + 16))
 
-        # モードバッジ & ステレオバッジ
+        # モードバッジ & ステレオバッジ (ステレオ概念はWFMのみ。他モードでは出さない)
         badge_x = cur_x + 56
         if badge_x + 140 < self.hero_rect.right - 10:
             w1 = self._draw_chip(f"MODE {self.mode}", badge_x, base_y + 14, (214, 236, 248))
-            status = getattr(self, "stereo_status", None) or ("STEREO" if self.is_stereo else "MONO")
-            st_col = (206, 240, 226) if status == "STEREO" else (236, 238, 244)
-            self._draw_chip(status, badge_x + w1 + 10, base_y + 14, st_col)
+            if self.mode == "WFM":
+                status = getattr(self, "stereo_status", None) or ("STEREO" if self.is_stereo else "MONO")
+                st_col = (206, 240, 226) if status == "STEREO" else (236, 238, 244)
+                self._draw_chip(status, badge_x + w1 + 10, base_y + 14, st_col)
 
         # 下段の音量スライダーは廃止 (システム音量に一本化)。HI-FI表示のみ残す。
         # オーディオ品質バッジ (HI-FI)
@@ -1175,10 +1200,11 @@ class SdrGui:
         self.screen.blit(shade, (cx - bw_px // 2, r.y + 6))
         pygame.draw.line(self.screen, C_GOLD, (cx, r.y + 4), (cx, r.bottom - 4), 2)
 
-        # 検出局マーカー
+        # 検出局マーカー (ラベルが重なる密集局は間引き表示)
         f_min = self.center_freq - self.sample_rate / 2
         f_max = self.center_freq + self.sample_rate / 2
         if (f_max - f_min) > 0:
+            last_bx = -10 ** 9
             for st in list(self.detected_stations):
                 try:
                     sfreq = st.get("freq_hz")
@@ -1187,10 +1213,15 @@ class SdrGui:
                     if f_min <= sfreq <= f_max:
                         ratio = (sfreq - f_min) / (f_max - f_min)
                         m_x = r.x + int(ratio * r.width)
-                        st_tag = st.get("name") or f"{st.get('freq_mhz', float(sfreq) / 1e6):.1f}"
+                        # マーカー線は常時描画 (ラベル省略時も位置は示す)
+                        pygame.draw.line(self.screen, (0, 190, 160), (m_x, r.y + 30), (m_x, r.y + 40), 2)
+                        st_tag = self._station_display_name(st) or f"{st.get('freq_mhz', float(sfreq) / 1e6):.1f}"
                         lbl = cached_text(self.font_tiny, st_tag, (230, 246, 255))
                         lw, lh = lbl.get_width(), lbl.get_height()
                         bx = max(r.x + 4, min(r.right - 4 - lw - 8, m_x - lw // 2 - 4))
+                        if bx - last_bx < 64:
+                            continue  # 隣ラベルと重なるためラベルのみ省略
+                        last_bx = bx
                         by = r.y + 12
                         badge_rect = pygame.Rect(bx, by, lw + 8, lh + 4)
                         pygame.draw.rect(self.screen, (14, 24, 38), badge_rect, border_radius=4)

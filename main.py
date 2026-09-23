@@ -119,6 +119,7 @@ class SdrApp:
         self.gui.on_seek_change = lambda d: self.cmd_queue.put(("SEEK", d))
         self.gui.on_scan_request = lambda: self.cmd_queue.put(("SCAN", None))
         self.gui.on_sw_scan_request = lambda: self.cmd_queue.put(("SW_SCAN", None))
+        self.gui.on_ham_scan_request = lambda: self.cmd_queue.put(("HAM_SCAN", None))
         self.gui.on_bfo_change = lambda d: self.cmd_queue.put(("BFO", d))
         # DXはC/N連動の自動絞りに一本化 (ボタン削除・木漏れ日整理)。
         # AFCは常時ON固定 (GUIボタン削除・木漏れ日整理)。
@@ -660,6 +661,56 @@ class SdrApp:
                 self.gui.scan_status_text = t("sw_scan_none")
             return stations
 
+        def safe_ham_scan(status_label: str, auto_tune_best: bool = True):
+            """アマチュア無線HFバンド (80/40/20m) をスキャンする。
+            LSB/USBは周波数から自動判定。プリセット更新なし (検出局リストのみ)。
+            CWはSSB検出後に手動切替 (BFO±)。"""
+            nonlocal t_usb
+            self.gui.scan_status_text = status_label
+            if not stop_usb_stream(t_usb):
+                if not t_usb.is_alive():
+                    try:
+                        t_usb = start_usb_stream()
+                    except Exception as e:
+                        print(f"[ERROR] USB restart failed: {e}", file=sys.stderr)
+                else:
+                    self.driver.resume_async()
+                    usb_running.set()
+                self.gui.scan_status_text = "USB busy - scan skipped"
+                return []
+            stations = []
+            try:
+                stations = self.tuner.scan_band_ham(snr_threshold=5.0)
+                self.gui.detected_stations = stations
+            except Exception as e:
+                print(f"[ERROR] Ham scan failed: {e}", file=sys.stderr)
+            finally:
+                try:
+                    restore_after_scan()
+                except Exception as e:
+                    print(f"[ERROR] Failed to restore receiver after scan: {e}", file=sys.stderr)
+                _drain_raw_queue()
+                t_usb = start_usb_stream()
+
+            if not auto_tune_best:
+                self.gui.scan_status_text = (t("ham_scan_done", n=len(stations))
+                                             if stations else t("ham_scan_none"))
+                return stations
+            if stations:
+                best = max(stations, key=lambda s: s["snr_db"])
+                best_mode = best.get("mode", "USB")
+                if best_mode not in ("USB", "LSB", "CW"):
+                    best_mode = "USB"
+                self._apply_frequency_and_mode(best["freq_hz"], best_mode)
+                self.gui.center_freq = best["freq_hz"]
+                self.gui.mode = best_mode
+                self.gui._sync_bfo_visibility()
+                self.gui.scan_status_text = t(
+                    "ham_scan_done", n=len(stations))
+            else:
+                self.gui.scan_status_text = t("ham_scan_none")
+            return stations
+
         t_usb = start_usb_stream()
         self._worker_t0 = time.monotonic()
 
@@ -678,7 +729,28 @@ class SdrApp:
                         # 初回シークは局リストが無いため帯域スキャンが必要
                         # (USBストリームを安全に停止しないとread_syncが競合・ハングする)
                         is_sw = (self.mode in ("AM", "USB", "LSB", "CW")) or (self.freq < 24000000)
-                        if is_sw:
+                        if self.mode in ("USB", "LSB", "CW"):
+                            # SSB/CW時はアマチュア無線リストから探し、局のモードで同調
+                            if not self.tuner.discovered_ham:
+                                safe_ham_scan(t("first_seek_scan"), auto_tune_best=False)
+                            ham = getattr(self.tuner, "discovered_ham", [])
+                            st = None
+                            if ham:
+                                margin = 500
+                                if direction > 0:
+                                    cands = [s for s in ham if s["freq_hz"] > self.freq + margin]
+                                    st = cands[0] if cands else None
+                                else:
+                                    cands = [s for s in ham if s["freq_hz"] < self.freq - margin]
+                                    st = cands[-1] if cands else None
+                            if st:
+                                next_mode = st.get("mode", "USB")
+                                if next_mode not in ("USB", "LSB", "CW"):
+                                    next_mode = "USB"
+                                self._apply_frequency_and_mode(st["freq_hz"], next_mode)
+                                self.gui.center_freq = self.freq
+                                self.gui.scan_status_text = t("tuned", freq=f"{st['freq_mhz']:.3f}", snr=f"{st['snr_db']:+.1f}")
+                        elif is_sw:
                             if not self.tuner.discovered_sw:
                                 safe_hf_scan(t("first_seek_scan"), auto_tune_best=False)
                             st = self.tuner.seek_next(self.freq, direction=direction, use_sw=True)
@@ -706,6 +778,9 @@ class SdrApp:
                     elif cmd == "SW_SCAN":
                         # 短波(HF)放送バンドスキャン (ダイレクトサンプリング)
                         safe_hf_scan(t("sw_scanning"))
+                    elif cmd == "HAM_SCAN":
+                        # アマチュア無線HFバンドスキャン (80/40/20m、LSB/USB自動)
+                        safe_ham_scan(t("ham_scanning"))
                     elif cmd == "BFO":
                         bfo = float(np.clip(self.dsp.bfo_offset_hz + float(val), -2000.0, 2000.0))
                         self.dsp.bfo_offset_hz = bfo

@@ -8,6 +8,7 @@ import time
 import numpy as np
 from rtlsdr_driver import RtlSdrDriver
 from config import SHORTWAVE_BANDS, SW_MAX_HZ, shortwave_scan_centers
+from config import HAM_BANDS, ham_band_mode
 
 
 # 日本の主要FM局データベース (関東・茨城・東京・広域)
@@ -59,6 +60,7 @@ class AutoTuner:
         self.owns_driver = driver is None
         self.discovered_stations = []  # スキャンで発見された局リスト (FM)
         self.discovered_sw = []        # 短波(HF)スキャン結果
+        self.discovered_ham = []       # アマチュア無線スキャン結果
         self.last_scan_time = 0.0
 
     def scan_band(
@@ -220,12 +222,19 @@ class AutoTuner:
         snr_threshold: float = 6.5,
         rate_hz: int = 1152000,
         max_results: int = 40,
+        bands=None,
+        grid_hz: int = 5000,
+        mode_fn=None,
+        store_attr: str = "discovered_sw",
     ) -> list[dict]:
         """短波(HF)放送バンドをダイレクトサンプリング(Qブランチ)でスキャンする。
 
         2.0〜14.4MHzのSW放送バンドを5kHzグリッドで走査し、受信可能な局を返す。
         15MHz以上はRTL-SDRのダイレクトサンプリング上限を超えるため対象外
         (アップコンバータ使用時は config.SW_MAX_HZ を変更)。
+
+        bands/grid_hz/mode_fn/store_attr はアマチュア無線スキャン用の汎化
+        (既定は従来の放送スキャンと同一動作)。
         """
         was_open = self.driver.is_open
         if not was_open:
@@ -236,13 +245,13 @@ class AutoTuner:
         self.driver.set_gain_mode(True)
         self.driver.set_gain(33.8)           # ダイレクトサンプリングでは実質無効
 
-        centers = shortwave_scan_centers(rate_hz)
+        centers = shortwave_scan_centers(rate_hz, bands=bands)
         fft_size = 2048
         window = np.hamming(fft_size).astype(np.float32)
         win_power = np.sum(window ** 2) / fft_size
         band_ranges = [
             (int(lo * 1000), int(min(hi * 1000, SW_MAX_HZ)))
-            for _name, lo, hi in SHORTWAVE_BANDS
+            for _name, lo, hi in (bands if bands is not None else SHORTWAVE_BANDS)
         ]
         stations = []
 
@@ -280,12 +289,13 @@ class AutoTuner:
             peaks = self._find_spectral_peaks(
                 spec_db, freq_axis, noise_floor, snr_threshold, min_width_bins=3)
             for p in peaks:
-                # SW放送は5kHzグリッド
-                snapped = int(round(p["peak_freq"] / 5000.0) * 5000)
+                # 放送は5kHzグリッド、アマチュア無線は100Hzグリッドにスナップ
+                snapped = int(round(p["peak_freq"] / grid_hz) * grid_hz)
                 if not any(lo <= snapped <= hi for lo, hi in band_ranges):
                     continue
+                dedup_hz = max(1000, int(grid_hz * 0.8))
                 existing = next(
-                    (s for s in stations if abs(s["freq_hz"] - snapped) < 4000), None)
+                    (s for s in stations if abs(s["freq_hz"] - snapped) < dedup_hz), None)
                 if existing:
                     if p["snr_db"] > existing["snr_db"]:
                         existing["snr_db"] = round(p["snr_db"], 1)
@@ -294,7 +304,8 @@ class AutoTuner:
                 stations.append({
                     "freq_hz": snapped,
                     "freq_mhz": snapped / 1e6,
-                    "name": "Unknown FM Station",
+                    "name": "",
+                    "mode": mode_fn(snapped) if mode_fn is not None else "AM",
                     "snr_db": round(p["snr_db"], 1),
                     "peak_power_db": round(p["peak_power"], 1),
                     "afc_offset_hz": round(p["peak_freq"] - snapped, 0),
@@ -310,9 +321,23 @@ class AutoTuner:
         stations.sort(key=lambda s: s["snr_db"], reverse=True)
         stations = stations[:max_results]
         stations.sort(key=lambda s: s["freq_hz"])
-        self.discovered_sw = stations
+        setattr(self, store_attr, stations)
         self.last_scan_time = time.time()
         return stations
+
+    def scan_band_ham(
+        self,
+        snr_threshold: float = 5.0,
+        rate_hz: int = 1152000,
+        max_results: int = 40,
+    ) -> list[dict]:
+        """アマチュア無線HFバンド (80/40/20m) をスキャンする。
+        100Hzグリッド・LSB/USB自動判定。CWはSSBで検出後に手動切替。
+        微弱信号が多いためしきい値は放送より低め (5.0dB)。"""
+        return self.scan_band_hf(
+            snr_threshold=snr_threshold, rate_hz=rate_hz,
+            max_results=max_results, bands=HAM_BANDS, grid_hz=100,
+            mode_fn=ham_band_mode, store_attr="discovered_ham")
 
     def _find_spectral_peaks(
         self, spec_db: np.ndarray, freq_axis: np.ndarray, noise_floor: float,

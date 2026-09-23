@@ -145,6 +145,22 @@ SHORTWAVE_BANDS = [
 SW_MAX_HZ = 14400000  # ダイレクトサンプリングの実用上限
 
 
+# ----------------------------------------------------------------------
+# アマチュア無線 HF バンド (kHz。ダイレクトサンプリング上限以下のみ)
+#   15m/10m・VHF/UHFは別経路のため対象外。モードは10MHz境でLSB/USB。
+# ----------------------------------------------------------------------
+HAM_BANDS = [
+    ("80m", 3500, 3570),
+    ("40m", 7000, 7200),
+    ("20m", 14000, 14350),
+]
+
+
+def ham_band_mode(freq_hz: int) -> str:
+    """アマチュア無線の慣例モード (10MHz未満LSB、以上USB)。CWはSSBで検出後に切替"""
+    return "LSB" if freq_hz < 10000000 else "USB"
+
+
 def shortwave_band_name(freq_hz: int) -> str:
     """周波数から短波放送バンド名 (49m等) を返す"""
     for name, lo_khz, hi_khz in SHORTWAVE_BANDS:
