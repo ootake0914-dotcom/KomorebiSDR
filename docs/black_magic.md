@@ -102,7 +102,9 @@ dsp.bm_sr_enabled = True      # C (副経路のみ。スケルチ自動反映な
    Gavish-Donoho最適収縮も試したが対角平均→FIR後の出力SNRでは
    旧シフト収縮と互角〜微劣化 (合成±0.3dB) のため収縮式は維持。
    合成AB: 旧+3.67dB/保存0.916 → 新+3.69dB/保存0.922 (同等＋非負保証)。
-2. SRの`clip`は常にFalse (dspにADCクリップ旗がない)。過大入力時は使わないこと。
+2. [対策済] SRの`clip`は常にFalseだった → dspがadc_clip_pct/adc_clippedを
+   自己計測しSRへ配線済み。notch/RMTにも過大入力ガード (adc-clipバイパス)
+   を追加 (tests/test_clip_guard.py)。
 3. SRの`noise_floor`/`snr`は暫定プロキシ (超音波ノイズ・Sメータ換算)。
 4. コントローラのCPU値はdsp内実測のみ。外部負荷は見ない。
 5. pilot検出率の立上り3〜4ブロックはdwell＋EMAの仕様 (最小継続時間のため)。
