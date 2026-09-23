@@ -216,6 +216,39 @@ HAM_VHF_BANDS = [
 ]
 
 
+def resolve_mode(freq_hz: int, requested: str,
+                 fm_start_hz: int = 76000000,
+                 fm_end_hz: int = 108000000) -> str:
+    """周波数帯と要求モードから復調モードを自動解決する (プラグアンドプレイ)。
+
+    帯域と明白に矛盾する場合のみ補正し、明示的なSSB/CWは尊重する:
+    - FM放送帯 (fm_start..fm_end): AM/SSB系 → WFM (NFMはユーザー意図として残す)
+    - 24MHz未満 (MW/SW): FM系 → AM。HAM HFバンド内のAM系 → 慣例のLSB/USB
+    - HAM VHF/UHF (2m/70cm): NFM以外 → NFM
+    - エアバンド 118-137MHz: FM系 → AM
+    それ以外は要求モードをそのまま返す。"""
+    m = str(requested or "AM")
+    try:
+        f = int(freq_hz)
+    except (TypeError, ValueError):
+        return m
+    if fm_start_hz <= f <= fm_end_hz:
+        return m if m in ("WFM", "NFM") else "WFM"
+    if f < 24000000:
+        for _name, lo_khz, hi_khz in HAM_BANDS:
+            if lo_khz * 1000 <= f <= hi_khz * 1000:
+                if m in ("WFM", "NFM", "AM", "AM_NARROW"):
+                    return ham_band_mode(f)
+                return m
+        return "AM" if m in ("WFM", "NFM") else m
+    for _name, lo, hi, band_mode in HAM_VHF_BANDS:
+        if lo <= f <= hi:
+            return m if m == band_mode else band_mode
+    if 118000000 <= f <= 137000000 and m in ("WFM", "NFM"):
+        return "AM"
+    return m
+
+
 # ----------------------------------------------------------------------
 # 設定ファイル
 # ----------------------------------------------------------------------

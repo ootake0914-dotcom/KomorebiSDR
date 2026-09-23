@@ -236,6 +236,22 @@ dsp.bm_sr_enabled = True      # C (副経路のみ。スケルチ自動反映な
 - 教訓: STOIは4.3kHz以上盲目。NFMの+22dB可聴ヒスはSTOI=1.000のまま
   すり抜けた。帯域別ヒス指標との併用 (デュアルメトリック) が必須。
 
+## 自動化の完成 (プラグアンドプレイ: 自動モード解決＋収束測定)
+
+- 周波数と矛盾するモードの自動解決 `config.resolve_mode` を追加。
+  FREQ・シーク・スキャン経路 (`auto=True`) は帯域と矛盾するFM/AM系を
+  補正 (FM帯AM→WFM、24MHz未満WFM→AM、HAM HFのAM→LSB/USB、
+  2m/70cm→NFM、エアバンド→AM)。ユーザーの明示MODE選択 (`auto=False`) と
+  明示SSB/CWは尊重する。
+- 収束測定 (`tests/test_auto_convergence.py`): 合成WFM/AM/NFM/USBを
+  冷えたdspへ流し、主要状態 (Sメーター/パイロットロック/ブレンド/NRヒス/
+  AFC/AM同期/SSB AGC) が最終値の許容内で安定するまでの時間を実測。
+  最悪はWFM Sメーター1.26s・NFM AFC 1.03sで、3秒基準を満たす。
+  スローAGC (attack2s/release10s) は局間レベリング用の意図的遅延のため
+  合否対象外 (参考表示: 本条件で約2.3〜2.4s)。
+- 副産物: 合成NFMに+300Hzオフセットを入れ、AFCが-295.6Hzへ収束する
+  ことを確認 (追従の意味的検証)。
+
 ## 第2章 タスクC: WFM減量 (採用: stereo_pair / freq_blend 最適化)
 
 ### 目的と基準

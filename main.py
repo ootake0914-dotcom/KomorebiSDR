@@ -26,7 +26,7 @@ import sw_schedule
 from rt_profile import RtProfile
 from config import (load_config, save_config, detect_country, detect_language,
                     region_profile, LOG_PATH, shortwave_band_name,
-                    SHORTWAVE_BANDS, MW_BANDS, HAM_VHF_BANDS)
+                    SHORTWAVE_BANDS, MW_BANDS, HAM_VHF_BANDS, resolve_mode)
 from i18n import set_language as i18n_set_language, get_language as i18n_language, t
 
 
@@ -334,8 +334,27 @@ class SdrApp:
         except Exception:
             pass
 
-    def _apply_frequency_and_mode(self, freq: int, mode: str):
-        """周波数と復調モードをハードウェア・DSPに適用"""
+    def _apply_frequency_and_mode(self, freq: int, mode: str, auto: bool = True):
+        """周波数と復調モードをハードウェア・DSPに適用。
+
+        auto=True (周波数変更・シーク・スキャン等): 帯域と矛盾するモードは
+        resolve_modeで自動補正する (プラグアンドプレイ。周波数直打ちや
+        隣接帯域への移動で前のモードが残る誤復調を防ぐ)。
+        auto=False (ユーザーがMODEを明示選択): 要求をそのまま尊重する。"""
+        if auto:
+            try:
+                resolved = resolve_mode(
+                    freq, mode,
+                    int(self.profile.get("fm_start_hz", 76000000)),
+                    int(self.profile.get("fm_end_hz", 108000000)))
+                if resolved != mode:
+                    print(f"[INFO] mode auto-correct: {mode} -> {resolved} "
+                          f"@ {freq / 1e6:.3f}MHz", file=sys.stderr)
+                    mode = resolved
+                    self.gui.mode = mode
+                    self.gui._sync_bfo_visibility()
+            except Exception:
+                pass
         self.freq = freq
         self.mode = mode
 
@@ -745,7 +764,8 @@ class SdrApp:
                     if cmd == "FREQ":
                         self._apply_frequency_and_mode(val, self.mode)
                     elif cmd == "MODE":
-                        self._apply_frequency_and_mode(self.freq, val)
+                        # 明示的なモード選択は帯域補正せず尊重する
+                        self._apply_frequency_and_mode(self.freq, val, auto=False)
                     elif cmd == "SEEK":
                         # 次局/前局シーク (AM/短波ではSW局リスト、FM/その他ではFM局リスト)
                         direction = val
