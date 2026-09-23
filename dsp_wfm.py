@@ -195,7 +195,9 @@ class DspWfmMixin:
                     if self.bm_notch is None and AdaptiveNotchCanceller is not None:
                         self.bm_notch = self._bm_make_notch()
                     if self.bm_notch is not None and len(left) == len(right):
-                        (left, right), _ = self.bm_notch.process_stereo(left, right)
+                        (left, right), _ = self.bm_notch.process_stereo(
+                            left, right,
+                            clip=bool(getattr(self, "adc_clipped", False)))
                         left = np.asarray(left, dtype=np.float32)
                         right = np.asarray(right, dtype=np.float32)
                 except Exception:
@@ -215,7 +217,8 @@ class DspWfmMixin:
                             left, right,
                             s_meter_dbfs=float(getattr(self, "s_meter_dbfs",
                                                        -20.0)),
-                            snr_db=None)
+                            snr_db=None,
+                            clip=bool(getattr(self, "adc_clipped", False)))
                         left = np.asarray(left, dtype=np.float32)
                         right = np.asarray(right, dtype=np.float32)
                         try:
@@ -463,7 +466,9 @@ class DspWfmMixin:
                 if self.bm_notch is None and AdaptiveNotchCanceller is not None:
                     self.bm_notch = self._bm_make_notch()
                 if self.bm_notch is not None:
-                    out_mono, _ = self.bm_notch.process_mono(out_mono, ch="bm")
+                    out_mono, _ = self.bm_notch.process_mono(
+                        out_mono, ch="bm",
+                        clip=bool(getattr(self, "adc_clipped", False)))
                     out_mono = np.asarray(out_mono, dtype=np.float32)
             except Exception:
                 pass
@@ -479,7 +484,8 @@ class DspWfmMixin:
                     out_mono, _bm_info_m = self.bm_rmt.process_mono(
                         out_mono,
                         s_meter_dbfs=float(getattr(self, "s_meter_dbfs", -20.0)),
-                        snr_db=None, ch="bm")
+                        snr_db=None, ch="bm",
+                        clip=bool(getattr(self, "adc_clipped", False)))
                     out_mono = np.asarray(out_mono, dtype=np.float32)
                     try:
                         self._bm_last_rmt_info = {

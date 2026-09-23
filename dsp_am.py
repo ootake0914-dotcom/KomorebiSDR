@@ -131,7 +131,9 @@ class DspAmMixin:
                 if self.bm_notch is None and AdaptiveNotchCanceller is not None:
                     self.bm_notch = self._bm_make_notch()
                 if self.bm_notch is not None:
-                    audio, _ = self.bm_notch.process_mono(audio, ch="bm_am")
+                    audio, _ = self.bm_notch.process_mono(
+                        audio, ch="bm_am",
+                        clip=bool(getattr(self, "adc_clipped", False)))
                     audio = np.asarray(audio, dtype=np.float32)
             except Exception:
                 pass

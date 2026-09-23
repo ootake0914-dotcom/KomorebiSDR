@@ -165,8 +165,10 @@ class AdaptiveNotchCanceller:
                      "processing_ms": (time.perf_counter() - t0) * 1000.0})
         return info
 
-    def process_mono(self, audio, ch=""):
-        """モノラル1ch処理 → (cancelled, info)。"""
+    def process_mono(self, audio, ch="", clip=False):
+        """モノラル1ch処理 → (cancelled, info)。
+        clip=True (ADC飽和) 時は検出・除去とも行わない。
+        クリップ波形の高調波列をハム線と誤認する事故を防ぐ。"""
         t0 = time.perf_counter()
         info = {"processing_ms": 0.0, "bypass_reason": "", "lines": [],
                 "removed_db": 0.0}
@@ -181,6 +183,9 @@ class AdaptiveNotchCanceller:
             return x, info
         if n < 1024:
             info["bypass_reason"] = "too-short"
+            return x, info
+        if bool(clip):
+            info["bypass_reason"] = "adc-clip"
             return x, info
         if not bool(np.all(np.isfinite(x))):
             info["bypass_reason"] = "non-finite"
@@ -222,7 +227,7 @@ class AdaptiveNotchCanceller:
         info["processing_ms"] = (time.perf_counter() - t0) * 1000.0
         return y, info
 
-    def process_stereo(self, left, right):
+    def process_stereo(self, left, right, clip=False):
         """Midで推定しL/R同量を差し引く (ハム同相仮定) → ((L, R), info)。"""
         try:
             l = np.asarray(left, dtype=np.float32).reshape(-1)
@@ -232,7 +237,7 @@ class AdaptiveNotchCanceller:
         n = min(len(l), len(r))
         l, r = l[:n], r[:n]
         mid = ((l.astype(np.float64) + r.astype(np.float64)) * 0.5).astype(np.float32)
-        ym, info = self.process_mono(mid)
+        ym, info = self.process_mono(mid, clip=clip)
         if info.get("bypass_reason") in ("", "partial"):
             # Midで推定したハム波形をL/Rから差し引く
             h = (mid.astype(np.float64) - np.asarray(ym, dtype=np.float64))

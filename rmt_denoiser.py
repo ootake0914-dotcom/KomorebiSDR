@@ -118,8 +118,11 @@ class SafeRmtDenoiser:
         except Exception:
             return 0.0
 
-    def process_mono(self, audio, s_meter_dbfs=-40.0, snr_db=None, ch=""):
-        """モノラル1ch処理 → (denoised, info)。入力は変更しない。"""
+    def process_mono(self, audio, s_meter_dbfs=-40.0, snr_db=None, ch="",
+                       clip=False):
+        """モノラル1ch処理 → (denoised, info)。入力は変更しない。
+        clip=True (ADC飽和) 時は除去もブレンドもせず遅延整合出力のみ返す。
+        クリップ波形の高調波を信号と誤認して削る事故を防ぐ過大入力ガード。"""
         t0 = time.perf_counter()
         info = {"processing_ms": 0.0, "bypass_reason": "",
                 "estimated_noise_power": 0.0, "retained_rank": 0,
@@ -155,6 +158,11 @@ class SafeRmtDenoiser:
             xd = x_ext[:n]
         else:
             xd = x
+        if bool(clip):
+            # 過大入力ガード: 遅延整合だけ保ち、処理は一切しない
+            info["bypass_reason"] = "adc-clip"
+            self._eff_strength = 0.0
+            return xd, info
         rms_in = float(np.sqrt(np.mean(x.astype(np.float64) ** 2)) + 1e-18)
         if rms_in < 1e-6:
             # 無音は増幅も処理もしない
@@ -229,7 +237,8 @@ class SafeRmtDenoiser:
             return xd, info
         return y, info
 
-    def process_stereo(self, left, right, s_meter_dbfs=-40.0, snr_db=None):
+    def process_stereo(self, left, right, s_meter_dbfs=-40.0, snr_db=None,
+                         clip=False):
         """ステレオ処理 (Mid通常・Side低強度) → ((L, R), info)。"""
         try:
             l = np.asarray(left, dtype=np.float32).reshape(-1)
@@ -240,11 +249,13 @@ class SafeRmtDenoiser:
         l, r = l[:n], r[:n]
         mid = ((l.astype(np.float64) + r.astype(np.float64)) * 0.5).astype(np.float32)
         side = ((l.astype(np.float64) - r.astype(np.float64)) * 0.5).astype(np.float32)
-        ym, im = self.process_mono(mid, s_meter_dbfs, snr_db, ch="bm_m")
+        ym, im = self.process_mono(mid, s_meter_dbfs, snr_db, ch="bm_m",
+                                       clip=clip)
         saved_eff = self._eff_strength
         # Sideは低強度: 一時的に目標を絞って処理し、強度状態はMid基準に戻す
         self._eff_strength = saved_eff * self.side_ratio
-        ys, iss = self.process_mono(side, s_meter_dbfs, snr_db, ch="bm_s")
+        ys, iss = self.process_mono(side, s_meter_dbfs, snr_db, ch="bm_s",
+                                    clip=clip)
         self._eff_strength = saved_eff
         yl = (ym.astype(np.float64) + ys.astype(np.float64)).astype(np.float32)
         yr = (ym.astype(np.float64) - ys.astype(np.float64)).astype(np.float32)
