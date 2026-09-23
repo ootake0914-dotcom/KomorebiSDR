@@ -891,6 +891,8 @@ class SdrApp:
                         if dsp_tag.startswith("DSP "):
                             dsp_parts = dsp_tag[4:].split()
                             dsp_tag = f"DSP: {dsp_parts[0]}" if dsp_parts else "DSP: OK"
+                        rf_st = getattr(self.dsp, "rf_health_state", "HEALTHY")
+                        rf_tag = f" | RF:{rf_st}" if rf_st != "HEALTHY" else ""
                         txt = (
                             f"C/N: {cn_val:+.1f}dB | "
                             f"Aud: {aud_val:+.1f}dB | "
@@ -898,6 +900,7 @@ class SdrApp:
                             f"Ant: {ant_tag} | "
                             f"Sync: {sync_tag} | "
                             f"{afc_str}"
+                            f"{rf_tag}"
                         )
                     else:
                         lock_str = t("lock_fixed") if hard_locked else (t("lock_converged") if stats["converged"] else t("lock_searching"))

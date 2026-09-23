@@ -422,3 +422,12 @@ dsp.bm_sr_enabled = True      # C (副経路のみ。スケルチ自動反映な
 - **Resilience Score: 100.0 / 100.0**
 - 全テストスイート（`python tests/run_all.py`）: **ALL TESTS PASSED**
 
+### ハードウェアゲイン自動連動 (Auto Gain Interlocking)
+- **`HyperController` との統合**:
+  - `RfHealthGovernor` の過大入力判定（`OVERLOAD_HARD` / `OVERLOAD_WARNING`）および自律減衰要求（`gain_step_db`）を、`HyperController` の毎フレーム処理で直接監視。
+  - **ハードロック優先介入**: ユーザー固定または収束後ハードロック（`hard_lock=True`）中であっても、過大入力を検知した場合は最優先で介入し、チューナー実機（R820T2等）のゲインを目標値以下（例: -2dB, -6dB, -12dB）の安全段へ即座に引き下げてクリッピングを物理解消。
+  - **安全下限クランプ**: 過剰な減衰による無音化を防ぐため、`_min_safe_idx()`（19.7dB / 非常時12.5dB）の下限ガードを厳格に維持。
+  - **GUIテレメトリ反映**: 異常発生時はテレメトリに `| RF:OVERLOAD_HARD` などの警告タグを表示。
+- **検証**: `tests/test_rf_gain_interlock.py`（全4テスト全件合格）。
+
+

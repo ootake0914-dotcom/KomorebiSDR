@@ -703,8 +703,27 @@ class HyperController:
             cur_idx = self.current_gain_idx
             min_idx = self._min_safe_idx()
 
+            # RF Health Governor による自律過大入力・ADCサチュレーション保護 (ハードロック時も優先介入)
+            rf_info = getattr(self.dsp, "rf_health_info", {})
+            rf_step = float(rf_info.get("gain_step_db", 0.0))
+            if rf_step < 0.0:
+                cur_gain = self.available_gains[cur_idx]
+                target_gain = cur_gain + rf_step
+                candidates = [i for i, g in enumerate(self.available_gains) if g <= target_gain]
+                new_idx = max(min_idx, max(candidates)) if candidates else min_idx
+                if new_idx < cur_idx:
+                    self._record_observation(clipped=True)
+                    self.clip_upper_idx = cur_idx if self.clip_upper_idx is None else min(self.clip_upper_idx, cur_idx)
+                    self.locked_gain_db = self.available_gains[new_idx]
+                    self.last_verify_time = now
+                    # ハードロック中ならロックを維持したまま安全段へ退避
+                    if not self.hard_lock:
+                        self.locked = False
+                        self.search_phase = "fine"
+                        self._coarse_plan = []
+                    self._apply_gain(new_idx)
             # ハードロック（ユーザー手動固定）中: 真の重度サチュレーション(>2.5%)時のみ安全段へスライド(ロックは維持)
-            if self.hard_lock:
+            elif self.hard_lock:
                 if clip_pct >= 2.5:
                     step = 2 if clip_pct > 4.0 else 1
                     new_idx = max(min_idx, cur_idx - step)
@@ -766,5 +785,6 @@ class HyperController:
             "reacquires": self.reacquires,
             "antenna_profile": self.antenna_profile,
             "antenna_type": self.antenna_type_detected,
+            "rf_health": str(getattr(self.dsp, "rf_health_state", "HEALTHY")),
         }
         return self.last_stats
