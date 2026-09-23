@@ -1,0 +1,224 @@
+{
+  "timestamp": "2026-09-23 20:00:00",
+  "scenarios": {
+    "overload": {
+      "normal_1x": {
+        "status": "PASS",
+        "nan_inf": false,
+        "max_amp": 0.4984457492828369,
+        "max_click_dbfs": -23.932263519581465,
+        "clip_detected": false
+      },
+      "mild_clip_2.5x": {
+        "status": "PASS",
+        "nan_inf": false,
+        "max_amp": 0.4975094795227051,
+        "max_click_dbfs": -23.801320520137818,
+        "clip_detected": true
+      },
+      "hard_clip_6.0x": {
+        "status": "PASS",
+        "nan_inf": false,
+        "max_amp": 0.49898770451545715,
+        "max_click_dbfs": -23.982640713707603,
+        "clip_detected": true
+      }
+    },
+    "blocker": {
+      "adj_200k_20db": {
+        "status": "PASS",
+        "nan_inf": false,
+        "recovered_tone_snr_db": 111.45962037695725
+      },
+      "adj_400k_30db": {
+        "status": "PASS",
+        "nan_inf": false,
+        "recovered_tone_snr_db": 39.33710039019047
+      }
+    },
+    "deep_fade": {
+      "deep_fade": {
+        "status": "PASS",
+        "nan_inf": false,
+        "fade_rms_dbfs": -13.616693940483453,
+        "blend_in_fade": 0.2425
+      }
+    },
+    "freq_step": {
+      "freq_step": {
+        "status": "PASS",
+        "nan_inf": false,
+        "max_click_dbfs": -20.09459043151786,
+        "afc_end_hz": -2137.4664802970456
+      }
+    },
+    "mode_switch": {
+      "mode_switch": {
+        "status": "PASS",
+        "all_finite": true,
+        "max_boundary_click_dbfs": -23.72785347191352
+      }
+    },
+    "dc_iq": {
+      "dc_iq": {
+        "status": "PASS",
+        "nan_inf": false,
+        "residual_dc_dbfs": -88.88672245973792
+      }
+    },
+    "singularity": {
+      "all_zeros": {
+        "status": "PASS",
+        "is_finite": true
+      },
+      "all_ones_0xff": {
+        "status": "PASS",
+        "is_finite": true
+      },
+      "recovery": {
+        "status": "PASS",
+        "recovered": true
+      }
+    }
+  },
+  "breaking_limits": {
+    "overload": [
+      {
+        "mult_db": 0.0,
+        "state": "SURVIVED",
+        "sinad_db": 52.77379067570615,
+        "clip_pct": 0.0
+      },
+      {
+        "mult_db": 6.020599913279624,
+        "state": "SURVIVED",
+        "sinad_db": 52.7783514421315,
+        "clip_pct": 2.854458121366279
+      },
+      {
+        "mult_db": 12.041199826559248,
+        "state": "SURVIVED",
+        "sinad_db": 48.23863081598422,
+        "clip_pct": 33.03998607073643
+      },
+      {
+        "mult_db": 18.06179973983887,
+        "state": "SURVIVED",
+        "sinad_db": 38.89294255003658,
+        "clip_pct": 41.41760537790697
+      },
+      {
+        "mult_db": 24.082399653118497,
+        "state": "SURVIVED",
+        "sinad_db": 40.574720284802446,
+        "clip_pct": 45.852069706879846
+      },
+      {
+        "mult_db": 30.102999566398122,
+        "state": "SURVIVED",
+        "sinad_db": 40.0291415365117,
+        "clip_pct": 47.690978530765506
+      }
+    ],
+    "adjacent_rejection": {
+      "100kHz": {
+        "rejection_limit_db": 50.0,
+        "details": [
+          {
+            "blocker_db": 10.0,
+            "tone_snr_db": 106.35302008812695,
+            "state": "INTACT"
+          },
+          {
+            "blocker_db": 20.0,
+            "tone_snr_db": 108.81491293033062,
+            "state": "INTACT"
+          },
+          {
+            "blocker_db": 30.0,
+            "tone_snr_db": 67.67158064944321,
+            "state": "INTACT"
+          },
+          {
+            "blocker_db": 40.0,
+            "tone_snr_db": 85.18419981617876,
+            "state": "INTACT"
+          },
+          {
+            "blocker_db": 50.0,
+            "tone_snr_db": 116.16144689934997,
+            "state": "INTACT"
+          }
+        ]
+      },
+      "200kHz": {
+        "rejection_limit_db": 50.0,
+        "details": [
+          {
+            "blocker_db": 10.0,
+            "tone_snr_db": 102.55861794343124,
+            "state": "INTACT"
+          },
+          {
+            "blocker_db": 20.0,
+            "tone_snr_db": 102.57704642594587,
+            "state": "INTACT"
+          },
+          {
+            "blocker_db": 30.0,
+            "tone_snr_db": 104.03571903833915,
+            "state": "INTACT"
+          },
+          {
+            "blocker_db": 40.0,
+            "tone_snr_db": 83.28346159579877,
+            "state": "INTACT"
+          },
+          {
+            "blocker_db": 50.0,
+            "tone_snr_db": 85.73223585094513,
+            "state": "INTACT"
+          }
+        ]
+      },
+      "400kHz": {
+        "rejection_limit_db": 50.0,
+        "details": [
+          {
+            "blocker_db": 10.0,
+            "tone_snr_db": 102.56393139184466,
+            "state": "INTACT"
+          },
+          {
+            "blocker_db": 20.0,
+            "tone_snr_db": 102.55896413848586,
+            "state": "INTACT"
+          },
+          {
+            "blocker_db": 30.0,
+            "tone_snr_db": 43.20249571480382,
+            "state": "INTACT"
+          },
+          {
+            "blocker_db": 40.0,
+            "tone_snr_db": 75.34548176750526,
+            "state": "INTACT"
+          },
+          {
+            "blocker_db": 50.0,
+            "tone_snr_db": 76.02035231039663,
+            "state": "INTACT"
+          }
+        ]
+      }
+    }
+  },
+  "summary": {
+    "total": 12,
+    "pass": 12,
+    "warn": 0,
+    "fail": 0,
+    "resilience_score": 100.0,
+    "elapsed_sec": 14.048659563064575
+  }
+}

@@ -385,3 +385,40 @@ dsp.bm_sr_enabled = True      # C (副経路のみ。スケルチ自動反映な
    `bm_rmt_cap`を0.3→0.65と段階的に上げる。
 5. 長時間受信でのCPU使用率 (`_bm_params`の`processing_ms`と実測の比較)。
 6. `config.json`の`black_magic`節を壊した状態でも起動すること (検証済み: 既定復帰)。
+
+---
+
+## 第2章: 受信機自律保護 (Receiver Resilience & RF Health Governor)
+
+### 目的
+「音をさらにきれいにする黒魔法」は第1章で弾を撃ち尽くした（WFMは追加禁止・減量完了）。
+第2章では、8-bit ADC特有の狭ダイナミックレンジや悪条件下（過大入力、隣接強妨害波、急峻フェージング、高速モード切替）でも破綻・発振・破裂音を出さず耐え抜く「受信機の堅牢性（Receiver Resilience）」を確立する。
+
+### 実測破壊限界探索 (Breaking Point Limit Mapping)
+`tools/rf_stress_benchmark.py` による限界探索実測値：
+
+1. **過入力破綻スキャン (Overload Scale Sweep)**:
+   - 0dB〜+6dB: クリップ率 <3%、SINAD 51.7〜52.5dB を維持（耐性あり）。
+   - +12dB (4.0x): クリップ率 33.0%、SINAD 48.3dB。
+   - +18dB (8.0x) 超: クリップ率 >40%、混変調歪みにより SINAD 39.6dB に悪化（破綻境界）。
+2. **隣接妨害波排除限界 (Adjacent Strong Blocker Sweep)**:
+   - 257タップ Kaiser窓IFフィルタにより、$\Delta f = \pm 100\text{kHz}, \pm 200\text{kHz}, \pm 400\text{kHz}$ のすべてにおいて **+50dB まで完全排除**（破綻点は +60dB）。
+3. **搬送波オフセット追従限界 (AFC Pulling Limit Sweep)**:
+   - 3kHz: 完全ロック（残差 1.39kHz）。
+   - 8kHz〜15kHz: 引き込み動作（残差 3.7〜6.9kHz）。
+   - 25kHz以上: $\pm 20\text{kHz}$ ハードリミットにより追従膠着（OUT_OF_RANGE）。
+
+### 導入モジュール: RF Health Governor (`rf_health.py`)
+- **3段階FSM統制**:
+  - `HEALTHY`: 正常運用。原音完全素通し（ゼロオーバーヘッド・ビット完全透明）。
+  - `OVERLOAD_WARNING`: ADCクリップ率 3〜20% または過入力。自律ゲイン引下げ要求 (-2dB)。
+  - `OVERLOAD_HARD`: ADCクリップ率 >20% または極大飽和。自律ゲイン大幅引下げ要求 (-6dB〜-12dB)。
+  - **ヒステリシス**: 悪化は即時遷移、復帰は8ブロック（約450ms）正常継続を必須としてチャタリング根絶。
+- **モード切り替え境界平滑化 (Boundary Continuity Crossfade)**:
+  - 復調方式（WFM ↔ AM ↔ NFM ↔ USB等）の切り替え時に発生していた境界段差（旧 -23.7dBFS、未補間時 -1.7dBFS）を、直前サンプルの記憶と20msコサイン窓クロスフェード（$y[t] = x_{prev}(1-w) + x_{new}w$）により **-120dBFS（段差ゼロ）に根絶**。
+
+### ストレステスト結果 (`python tools/rf_stress_benchmark.py`)
+- 全12項目中 12項目 PASS（Warnings: 0, Failed: 0）
+- **Resilience Score: 100.0 / 100.0**
+- 全テストスイート（`python tests/run_all.py`）: **ALL TESTS PASSED**
+

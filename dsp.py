@@ -36,6 +36,7 @@ from audiophile_dsp import (
     MinimumPhaseApodizer,
     TpdfDitherNoiseShaper,
 )
+from rf_health import RfHealthGovernor, RfHealthState
 
 
 # ================================================================
@@ -126,6 +127,13 @@ class SdrDspPipeline(DspBlackMagicMixin, DspAmMixin, DspNfmMixin,
         # ADCクリップ旗 (生IQの±127飽和率。SR/BM/AGCへ供給。選局でリセット)
         self.adc_clip_pct = 0.0
         self.adc_clipped = False
+
+        # RF Health Governor (過大入力・急峻フェージング・モード切替過渡の自律保護)
+        self.rf_health_governor = RfHealthGovernor(sample_rate=self.audio_rate)
+        self.rf_health_enabled = True
+        self._last_mode = None
+        self.rf_health_state = RfHealthState.HEALTHY
+        self.rf_health_info = {}
 
         self.offset_freq = 0.0
         self.mixer_phase = 0.0
@@ -282,6 +290,8 @@ class SdrDspPipeline(DspBlackMagicMixin, DspAmMixin, DspNfmMixin,
         # ADCクリップ旗もリセット (前局の過大入力を引きずらない)
         self.adc_clip_pct = 0.0
         self.adc_clipped = False
+        if getattr(self, "rf_health_governor", None) is not None:
+            self.rf_health_governor.reset()
         # LUFS窓履歴もリセット (ゲインは維持し音量跳躍を防ぐ)
         try:
             if self._lufs_norm is not None:
@@ -788,6 +798,19 @@ class SdrDspPipeline(DspBlackMagicMixin, DspAmMixin, DspNfmMixin,
         except Exception:
             pass
 
+        # モード切替の検出と通知 (クリック抑制クロスフェードのトリガー)
+        if self._last_mode is not None and mode != self._last_mode:
+            if getattr(self, "rf_health_governor", None) is not None:
+                self.rf_health_governor.notify_mode_switch(self._last_mode, mode)
+        self._last_mode = mode
+
+        # RF Health Governor 更新 (過大入力・クリップ・深フェージングのFSM判定)
+        if getattr(self, "rf_health_enabled", True) and getattr(self, "rf_health_governor", None) is not None:
+            _pl = float(getattr(self, "_stereo_blend", 1.0))
+            self.rf_health_state, self.rf_health_info = self.rf_health_governor.update(
+                raw_work, s_meter_dbfs=float(getattr(self, "s_meter_dbfs", -20.0)), pilot_lock=_pl
+            )
+
         iq = self.raw_to_iq(raw_work)
         if getattr(self, "iq_corrector", None) is not None:
             iq = self.iq_corrector.process(iq)
@@ -950,6 +973,10 @@ class SdrDspPipeline(DspBlackMagicMixin, DspAmMixin, DspNfmMixin,
                 audio_clean = (np.asarray(audio_clean) * _sq).astype(np.float32)
             except Exception:
                 pass
+
+        # RF Health Governor による最終オーディオガード (過大入力保護・ソフトフェード・モード切替クリック抑圧)
+        if getattr(self, "rf_health_enabled", True) and getattr(self, "rf_health_governor", None) is not None:
+            audio_clean = self.rf_health_governor.apply_audio_guard(audio_clean)
 
         return audio_clean, spectrum_db
 
