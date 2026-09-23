@@ -114,6 +114,24 @@ class DspBlackMagicMixin:
                                max_matrix_size=int(_num("max_matrix_size", 256, 16, 4096)),
                                cpu_budget_percent=_num("cpu_budget_percent", 20.0, 0.0, 100.0))
 
+    def _bm_rmt_strength_cap(self) -> float:
+        """番組適応したRMT強度上限。トーク (speech_prob→1) で半減する。
+        音楽 (prob=0)・適応OFF・分類器不在時は従来上限と一致する。"""
+        try:
+            cap = min(max(float(getattr(self, "bm_rmt_cap", 0.65)), 0.0), 0.85)
+        except (TypeError, ValueError):
+            cap = 0.65
+        if bool(getattr(self, "bm_rmt_speech_adapt", True)):
+            try:
+                p = float(getattr(getattr(self, "cognitive_eq", None),
+                                  "speech_prob", 0.0))
+            except (TypeError, ValueError):
+                p = 0.0
+            if not (p >= 0.0 and p <= 1.0):
+                p = 0.0
+            cap *= 1.0 - 0.5 * p
+        return float(cap)
+
     def _bm_make_notch(self):
         """bm_cfgを反映したAdaptiveNotchCancellerを生成。"""
         if AdaptiveNotchCanceller is None:
@@ -220,6 +238,9 @@ class DspBlackMagicMixin:
         self.bm_cyclo_confidence = 0.0
         self.bm_sr_confidence = 0.0
         self.bm_rmt_cap = 0.65
+        # 番組適応RMT (既定ON): トーク時は強度上限を半減し了解度を優先、
+        # 音楽時は全開で快適性を優先。speech_prob=0では係数1.0で旧動作と一致。
+        self.bm_rmt_speech_adapt = True
         # main.pyから渡される黒魔法パラメータ (configのblack_magic節)。
         # 遅延生成インスタンスのコンストラクタに反映する。既定は空=内蔵既定。
         self.bm_cfg = {}

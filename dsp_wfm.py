@@ -211,8 +211,7 @@ class DspWfmMixin:
                     if self.bm_rmt is None and SafeRmtDenoiser is not None:
                         self.bm_rmt = self._bm_make_rmt()
                     if self.bm_rmt is not None and len(left) == len(right):
-                        self.bm_rmt.max_strength = min(max(
-                            float(getattr(self, "bm_rmt_cap", 0.65)), 0.0), 0.85)
+                        self.bm_rmt.max_strength = self._bm_rmt_strength_cap()
                         (left, right), _bm_info = self.bm_rmt.process_stereo(
                             left, right,
                             s_meter_dbfs=float(getattr(self, "s_meter_dbfs",
@@ -479,8 +478,7 @@ class DspWfmMixin:
                 if self.bm_rmt is None and SafeRmtDenoiser is not None:
                     self.bm_rmt = self._bm_make_rmt()
                 if self.bm_rmt is not None:
-                    self.bm_rmt.max_strength = min(max(
-                        float(getattr(self, "bm_rmt_cap", 0.65)), 0.0), 0.85)
+                    self.bm_rmt.max_strength = self._bm_rmt_strength_cap()
                     out_mono, _bm_info_m = self.bm_rmt.process_mono(
                         out_mono,
                         s_meter_dbfs=float(getattr(self, "s_meter_dbfs", -20.0)),
