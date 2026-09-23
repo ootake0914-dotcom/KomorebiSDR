@@ -25,7 +25,8 @@ from signal_logger import SignalLogger, is_settled as _sig_settled
 import sw_schedule
 from rt_profile import RtProfile
 from config import (load_config, save_config, detect_country, detect_language,
-                    region_profile, LOG_PATH, shortwave_band_name)
+                    region_profile, LOG_PATH, shortwave_band_name,
+                    SHORTWAVE_BANDS, MW_BANDS, HAM_VHF_BANDS)
 from i18n import set_language as i18n_set_language, get_language as i18n_language, t
 
 
@@ -630,7 +631,9 @@ class SdrApp:
                 return []
             stations = []
             try:
-                stations = self.tuner.scan_band_hf(snr_threshold=6.5)
+                stations = self.tuner.scan_band_hf(
+                    snr_threshold=6.5,
+                    bands=list(SHORTWAVE_BANDS) + list(MW_BANDS))
                 self.gui.detected_stations = stations
                 self._update_presets_from_sw_scan(stations)
             except Exception as e:
@@ -662,8 +665,8 @@ class SdrApp:
             return stations
 
         def safe_ham_scan(status_label: str, auto_tune_best: bool = True):
-            """アマチュア無線HFバンド (80/40/20m) をスキャンする。
-            LSB/USBは周波数から自動判定。プリセット更新なし (検出局リストのみ)。
+            """アマチュア無線バンド (HF 80/40/20m + VHF/UHF 2m/70cm) をスキャンする。
+            LSB/USB/NFMは帯域から自動判定。プリセット更新なし (検出局リストのみ)。
             CWはSSB検出後に手動切替 (BFO±)。"""
             nonlocal t_usb
             self.gui.scan_status_text = status_label
@@ -681,6 +684,15 @@ class SdrApp:
             stations = []
             try:
                 stations = self.tuner.scan_band_ham(snr_threshold=5.0)
+                for _band, _lo, _hi, _mode in HAM_VHF_BANDS:
+                    try:
+                        stations.extend(self.tuner.scan_band(
+                            _lo, _hi, step_hz=1000000, snr_threshold=5.0,
+                            mode=_mode, grid_hz=12500, unknown_min_snr=5.0))
+                    except Exception as e:
+                        print(f"[WARN] Ham VHF scan failed ({_band}): {e}", file=sys.stderr)
+                stations.sort(key=lambda s: s["freq_hz"])
+                self.tuner.discovered_ham = stations
                 self.gui.detected_stations = stations
             except Exception as e:
                 print(f"[ERROR] Ham scan failed: {e}", file=sys.stderr)
@@ -699,7 +711,7 @@ class SdrApp:
             if stations:
                 best = max(stations, key=lambda s: s["snr_db"])
                 best_mode = best.get("mode", "USB")
-                if best_mode not in ("USB", "LSB", "CW"):
+                if best_mode not in ("USB", "LSB", "CW", "NFM"):
                     best_mode = "USB"
                 self._apply_frequency_and_mode(best["freq_hz"], best_mode)
                 self.gui.center_freq = best["freq_hz"]
@@ -729,7 +741,11 @@ class SdrApp:
                         # 初回シークは局リストが無いため帯域スキャンが必要
                         # (USBストリームを安全に停止しないとread_syncが競合・ハングする)
                         is_sw = (self.mode in ("AM", "USB", "LSB", "CW")) or (self.freq < 24000000)
-                        if self.mode in ("USB", "LSB", "CW"):
+                        _ham_all = getattr(self.tuner, "discovered_ham", [])
+                        # NFMでもハムVHF帯にいればハムリストを使う (FM放送へ飛ばさない)
+                        _use_ham = (self.mode in ("USB", "LSB", "CW")
+                                    or (self.mode == "NFM" and any(s["freq_hz"] > 30000000 for s in _ham_all)))
+                        if _use_ham:
                             # SSB/CW時はアマチュア無線リストから探し、局のモードで同調
                             if not self.tuner.discovered_ham:
                                 safe_ham_scan(t("first_seek_scan"), auto_tune_best=False)
@@ -745,7 +761,7 @@ class SdrApp:
                                     st = cands[-1] if cands else None
                             if st:
                                 next_mode = st.get("mode", "USB")
-                                if next_mode not in ("USB", "LSB", "CW"):
+                                if next_mode not in ("USB", "LSB", "CW", "NFM"):
                                     next_mode = "USB"
                                 self._apply_frequency_and_mode(st["freq_hz"], next_mode)
                                 self.gui.center_freq = self.freq

@@ -470,8 +470,8 @@ class SdrGui:
         self.btn_band_fm = Button((bx0, by0, bw, 32), "📻 FM Radio",
                                   lambda: self._tune(80000000, "WFM"),
                                   bg_color=(220, 238, 250), radius=16)
-        self.btn_band_am = Button((bx0 + bw + 8, by0, bw, 32), "📰 AM News",
-                                  lambda: self._tune(954000, "AM"),
+        self.btn_band_am = Button((bx0 + bw + 8, by0, bw, 32), "📻 AMラジオ",
+                                  lambda: self._tune(594000, "AM"),
                                   bg_color=(232, 240, 248), radius=16)
         self.btn_band_sw = Button((bx0 + (bw + 8) * 2, by0, bw, 32), "🌐 Shortwave",
                                   lambda: self._tune(6055000, "AM"),
@@ -627,9 +627,19 @@ class SdrGui:
         return panel, rows, total
 
     @staticmethod
+    def _station_match_margin(freq_hz: float) -> int:
+        """選局一致マージン。短波は5kHz刻みのため±2kHzに狭める。
+        FM用±50kHzのままだと短波で複数行ハイライトされるバグになる
+        (seek_nextの短波窓と一致させる)。"""
+        try:
+            return 2000 if int(freq_hz) < 30000000 else 50000
+        except Exception:
+            return 50000
+
+    @staticmethod
     def _station_display_name(st) -> str:
         """表示用局名。未同定センチネルは「不明な局」に変換する。
-        (内部センチネル "Unknown FM Station" はppm_cal・テストと共有のため維持)"""
+        (内部センチネルはppm_cal・テストと共有のため維持)"""
         try:
             name = str(st.get("name", ""))
         except Exception:
@@ -697,7 +707,7 @@ class SdrGui:
                 fh = st.get("freq_hz")
                 if fh is None:
                     continue
-                sel = abs(int(fh) - cur) < 50000
+                sel = abs(int(fh) - cur) < self._station_match_margin(cur)
             except Exception:
                 continue
             if sel:
@@ -1043,7 +1053,7 @@ class SdrGui:
             ticker_text = self.station_name
         else:
             for st in self.detected_stations:
-                if abs(st["freq_hz"] - self.center_freq) <= 50000:
+                if abs(st["freq_hz"] - self.center_freq) <= self._station_match_margin(self.center_freq):
                     # "Unknown FM Station"は未同定センチネル。短波等では帯域汎名へ落とす
                     if st["name"] != "Unknown FM Station":
                         ticker_text = st["name"]

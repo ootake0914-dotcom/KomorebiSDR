@@ -69,6 +69,9 @@ class AutoTuner:
         end_hz: int = 95000000,
         step_hz: int = 1500000,
         snr_threshold: float = 7.5,
+        mode: str = None,
+        grid_hz: int = 100000,
+        unknown_min_snr: float = 8.5,
     ) -> list[dict]:
         """
         帯域全体を高速スイープし、FM放送局らしきピークを抽出 (偽局・ノイズスプリアスの除外を試みる)。
@@ -76,6 +79,8 @@ class AutoTuner:
         :param end_hz: スキャン終了周波数 (デフォルト 95.0MHz)
         :param step_hz: チューナーステップ幅 (デフォルト 1.5MHz)
         :param snr_threshold: ピーク検知しきい値 (ノイズフロアの微細な山を排除するため 7.5dB に設定)
+        :param mode: 検出局に付与するモード (None時はキー自体を付けない。従来動作)。
+            ハムVHF/UHF用に "NFM" を指定する。
         :return: 発見された局のリスト（周波数、SNR、信号強度、局名、AFC補正値）
         """
         if step_hz <= 0 or end_hz <= start_hz:
@@ -143,8 +148,8 @@ class AutoTuner:
             # ピーク検出 (帯域幅チェック付き)
             peaks = self._find_spectral_peaks(spec_db, freq_axis, noise_floor, snr_threshold)
             for p in peaks:
-                # 日本のFMグリッド (100kHz単位) にスナップ
-                snapped_hz = int(round(p["peak_freq"] / 100000.0) * 100000)
+                # 指定グリッド (FM放送100kHz / ハム12.5kHz) にスナップ
+                snapped_hz = int(round(p["peak_freq"] / grid_hz) * grid_hz)
                 if snapped_hz < start_hz or snapped_hz > end_hz:
                     continue
 
@@ -153,10 +158,11 @@ class AutoTuner:
 
                 # 本物のFM放送局判定:
                 # 1. 既知局DBにある場合は SNR 5.0dB でも許容
-                # 2. 未知局の場合は SNR >= 8.5dB かつ FMグリッド偏差 ±12kHz 以内であることを要求
+                # 2. 未知局の場合は SNR >= unknown_min_snr かつ グリッド偏差±12kHz以内を要求
+                #    (ハム用はしきい値を下げて呼ぶ)
                 is_known = (name != "Unknown FM Station")
                 if not is_known:
-                    if p["snr_db"] < 8.5 or abs(afc_offset) > 12000:
+                    if p["snr_db"] < unknown_min_snr or abs(afc_offset) > 12000:
                         continue
                 else:
                     if p["snr_db"] < 5.0:
@@ -183,6 +189,7 @@ class AutoTuner:
                         "peak_power_db": round(p["peak_power"], 1),
                         "afc_offset_hz": round(afc_offset, 0),
                         "quality": quality,
+                        **({"mode": mode} if mode is not None else {}),
                     })
 
         if not was_open and self.owns_driver:
@@ -191,7 +198,11 @@ class AutoTuner:
         # 周波数順にソート
         stations.sort(key=lambda s: s["freq_hz"])
 
-        # 隣接チャンネルスプラッター（強力局の裾野によるゴースト局）の除去フィルタ
+        # 隣接チャンネルスプラッター除去 (FM放送用。ハム等mode指定時は
+        # 狭帯域局同士を誤殺するため適用せず、格納も呼び出し側に委ねる)
+        if mode is not None:
+            stations.sort(key=lambda s: s["freq_hz"])
+            return stations
         filtered_stations = []
         for i, s in enumerate(stations):
             is_ghost = False
@@ -249,10 +260,12 @@ class AutoTuner:
         fft_size = 2048
         window = np.hamming(fft_size).astype(np.float32)
         win_power = np.sum(window ** 2) / fft_size
-        band_ranges = [
-            (int(lo * 1000), int(min(hi * 1000, SW_MAX_HZ)))
-            for _name, lo, hi in (bands if bands is not None else SHORTWAVE_BANDS)
-        ]
+        # バンド毎グリッド対応: 要素は (lo, hi[, grid])。3要素はgrid_hz既定。
+        band_ranges = []
+        for _entry in (bands if bands is not None else SHORTWAVE_BANDS):
+            _lo, _hi = _entry[1] * 1000, min(_entry[2] * 1000, SW_MAX_HZ)
+            _grid = int(_entry[3]) if len(_entry) > 3 else int(grid_hz)
+            band_ranges.append((_lo, _hi, _grid))
         stations = []
 
         for fc in centers:
@@ -289,11 +302,18 @@ class AutoTuner:
             peaks = self._find_spectral_peaks(
                 spec_db, freq_axis, noise_floor, snr_threshold, min_width_bins=3)
             for p in peaks:
-                # 放送は5kHzグリッド、アマチュア無線は100Hzグリッドにスナップ
-                snapped = int(round(p["peak_freq"] / grid_hz) * grid_hz)
-                if not any(lo <= snapped <= hi for lo, hi in band_ranges):
+                # ピークを含むバンドのグリッドにスナップ (放送5kHz/中波9kHz/ハム100Hz)
+                _grid = grid_hz
+                _in_band = False
+                for _lo, _hi, _g in band_ranges:
+                    if _lo <= p["peak_freq"] <= _hi:
+                        _grid = _g
+                        _in_band = True
+                        break
+                if not _in_band:
                     continue
-                dedup_hz = max(1000, int(grid_hz * 0.8))
+                snapped = int(round(p["peak_freq"] / _grid) * _grid)
+                dedup_hz = max(1000, int(_grid * 0.8))
                 existing = next(
                     (s for s in stations if abs(s["freq_hz"] - snapped) < dedup_hz), None)
                 if existing:

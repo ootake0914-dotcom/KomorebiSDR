@@ -162,8 +162,8 @@ def ham_band_mode(freq_hz: int) -> str:
 
 
 def shortwave_band_name(freq_hz: int) -> str:
-    """周波数から短波放送バンド名 (49m等) を返す"""
-    for name, lo_khz, hi_khz in SHORTWAVE_BANDS:
+    """周波数から短波放送バンド名 (49m等) を返す。中波は MW。"""
+    for name, lo_khz, hi_khz, *_rest in list(SHORTWAVE_BANDS) + list(MW_BANDS):
         if lo_khz * 1000 <= freq_hz <= hi_khz * 1000:
             return name
     return "SW"
@@ -171,14 +171,16 @@ def shortwave_band_name(freq_hz: int) -> str:
 
 def shortwave_scan_centers(rate_hz: float, bands=None, usable_max_hz: int = SW_MAX_HZ,
                            overlap_hz: int = 100000) -> list:
-    """短波バンドを覆うセンタ周波数リストを生成 (各帯域は窓幅で確実にカバー)"""
+    """短波バンドを覆うセンタ周波数リストを生成 (各帯域は窓幅で確実にカバー)。
+    bands要素は (name, lo_khz, hi_khz[, grid_hz])。4要素目のグリッドは
+    scan_band_hf側で使用し、ここでは無視する。"""
     bands = bands if bands is not None else SHORTWAVE_BANDS
     centers = []
     half = rate_hz / 2.0 - overlap_hz
     if half <= 0:
         return centers
     step = 2.0 * half
-    for _name, lo_khz, hi_khz in bands:
+    for _name, lo_khz, hi_khz, *_rest in bands:
         lo = lo_khz * 1000
         hi = min(hi_khz * 1000, usable_max_hz)
         if hi <= lo:
@@ -194,6 +196,24 @@ def shortwave_scan_centers(rate_hz: float, bands=None, usable_max_hz: int = SW_M
                 break
             fc += step
     return sorted(set(centers))
+
+
+# ----------------------------------------------------------------------
+# 中波 (MW) バンド (kHz)。短波スキャンと同一経路で走査する。
+# 4要素目はグリッド (9kHz)。NHK第1 594 / 第2 693kHzを含む。
+# ----------------------------------------------------------------------
+MW_BANDS = [
+    ("MW", 531, 1602, 9000),
+]
+
+
+# ----------------------------------------------------------------------
+# アマチュア無線 VHF/UHF バンド (Hz)。通常チューナー経路で走査する。
+# ----------------------------------------------------------------------
+HAM_VHF_BANDS = [
+    ("2m", 144000000, 146000000, "NFM"),
+    ("70cm", 430000000, 440000000, "NFM"),
+]
 
 
 # ----------------------------------------------------------------------
