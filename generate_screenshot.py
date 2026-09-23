@@ -16,8 +16,10 @@ def generate_screenshot(output_path="assets/screenshot.png"):
     gui.center_freq = 80000000
     gui.station_name = "TOKYO FM"
     gui.s_units = 8.5
+    gui.is_stereo = True
+    gui.stereo_status = "STEREO"
     gui.scan_status_text = "Receiving: 80.00 MHz - TOKYO FM (Stereo Hi-Fi)"
-    gui.telemetry_text = "SNR: 28.5dB | IQ: 48 | DSP: OK | Gain: Auto | Lock: Fixed | SIC: -18.2dB"
+    gui.telemetry_text = "SNR: 28.5dB | IQ: 48 | DSP: 24.2ms | Gain: Auto | Lock: Fixed | SIC: -18.2dB"
 
     # スキャンにより検出された放送局のシミュレーション (どこでも・誰でも・スキャン探索後)
     fm_presets = [
@@ -61,8 +63,8 @@ def generate_screenshot(output_path="assets/screenshot.png"):
     t = np.arange(4800) / 48000.0
     pcm = (0.55 * np.sin(2 * np.pi * 440 * t) + 0.3 * np.sin(2 * np.pi * 880 * t + 0.4) + 0.15 * np.sin(2 * np.pi * 1760 * t)).astype(np.float32)
 
-    # ウォーターフォールを綺麗に埋めるため 60 フレーム描画
-    for frame in range(70):
+    # ウォーターフォールを綺麗に埋めるため 230 フレーム描画
+    for frame in range(230):
         # 音楽・音声の揺らぎを付加
         wobble = np.random.randn(1024) * 0.8
         instant_spec = (spec_base + wobble).astype(np.float32)
