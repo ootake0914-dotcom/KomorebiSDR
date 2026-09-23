@@ -179,6 +179,14 @@ class DspNfmMixin:
         audio = self._apply_voice_highpass(audio)
         audio = self._voice_bandwidth(audio, 3000.0, 2200.0)
         # SSB/CW経路のRMTは不採用 (狭帯域誤作動。verdict参照)
+        # CW自動ピッチ (既定ON): 400-1000Hzのピークを650Hzへ寄せる。
+        # SSBは抑制搬送波で盲目基準がなく、誤補正が mistune より有害なため
+        # 見送り (手動BFO維持)。CWのみ・明瞭単音のみ・±800Hz clamp。
+        if mode == "CW" and bool(getattr(self, "cw_auto_pitch", True)):
+            try:
+                audio = self._cw_auto_pitch(audio)
+            except Exception:
+                pass
         # SSB/CW経路のSR検出プローブ (既定OFF。confidence公開のみ)
         try:
             _lv = float(level)
@@ -192,6 +200,53 @@ class DspNfmMixin:
         except Exception:
             pass
         return audio.astype(np.float32)
+
+    def _cw_auto_pitch(self, audio: np.ndarray) -> np.ndarray:
+        """CW自動ピッチ: 400-1000Hzの最大ピーク (放物線補間で細分) を
+        650Hzへ寄せるようBFOを=ゆっくり補正する。ピーク突出<6dB・無音・
+        非有限時は保持 (ホールド)。補正は±800Hz clamp、急変禁止。
+        音声自体は変えずBFO状態のみ進める (当ブロックは旧BFOで復調済み
+        のため、効果は次ブロック以降に反映される)。"""
+        try:
+            x = np.asarray(audio, dtype=np.float64).reshape(-1)
+        except Exception:
+            return audio
+        n = len(x)
+        if n < 1024 or not bool(np.all(np.isfinite(x))):
+            return audio
+        if float(np.sqrt(np.mean(x ** 2))) < 1e-4:
+            return audio
+        spec = np.abs(np.fft.rfft(x * np.hanning(n)))
+        freqs = np.fft.rfftfreq(n, 1.0 / float(self.audio_rate))
+        m = (freqs >= 400.0) & (freqs <= 1000.0)
+        if not bool(np.any(m)):
+            return audio
+        band = spec[m]
+        fr = freqs[m]
+        k = int(np.argmax(band))
+        peak = float(band[k])
+        floor = float(np.median(band)) + 1e-18
+        if 20.0 * float(np.log10(peak / floor)) < 6.0:
+            return audio
+        # 放物線補間でサブビン推定
+        if 0 < k < len(band) - 1:
+            a, b, c = (float(band[k - 1]), float(band[k]),
+                       float(band[k + 1]))
+            d = a - 2.0 * b + c
+            shift = 0.5 * (a - c) / d if abs(d) > 1e-18 else 0.0
+            shift = min(max(shift, -1.0), 1.0)
+        else:
+            shift = 0.0
+        f0 = float(fr[k] + shift * (fr[1] - fr[0]))
+        err = f0 - 650.0
+        if abs(err) < 5.0:
+            return audio
+        cur = float(getattr(self, "bfo_offset_hz", 0.0))
+        # CWは正=ピッチ上昇 (demodulate_ssbと同符号)。高すぎたら下げる。
+        # 1ブロックで誤差1割 (急変禁止・発散時はclampが止める)。
+        new = cur - 0.1 * err
+        self.bfo_offset_hz = float(min(max(new, -800.0), 800.0))
+        return audio
 
     def _init_nfm_state(self):
         """NFM/SSB用FIR等の状態初期化 (__init__ から純粋移動)。"""
@@ -217,6 +272,7 @@ class DspNfmMixin:
         self._voice_hp_state = np.zeros(2, dtype=np.float32)
         # ===== SSB / CW =====
         self.bfo_offset_hz = 0.0     # BFO微調整 (SSB/CWのみ)
+        self.cw_auto_pitch = True    # CW自動ピッチ (650Hzへ。SSBは見送り)
         self.ssb_agc_level = 0.0
         self._ssb_agc_hang = 0
         self._ssb_bp_phase = 0.0

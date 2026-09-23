@@ -293,6 +293,13 @@ class SdrDspPipeline(DspBlackMagicMixin, DspAmMixin, DspNfmMixin,
         self._am_ig = 0.0
         self._am_ef = 0.0
         self._am_sync_mix = 0.0
+        # CW自動ピッチのBFOもリセット (前局への補正を持ち越さない。
+        # 手動BFO (cw_auto_pitch=False) は維持する)
+        try:
+            if bool(getattr(self, "cw_auto_pitch", True)):
+                self.bfo_offset_hz = 0.0
+        except Exception:
+            pass
         # history_* はWFM/NFM/AM/SSBで共有しているため、選局・モード切替で
         # 全FIR履歴をゼロ化 (前局の残響・タップ数違いの過渡ポップを防止)。
         # AGCレベルは維持し音量ポンピングを避ける。
