@@ -385,13 +385,14 @@ class DspWfmMixin:
         if self.afc_enabled and len(demod) > 0:
             mean_dc = float(np.mean(demod))
             freq_error_hz = mean_dc * (self.if_rate / (2.0 * np.pi))
-            if abs(freq_error_hz) < 20000.0:  # ±20kHz以内の偏差に自動追従
+            afc_limit = float(getattr(self, "afc_limit_hz", 42000.0))
+            if abs(freq_error_hz) < afc_limit:  # 許容偏差範囲に自動追従
                 # 20Hz未満の微小ジッターは補正を休止しロックを維持
                 if abs(freq_error_hz) > 20.0:
                     self.afc_offset_hz = float(np.clip(
                         self.afc_offset_hz - self.afc_alpha * freq_error_hz,
-                        -20000.0,
-                        20000.0
+                        -afc_limit,
+                        afc_limit
                     ))
 
         # 3. 適切な名目オーディオゲインにスケーリング
@@ -1218,6 +1219,7 @@ class DspWfmMixin:
         self.afc_enabled = True
         self.afc_offset_hz = 0.0
         self.afc_alpha = 0.05  # 滑らかな追従時定数
+        self.afc_limit_hz = 42000.0  # 引き込み許容上限 (隣接局100kHzへの誤引き込みを防ぎつつPPMズレ・オフセットを吸収)
 
         self.fm_last_sample = 0.0 + 0.0j
         # PLL-FM復調状態 (fn=25kHz, ζ=1.0 の実測勝ち値。w=2πfn/fsで正規化設計)
