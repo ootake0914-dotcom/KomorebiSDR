@@ -261,8 +261,7 @@ class SdrGui:
         self.tune_rect = pygame.Rect(826, 246, 280, 414)  # 下部まで延長 (カード廃止分)
         # preset_rectは廃止 (ステーションカード削除)。プリセットデータはconfig側で維持。
         self.status_rect = pygame.Rect(14, 674, 1092, 32)
-        self.is_favorite = False
-        self.fav_rect = pygame.Rect(self.hero_rect.right - 40, self.hero_rect.y + 10, 26, 24)
+        # お気に入り☆は飾りのみだったため廃止 (保存・一覧なしの嘘UI)。
         # 音量スライダー廃止 (システム音量に一本化。死にコントロール除去)。
 
         self.wf_surface = pygame.Surface((self.wf_rect.width, self.wf_rect.height))
@@ -783,10 +782,7 @@ class SdrGui:
             # クリックイベント
             if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                 mx, my = event.pos
-                if self.fav_rect.collidepoint(mx, my):
-                    self.is_favorite = not self.is_favorite
-                    continue
-                elif self.station_list_open:
+                if self.station_list_open:
                     # モーダル消費時は下層ボタン/同調へ素通りさせない
                     self._station_list_click(mx, my)
                     continue
@@ -860,7 +856,6 @@ class SdrGui:
         mx, my = pygame.mouse.get_pos()
         is_hover_btn = any(btn.visible and btn.rect.collidepoint(mx, my) for btn in self.buttons)
         is_hover_digit = (self.hovered_freq_digit is not None)
-        is_hover_fav = self.fav_rect.collidepoint(mx, my)
         # スペクトラム上のホバー周波数 (ワンクリック選局の照準表示)
         if self.spec_rect.collidepoint(mx, my) and self.spec_rect.width > 0:
             sr = self.sample_rate if self.sample_rate > 0 else 1152000
@@ -868,7 +863,7 @@ class SdrGui:
                                   + (mx - self.spec_rect.x) / self.spec_rect.width * sr)
         else:
             self.hover_freq_hz = None
-        if is_hover_btn or is_hover_digit or is_hover_fav or self.hover_freq_hz is not None:
+        if is_hover_btn or is_hover_digit or self.hover_freq_hz is not None:
             try:
                 pygame.mouse.set_cursor(pygame.SYSTEM_CURSOR_HAND)
             except Exception:
@@ -1026,19 +1021,10 @@ class SdrGui:
         # ============================================================
         # 1. NOW PLAYING HUB (hero_rect: 14, 14, 530, 116)
         # ============================================================
-        # ★ お気に入りアイコンボタン
-        fav_icon = "★" if self.is_favorite else "☆"
-        fav_col = (245, 185, 45) if self.is_favorite else (160, 175, 195)
-        mx, my = pygame.mouse.get_pos()
-        if self.fav_rect.collidepoint(mx, my):
-            pygame.draw.rect(self.screen, (225, 235, 248), self.fav_rect, border_radius=6)
-        fav_surf = cached_text(self.font_station, fav_icon, fav_col)
-        self.screen.blit(fav_surf, fav_surf.get_rect(center=self.fav_rect.center))
-
-        # 地域プロファイルラベル (右上段)
+        # 地域プロファイルラベル (右上段。お気に入り廃止後は右端基準)
         if self.region_label:
             rl = cached_text(self.font_tiny, f"{t('region')}: {self.region_label}", (130, 145, 165))
-            self.screen.blit(rl, (self.fav_rect.left - 10 - rl.get_width(), self.hero_rect.y + 14))
+            self.screen.blit(rl, (self.hero_rect.right - 10 - rl.get_width(), self.hero_rect.y + 14))
 
         # メイン局名 (主役として太字で堂々表示)
         ticker_text = ""
