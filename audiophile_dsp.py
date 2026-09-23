@@ -241,3 +241,88 @@ class ActiveDcServo:
             self.dc_l = dc
 
         return out
+
+
+class LoudnessNormalizer:
+    """EBU R128簡易ラウドネス推定器 (AGCのレベル推定部専用)。
+
+    K-weighting (RLB high-shelf + 60Hz HPF。FFT振幅で等価適用。
+    レベル推定のため位相は不問) した400ms窓のエネルギーを、
+    絶対ゲート-70LUFS＋相対ゲート-10LUで統合しLUFSを返す。
+    ゲイン時定数・範囲は呼び出し側 (dsp _slow_agc_level) の従来値を用いる。
+    numpyのみ。"""
+
+    # RLB係数 (48kHz。EBU Tech 3341 Table 1相当)
+    _SHELF_B = (1.53512485958697, -2.69169618940638, 1.19839281085285)
+    _SHELF_A = (1.0, -1.69065929318241, 0.73248077421585)
+    _HP_B = (1.0, -2.0, 1.0)
+    _HP_A = (1.0, -1.99004745483398, 0.99007225036621)
+
+    def __init__(self, sample_rate=48000.0, target_lufs=-20.0,
+                 window_sec=0.4, history_sec=3.2):
+        self.fs = float(sample_rate)
+        self.target_lufs = float(target_lufs)
+        self.win_n = int(self.fs * float(window_sec))
+        self.max_win = max(1, int(float(history_sec) / float(window_sec)))
+        self._buf = np.zeros(0, dtype=np.float64)
+        self._wins = []
+        # K-weighting振幅曲線を窓長FFTビンに事前計算
+        nfft = 1
+        while nfft < self.win_n:
+            nfft *= 2
+        self._nfft = nfft
+        f = np.fft.rfftfreq(nfft, 1.0 / self.fs)
+        w = 2.0 * np.pi * f / self.fs
+        z = np.exp(1j * w)
+        h = (np.polyval(self._SHELF_B[::-1], z)
+             / np.polyval(self._SHELF_A[::-1], z))
+        h *= (np.polyval(self._HP_B[::-1], z)
+              / np.polyval(self._HP_A[::-1], z))
+        self._k2 = (np.abs(h) ** 2).astype(np.float64)
+
+    def reset_history(self):
+        """選局時: 窓履歴のみ捨てる (ゲインは維持し音量跳躍を防ぐ)。"""
+        self._buf = np.zeros(0, dtype=np.float64)
+        self._wins = []
+
+    @staticmethod
+    def _win_lufs(win, k2, nfft):
+        w = np.hanning(len(win))
+        spec = np.fft.rfft(win * w, n=nfft)
+        p = (np.abs(spec) ** 2) * k2[:len(spec)]
+        # 片側→両側補正 (DC/Nyquist除く2倍) してParsevalで平均電力化
+        p[1:-1] *= 2.0
+        e = float(np.sum(p)) / (float(nfft) * float(np.sum(w ** 2)))
+        return -0.691 + 10.0 * float(np.log10(e + 1e-18))
+
+    def push(self, block):
+        """ブロック追加 → 統合LUFS。窓未満・全窓ゲート外はNone。"""
+        try:
+            x = np.asarray(block, dtype=np.float64).reshape(-1)
+        except Exception:
+            return None
+        if x.size == 0 or not bool(np.all(np.isfinite(x))):
+            return None
+        self._buf = np.concatenate((self._buf, x))
+        while len(self._buf) >= self.win_n:
+            w = self._buf[:self.win_n]
+            self._buf = self._buf[self.win_n:]
+            self._wins.append(self._win_lufs(w, self._k2, self._nfft))
+            if len(self._wins) > self.max_win:
+                self._wins.pop(0)
+        gated = [v for v in self._wins if v >= -70.0]
+        if not gated:
+            return None
+        rel = max(gated) - 10.0
+        gated = [v for v in gated if v >= rel]
+        if not gated:
+            return None
+        lin = float(np.mean([10.0 ** (v / 10.0) for v in gated]))
+        return -0.691 + 10.0 * float(np.log10(lin + 1e-18))
+
+    def gain_for(self, lufs):
+        """目標LUFSへ寄せる線形ゲイン (範囲制限は呼び出し側)。"""
+        try:
+            return float(10.0 ** ((self.target_lufs - float(lufs)) / 20.0))
+        except Exception:
+            return 1.0

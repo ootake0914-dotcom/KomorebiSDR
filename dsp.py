@@ -236,6 +236,10 @@ class SdrDspPipeline(DspBlackMagicMixin, DspAmMixin, DspNfmMixin,
         self.slow_agc_release = 10.0     # 持ち上げ方向の時定数 (秒)
         self.slow_agc_gain = 1.0
         self._slow_agc_floor = 1e-4      # -80dBFS未満は無音とみなし凍結
+        # R128ラウドネス推定への切替 (既定OFF。ON時はRMS推定をLUFS推定に
+        # 置換。時定数・範囲・凍結条件は従来通り。ゲイン状態は共有)
+        self.lufs_agc_enabled = False
+        self._lufs_norm = None
 
         # 超音波ノイズ比追従型 コグニティブ・オートスケルチ (FM三角ノイズクワイエティング追従)
         self.ultra_squelch = UltrasonicSquelchTracker(sample_rate=self.if_rate)
@@ -278,6 +282,12 @@ class SdrDspPipeline(DspBlackMagicMixin, DspAmMixin, DspNfmMixin,
         # ADCクリップ旗もリセット (前局の過大入力を引きずらない)
         self.adc_clip_pct = 0.0
         self.adc_clipped = False
+        # LUFS窓履歴もリセット (ゲインは維持し音量跳躍を防ぐ)
+        try:
+            if self._lufs_norm is not None:
+                self._lufs_norm.reset_history()
+        except Exception:
+            pass
         # 選局でAM同期PLLを初期化 (再ロック)
         self._am_th = 0.0
         self._am_ig = 0.0

@@ -838,7 +838,8 @@ class DspWfmMixin:
         無音 (-80dBFS未満) では凍結しノイズ持ち上げを防ぐ。ゲイン範囲±6dB、
         立ち下げ2秒・立ち上げ10秒の非対称時定数で、番組内の緩急には反応せず
         局替わり等の持続的レベル差だけを均す (ポンピング防止)。
-        ブロック内は単一ゲイン (変化は0.1dB/block未満でジッパー雑音なし)。"""
+        ブロック内は単一ゲイン (変化は0.1dB/block未満でジッパー雑音なし)。
+        lufs_agc_enabled時はRMS推定をR128 LUFS推定に置換 (ダイナミクス同一)。"""
         try:
             if len(audio) == 0:
                 return audio
@@ -846,7 +847,22 @@ class DspWfmMixin:
             rms = float(np.sqrt(np.mean(x * x)))
             if not np.isfinite(rms) or rms < float(self._slow_agc_floor):
                 return audio
-            desired = float(np.clip(float(self.slow_agc_target) / (rms + 1e-12),
+            if bool(getattr(self, "lufs_agc_enabled", False)):
+                try:
+                    from audiophile_dsp import LoudnessNormalizer
+                    if self._lufs_norm is None:
+                        self._lufs_norm = LoudnessNormalizer(
+                            sample_rate=float(self.audio_rate))
+                    mono = x if x.ndim == 1 else np.mean(x, axis=1)
+                    lufs = self._lufs_norm.push(mono)
+                    if lufs is None:
+                        return audio
+                    raw_desired = self._lufs_norm.gain_for(lufs)
+                except Exception:
+                    raw_desired = float(self.slow_agc_target) / (rms + 1e-12)
+            else:
+                raw_desired = float(self.slow_agc_target) / (rms + 1e-12)
+            desired = float(np.clip(raw_desired,
                                     float(self.slow_agc_min), float(self.slow_agc_max)))
             cur = float(self.slow_agc_gain)
             # ブロック長から時定数を換算 (audio_rate基準)
