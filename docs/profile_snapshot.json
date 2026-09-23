@@ -1,0 +1,80 @@
+{
+  "WFM bm=off": {
+    "p50": 32.25,
+    "p95": 40.23,
+    "p99": 50.64,
+    "top": [
+      [
+        "demod/wfm",
+        8.259
+      ],
+      [
+        "wfm/stereo_pair",
+        6.818
+      ],
+      [
+        "chan/decim_hist",
+        4.054
+      ],
+      [
+        "pair/wiener",
+        3.536
+      ],
+      [
+        "pair/post",
+        2.557
+      ],
+      [
+        "front/raw_to_iq",
+        1.589
+      ],
+      [
+        "wfm/freq_blend",
+        0.725
+      ],
+      [
+        "post/bss",
+        0.703
+      ]
+    ]
+  },
+  "WFM bm=ALL": {
+    "p50": 36.42,
+    "p95": 43.83,
+    "p99": 56.58,
+    "top": [
+      [
+        "demod/wfm",
+        11.944
+      ],
+      [
+        "wfm/stereo_pair",
+        7.133
+      ],
+      [
+        "chan/decim_hist",
+        3.951
+      ],
+      [
+        "pair/wiener",
+        3.404
+      ],
+      [
+        "pair/post",
+        2.63
+      ],
+      [
+        "front/raw_to_iq",
+        1.701
+      ],
+      [
+        "bm/notch_mono",
+        1.21
+      ],
+      [
+        "bm/rmt_mono",
+        1.097
+      ]
+    ]
+  }
+}
