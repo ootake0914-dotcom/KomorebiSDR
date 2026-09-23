@@ -4,6 +4,8 @@
 - パイロットロック率 (ON: cyclo present率・平均confidence、OFF: native lock平均)
 - blend平均・チャタリング回数
 - 音声差分 (RMS比・高域10-15kエネルギー差)
+- デュアルメトリック: OFF参照STOI (変調保存率)＋自動判定
+  (ok / SNR+/STOI- suspect / modulation-damage)
 - ブロック処理時間 p50/p95/p99・57.3ms超過率 (初回2ブロックは除外)
 - RMT処理時間・バイパス率 (rmt有効時のみ)
 
@@ -27,6 +29,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
 from dsp import SdrDspPipeline
+from tools.score_wav import stoi
 
 BLOCK = 132096
 BLOCK_MS = 57.3
@@ -172,6 +175,18 @@ def compare(off, on):
                                 / (np.sqrt(np.mean(ao_t ** 2)) + 1e-18)))
     hf = 10.0 * float(np.log10(band_energy(an_t, 10000, 15000)
                                / band_energy(ao_t, 10000, 15000)))
+    # デュアルメトリック: OFFを擬似参照とする変調保存率 (1.0=無改変)。
+    # ヒス削減 (hf<0) と変調保存の両立を判定し、「SNR+ / STOI-」を見逃さない。
+    # 目安: 良性RMT≒0.95、信号破壊FRESH≒0.33 (合成検証)。
+    try:
+        pseudo = float(stoi(ao_t, an_t))
+    except Exception:
+        pseudo = 0.0
+    verdict = "ok"
+    if pseudo < 0.70:
+        verdict = " modulation-damage"
+    elif hf < -1.0 and pseudo < 0.85:
+        verdict = " SNR+/STOI- suspect"
     return {
         "present_rate_on": float(np.mean(on["presents"])) if len(on["presents"]) else 0.0,
         "conf_mean_on": float(np.mean(on["confs"])) if len(on["confs"]) else 0.0,
@@ -183,6 +198,8 @@ def compare(off, on):
         "chatter_on": chatter(on["blends"]),
         "rms_diff_db": rms,
         "hf_diff_db": hf,
+        "stoi_pseudo": round(pseudo, 4),
+        "verdict": verdict,
         "align_lag": int(lag),
         "lat_off": {"p50": pct(off["lat"], 50), "p95": pct(off["lat"], 95),
                     "p99": pct(off["lat"], 99),
@@ -245,6 +262,8 @@ def main(argv):
               f"chatter OFF {m['chatter_off']}/ON {m['chatter_on']}")
         print(f"  RMS差 {m['rms_diff_db']:+.2f}dB 高域差 {m['hf_diff_db']:+.2f}dB "
               f"(lag {m.get('align_lag', 0)})")
+        print(f"  変調保存率(OFF参照STOI) {m.get('stoi_pseudo', 0.0):.3f} "
+              f"判定:{m.get('verdict', '?')}")
         print(f"  遅延 OFF {fmt_lat(m['lat_off'])}")
         print(f"  遅延 ON  {fmt_lat(m['lat_on'])}")
         if m["rmt_bypass_on"]:
