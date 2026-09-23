@@ -364,7 +364,7 @@ class DspWfmMixin:
                                                       0.0)), 0.0), 1.0)
                     res = self.bm_sr.assess(
                         demod, _bm_base, floor, snr, base_conf,
-                        clip=False,  # dspにADCクリップ旗なし。過大時は使わないこと
+                        clip=bool(getattr(self, "adc_clipped", False)),
                         candidate_present=bool(self.stereo_enabled))
                     if res.get("enabled"):
                         self.bm_sr_confidence = float(res.get("sr_confidence",

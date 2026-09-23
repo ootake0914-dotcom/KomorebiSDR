@@ -123,6 +123,10 @@ class SdrDspPipeline(DspBlackMagicMixin, DspAmMixin, DspNfmMixin,
         # 端数IQサンプル持ち越し用バッファ (時間軸断絶・クリック音の抑止)
         self.raw_leftover = np.empty(0, dtype=np.uint8)
 
+        # ADCクリップ旗 (生IQの±127飽和率。SR/BM/AGCへ供給。選局でリセット)
+        self.adc_clip_pct = 0.0
+        self.adc_clipped = False
+
         self.offset_freq = 0.0
         self.mixer_phase = 0.0
         self._tune_monotonic = time.monotonic()
@@ -271,6 +275,9 @@ class SdrDspPipeline(DspBlackMagicMixin, DspAmMixin, DspNfmMixin,
         self._tune_monotonic = time.monotonic()
         self.afc_offset_hz = 0.0
         self.nfm_afc_offset_hz = 0.0
+        # ADCクリップ旗もリセット (前局の過大入力を引きずらない)
+        self.adc_clip_pct = 0.0
+        self.adc_clipped = False
         # 選局でAM同期PLLを初期化 (再ロック)
         self._am_th = 0.0
         self._am_ig = 0.0
@@ -753,6 +760,17 @@ class SdrDspPipeline(DspBlackMagicMixin, DspAmMixin, DspNfmMixin,
         if len(raw_work) == 0:
             return np.zeros(0, dtype=np.float32), np.zeros(self.fft_size, dtype=np.float32)
 
+        # ADCクリップ計測 (生uint8の0/255飽和率。τ0.5秒平滑。0.5%超で旗立て)
+        try:
+            _rw = np.asarray(raw_work)
+            _cp = float(np.mean((_rw <= 1) | (_rw >= 254)) * 100.0)
+            _dt = len(raw_work) / (2.0 * float(self.rf_rate))
+            _a = 1.0 - float(np.exp(-_dt / 0.5))
+            self.adc_clip_pct += _a * (_cp - self.adc_clip_pct)
+            self.adc_clipped = bool(self.adc_clip_pct > 0.5)
+        except Exception:
+            pass
+
         iq = self.raw_to_iq(raw_work)
         if getattr(self, "iq_corrector", None) is not None:
             iq = self.iq_corrector.process(iq)
@@ -833,7 +851,7 @@ class SdrDspPipeline(DspBlackMagicMixin, DspAmMixin, DspNfmMixin,
                     _uq2 = getattr(self, "ultra_squelch", None)
                     self._bm_params = self.bm_controller.process_metrics({
                         "snr_db": float(getattr(self, "s_meter_dbfs", -45.0)) + 45.0,
-                        "clipped": False,  # dspにADCクリップ旗なし
+                        "clipped": bool(getattr(self, "adc_clipped", False)),
                         "pilot_confidence": float(getattr(self, "bm_cyclo_confidence",
                                                            0.0)),
                         "stereo_blend": float(getattr(self, "_stereo_blend", 0.0)),
