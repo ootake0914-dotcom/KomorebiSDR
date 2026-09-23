@@ -217,6 +217,17 @@ def main():
     print(f"  RMS差 {20 * np.log10(np.sqrt(np.mean(y.astype(np.float64) ** 2)) / np.sqrt(np.mean(x.astype(np.float64) ** 2))):+.2f} dB, "
           f"rank {info['retained_rank']}, noise {info['estimated_noise_power']:.2e}, "
           f"{info['processing_ms']:.2f}ms/block")
+    # 8. 共チャネル混信 (同周波に-6dBの別番組FM。分離はCMA/指向のみ)
+    iq_want = make_iq(True, 15.0, seed=7)
+    iq_int = make_iq(True, None, seed=99)
+    # 干渉側は別番組 (500Hz/3kHzトーン) として-6dBで混合
+    run_case("8. co-channel -6dB", iq_want + 0.5 * iq_int)
+    # 9. 長遅延エコー (d=40≒35μs×1.2倍。CMA残件の評価土台)
+    iq = make_iq(True, 15.0)
+    d = 40
+    iq9 = iq.copy()
+    iq9[d:] += 1.2 * iq[:-d]
+    run_case("9. long-echo d=40 g=1.2", iq9)
 
 
 if __name__ == "__main__":
