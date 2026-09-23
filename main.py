@@ -594,21 +594,33 @@ class SdrApp:
 
             self.gui.scan_status_text = t("scan_done", n=len(stations))
 
+            # スキャン後は最良局へ同調する (カーラジオ logic)。
+            # FM帯にいるときは+4dB改善時のみ移動 (再スキャンの往復防止)。
+            # 帯域外 (短波等) からは無条件で最良FM局へ移動する。
+            # モードはWFMに強制する (AMのままFM周波数へ飛ぶ誤復調の防止)。
             best_station = None
-            if auto_best and stations:
+            if stations:
                 best = max(stations, key=lambda s: s["snr_db"])
-                cur_snr = -99.0
-                for s in stations:
-                    if abs(s["freq_hz"] - self.freq) <= 50000:
-                        cur_snr = s["snr_db"]
-                        break
-                if best["snr_db"] >= cur_snr + 4.0:
+                in_fm = (self.profile["fm_start_hz"] <= self.freq
+                         <= self.profile["fm_end_hz"])
+                if in_fm:
+                    cur_snr = -99.0
+                    for s in stations:
+                        if abs(s["freq_hz"] - self.freq) <= 50000:
+                            cur_snr = s["snr_db"]
+                            break
+                    move = best["snr_db"] >= cur_snr + 4.0
+                else:
+                    move = True
+                if move:
                     best_station = best
                     self.freq = best["freq_hz"]
 
             if best_station:
-                self._apply_frequency_and_mode(self.freq, self.mode)
+                self._apply_frequency_and_mode(self.freq, "WFM")
                 self.gui.center_freq = best_station["freq_hz"]
+                self.gui.mode = "WFM"
+                self.gui._sync_bfo_visibility()
                 self.gui.scan_status_text = t("auto_tuned", freq=f"{best_station['freq_mhz']:.2f}", snr=f"{best_station['snr_db']:+.1f}")
             return stations
 
