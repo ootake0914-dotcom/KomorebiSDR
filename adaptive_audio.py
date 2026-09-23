@@ -12,6 +12,33 @@ Audio-domain adaptive modules (extracted from adaptive_dsp.py).
 import numpy as np
 
 
+_mp_median_cache: dict = {}
+
+
+def _mp_median(gamma: float) -> float:
+    """Marčenko-Pastur分布 (アスペクト比γ) の中央値を数値計算する。
+    RMTノイズ分散の頑健推定用 (σ^2 = median(λ)/μ_γ)。γ毎にキャッシュ。
+    γ→0でμ→1に収束する。"""
+    key = round(float(gamma), 5)
+    hit = _mp_median_cache.get(key)
+    if hit is not None:
+        return hit
+    g = min(max(float(gamma), 1e-9), 0.999)
+    sq = float(np.sqrt(g))
+    a = (1.0 - sq) ** 2
+    b = (1.0 + sq) ** 2
+    xs = np.linspace(a, b, 2049)
+    # MP密度 f(x) = sqrt((b-x)(x-a)) / (2πγx)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        pdf = np.sqrt(np.maximum((b - xs) * (xs - a), 0.0)) / (2.0 * np.pi * g * xs)
+    pdf[~np.isfinite(pdf)] = 0.0
+    cdf = np.cumsum(pdf)
+    cdf /= cdf[-1]
+    mu = float(np.interp(0.5, cdf, xs))
+    _mp_median_cache[key] = mu
+    return mu
+
+
 class CognitiveSpeechMusicTracker:
     """
     復調音声の短時間スペクトル特性 (ロールオフ周波数・低域比率) から
@@ -339,14 +366,23 @@ class RmtHankelDenoiser:
             eigvals = eigvals[idx]
             eigvecs = eigvecs[:, idx]
 
-            # 4. ノイズ分散 sigma^2 のロバスト推定 (下位50%のメディアン)
-            sigma2_est = float(np.median(eigvals[L // 2:])) / ((1.0 - np.sqrt(gamma)) ** 2 + 1e-12)
-            self._cached_sigma2 = sigma2_est
+            # 4. ノイズ分散 sigma^2 の頑健推定 (MP中央値)。
+            # 旧法 (下位50%メディアン) はトーン性信号で負値→バイパスした
+            # (issue#1)。全固有値の中央値はトーン性外れ値に強く、
+            # MP理論中央値で割ることで白色性によらずσ^2を得る。負値にはならない。
+            lam = np.maximum(eigvals, 0.0)
+            med = float(np.median(lam))
+            mu = _mp_median(float(gamma))
+            sigma2_est = med / max(mu, 1e-12)
+            self._cached_sigma2 = float(max(sigma2_est, 0.0))
 
             # マルチェンコ・パスツール理論上限 lambda_+
             lambda_plus = sigma2_est * ((1.0 + np.sqrt(gamma)) ** 2)
 
-            # ノイズ固有値の切除 (BBP相転移閾値)
+            # ノイズ固有値の切除 (BBP相転移閾値＋シフト収縮)。
+            # 注: Gavish-Donoho最適収縮も試したが、このパイプライン
+            # (対角平均→FIR畳み込み後) の出力SNRでは旧式と互角〜微劣化
+            # (合成±0.3dB以内) のため実績式を維持する。頑健σ^2化のみ採用。
             retained = np.maximum(0.0, eigvals - sigma2_est)
             retained[eigvals <= lambda_plus] = 0.0
             # 診断公開 (処理内容不変)
