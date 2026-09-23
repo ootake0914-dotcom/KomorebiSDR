@@ -139,12 +139,17 @@ def score(path):
     prog = band_pow(m, sr, 300, 3000)
     hiss = band_pow(m, sr, 6000, min(12000, sr / 2 - 100))
     snr = 10.0 * float(np.log10(prog / hiss))
+    # 可聴ヒス (5.5-11kHz。STOIは4.3kHz以上盲目のため別指標が必須。
+    # NFMで+22dB可聴ヒスがSTOI=1.000を通過した実例あり)
+    ear_hi = min(11000, sr / 2 - 100)
+    ear_hiss = 10.0 * float(np.log10(band_pow(m, sr, 5500, ear_hi) / prog))
     corr = float(np.corrcoef(l, r)[0, 1]) if len(l) > 1 else 1.0
     hum = 10.0 * float(np.log10(
         (band_pow(m, sr, 45, 55) + band_pow(m, sr, 95, 105)) / prog))
     rms = float(20.0 * np.log10(np.sqrt(np.mean(m ** 2)) + 1e-18))
     return {"file": os.path.basename(path), "snr_db": round(snr, 1),
             "stereo_corr": round(corr, 3), "hum_db": round(hum, 1),
+            "ear_hiss_db": round(ear_hiss, 1),
             "rms_dbfs": round(rms, 1)}
 
 

@@ -175,6 +175,9 @@ def compare(off, on):
                                 / (np.sqrt(np.mean(ao_t ** 2)) + 1e-18)))
     hf = 10.0 * float(np.log10(band_energy(an_t, 10000, 15000)
                                / band_energy(ao_t, 10000, 15000)))
+    # 可聴ヒス差 (5.5-11kHz。STOI盲目域の耳障りさを捕捉。NFM+22dB実例あり)
+    ahf = 10.0 * float(np.log10(band_energy(an_t, 5500, 11000)
+                                / band_energy(ao_t, 5500, 11000)))
     # デュアルメトリック: OFFを擬似参照とする変調保存率 (1.0=無改変)。
     # ヒス削減 (hf<0) と変調保存の両立を判定し、「SNR+ / STOI-」を見逃さない。
     # 目安: 良性RMT≒0.95、信号破壊FRESH≒0.33 (合成検証)。
@@ -185,6 +188,8 @@ def compare(off, on):
     verdict = "ok"
     if pseudo < 0.70:
         verdict = " modulation-damage"
+    elif ahf > 3.0:
+        verdict = " hiss-add suspect"
     elif hf < -1.0 and pseudo < 0.85:
         verdict = " SNR+/STOI- suspect"
     return {
@@ -198,6 +203,7 @@ def compare(off, on):
         "chatter_on": chatter(on["blends"]),
         "rms_diff_db": rms,
         "hf_diff_db": hf,
+        "aud_hiss_diff_db": round(ahf, 2),
         "stoi_pseudo": round(pseudo, 4),
         "verdict": verdict,
         "align_lag": int(lag),
@@ -261,6 +267,7 @@ def main(argv):
         print(f"  blend OFF {m['blend_mean_off']:.2f}/ON {m['blend_mean_on']:.2f} "
               f"chatter OFF {m['chatter_off']}/ON {m['chatter_on']}")
         print(f"  RMS差 {m['rms_diff_db']:+.2f}dB 高域差 {m['hf_diff_db']:+.2f}dB "
+              f"可聴ヒス差 {m.get('aud_hiss_diff_db', 0.0):+.2f}dB "
               f"(lag {m.get('align_lag', 0)})")
         print(f"  変調保存率(OFF参照STOI) {m.get('stoi_pseudo', 0.0):.3f} "
               f"判定:{m.get('verdict', '?')}")
