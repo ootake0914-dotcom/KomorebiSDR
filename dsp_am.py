@@ -137,6 +137,18 @@ class DspAmMixin:
                     audio = np.asarray(audio, dtype=np.float32)
             except Exception:
                 pass
+        # AM経路のRMTは不採用 (狭帯域誤作動。verdict参照)。
+        # SR検出プローブのみ残す (既定OFF。confidence公開のみ)
+        try:
+            _lock = float(getattr(self, "am_sync_lock", 0.0))
+
+            def _am_base(v, _lk=_lock):
+                vv = np.asarray(v, dtype=np.float64).reshape(-1)
+                return bool(_lk > 0.35) and bool(np.mean(vv ** 2) > 1e-8)
+
+            self._bm_sr_probe(audio, _am_base, _lock)
+        except Exception:
+            pass
         return audio.astype(np.float32)
 
     def _voice_bandwidth(self, audio: np.ndarray, f_max: float = 4000.0,

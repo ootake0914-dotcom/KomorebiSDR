@@ -132,6 +132,35 @@ class DspBlackMagicMixin:
             cap *= 1.0 - 0.5 * p
         return float(cap)
 
+    def _bm_sr_probe(self, x, base_fn, base_conf):
+        """AM/NFM/SSB共用SR検出プローブ。confidence公開のみで音声は変えない。"""
+        if not (bool(getattr(self, "black_magic_enabled", False))
+                and bool(getattr(self, "bm_sr_enabled", False))):
+            return
+        try:
+            _bmp = getattr(self, "_bm_params", None) or {}
+            if not bool(_bmp.get("sr_active", True)):
+                return
+            if self.bm_sr is None and StochasticResonanceDetector is not None:
+                self.bm_sr = self._bm_make_sr()
+            xa = np.asarray(x, dtype=np.float64).reshape(-1)
+            if self.bm_sr is None or len(xa) < 1024:
+                return
+            _uq = getattr(self, "ultra_squelch", None)
+            floor = 10.0 ** (float(getattr(_uq, "noise_db", -40.0)) / 20.0)
+            snr = float(getattr(self, "s_meter_dbfs", -45.0)) + 45.0
+            bc = min(max(float(base_conf), 0.0), 1.0)
+            res = self.bm_sr.assess(
+                xa, base_fn, floor, snr, bc,
+                clip=bool(getattr(self, "adc_clipped", False)),
+                candidate_present=True)
+            if res.get("enabled"):
+                self.bm_sr_confidence = float(res.get("sr_confidence", bc))
+            else:
+                self.bm_sr_confidence = bc
+        except Exception:
+            pass
+
     def _bm_make_notch(self):
         """bm_cfgを反映したAdaptiveNotchCancellerを生成。"""
         if AdaptiveNotchCanceller is None:

@@ -168,6 +168,22 @@ class SafeRmtDenoiser:
             # 無音は増幅も処理もしない
             info["bypass_reason"] = "silent"
             return xd, info
+        # 動作包絡: 6kHz以上に内容のない狭帯域入力では休止する。
+        # コア・強度マップは広帯域FM放送スペクトル前提であり、狭帯域音声
+        # (AM/NFM/SSBの帯域制限後等) では高域の剥離/合成を往復する誤作動を
+        # 実測 (NFMでSTOI -0.34・ヒス+35dB)。弱電界FMの三角ノイズを含め、
+        # 広帯域放送には必ず6kHz以上成分があるため実害なし。
+        try:
+            _sp = np.abs(np.fft.rfft(xd)) ** 2 + 1e-24
+            _fr = np.fft.rfftfreq(len(xd), 1.0 / self.fs)
+            _hi = float(np.sum(_sp[_fr >= 6000.0]))
+            _lo = float(np.sum(_sp[(_fr >= 300.0) & (_fr < 3000.0)])) + 1e-24
+            if _hi < _lo * 1e-3:
+                info["bypass_reason"] = "narrowband"
+                self._eff_strength = 0.0
+                return xd, info
+        except Exception:
+            pass
         try:
             s_db = float(s_meter_dbfs)
         except (TypeError, ValueError):
@@ -221,6 +237,27 @@ class SafeRmtDenoiser:
             return y, info
         hf = self._hf_energy_db(xd, y)
         info["hf_loss_db"] = float(hf)
+        # 高域合成の禁止: 狭帯域入力等でコアが高域ゴミを足す誤作動時は
+        # 入力へ戻す。RMSガード (全帯域+12%) では狭帯域の高域増加を
+        # 検出できない (低域支配のため) ため帯域別に判定する。
+        # 10kHzだけでなく6kHz以上で判定する (狭帯域経路の可聴ヒス対応。
+        # 正規のヒス削減は負方向のため誤爆しない)。
+        _add = hf
+        try:
+            _spx = np.abs(np.fft.rfft(xd.astype(np.float64))) ** 2 + 1e-24
+            _spy = np.abs(np.fft.rfft(np.asarray(y, dtype=np.float64))) ** 2 + 1e-24
+            _fr6 = np.fft.rfftfreq(len(xd), 1.0 / self.fs)
+            _m6 = _fr6 >= 6000.0
+            if bool(np.any(_m6)):
+                _add = 10.0 * math.log10(
+                    float(np.sum(_spy[_m6]) / np.sum(_spx[_m6])))
+        except Exception:
+            pass
+        if _add > 3.0:
+            y = xd.copy()
+            info["bypass_reason"] = "hf-add"
+            self._eff_strength *= 0.5
+            return y, info
         if hf < -6.0 or info["rms_diff_db"] < -3.0:
             self._eff_strength *= 0.5
 

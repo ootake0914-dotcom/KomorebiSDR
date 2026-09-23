@@ -103,6 +103,21 @@ class DspNfmMixin:
         # 7. 通信用300Hz音声ハイパスフィルタ
         audio = self._apply_voice_highpass(audio)
 
+        # NFM経路のRMTは不採用 (狭帯域誤作動。verdict参照)
+        # NFM経路のSR検出プローブ (既定OFF。confidence公開のみ)
+        try:
+            _thr = float(effective_threshold)
+            _pw = float(power_db)
+
+            def _nfm_base(v, _p=_pw, _t=_thr):
+                vv = np.asarray(v, dtype=np.float64).reshape(-1)
+                return bool(_p > _t + 6.0) and bool(np.mean(vv ** 2) > 1e-8)
+
+            _conf = min(max((_pw - _thr) / 20.0, 0.0), 1.0)
+            self._bm_sr_probe(audio, _nfm_base, _conf)
+        except Exception:
+            pass
+
         if ultra_gain < 0.999:
             audio = audio * ultra_gain
 
@@ -163,6 +178,19 @@ class DspNfmMixin:
         audio = self.decimate_with_history(audio, fir_final, 1, "history_ssb_audio")
         audio = self._apply_voice_highpass(audio)
         audio = self._voice_bandwidth(audio, 3000.0, 2200.0)
+        # SSB/CW経路のRMTは不採用 (狭帯域誤作動。verdict参照)
+        # SSB/CW経路のSR検出プローブ (既定OFF。confidence公開のみ)
+        try:
+            _lv = float(level)
+
+            def _ssb_base(v, _l=_lv):
+                vv = np.asarray(v, dtype=np.float64).reshape(-1)
+                return bool(_l > 8e-4) and bool(np.mean(vv ** 2) > 1e-8)
+
+            _conf = min(max((_lv - 2e-4) / 2e-3, 0.0), 1.0)
+            self._bm_sr_probe(audio, _ssb_base, _conf)
+        except Exception:
+            pass
         return audio.astype(np.float32)
 
     def _init_nfm_state(self):
