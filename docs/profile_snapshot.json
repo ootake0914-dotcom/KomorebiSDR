@@ -1,80 +1,122 @@
 {
   "WFM bm=off": {
-    "p50": 32.25,
-    "p95": 40.23,
-    "p99": 50.64,
+    "p50": 24.19,
+    "p95": 30.21,
+    "p99": 39.43,
     "top": [
       [
         "demod/wfm",
-        8.259
-      ],
-      [
-        "wfm/stereo_pair",
-        6.818
+        5.23
       ],
       [
         "chan/decim_hist",
-        4.054
+        3.426
       ],
       [
         "pair/wiener",
-        3.536
+        3.094
       ],
       [
         "pair/post",
-        2.557
+        2.212
+      ],
+      [
+        "pair/mpx_canceller",
+        1.805
       ],
       [
         "front/raw_to_iq",
-        1.589
+        1.622
       ],
       [
-        "wfm/freq_blend",
-        0.725
+        "demod/pilot_pll",
+        1.24
       ],
       [
         "post/bss",
-        0.703
+        0.657
       ]
     ]
   },
   "WFM bm=ALL": {
-    "p50": 36.42,
-    "p95": 43.83,
-    "p99": 56.58,
+    "p50": 30.24,
+    "p95": 42.61,
+    "p99": 52.38,
     "top": [
       [
         "demod/wfm",
-        11.944
-      ],
-      [
-        "wfm/stereo_pair",
-        7.133
+        6.302
       ],
       [
         "chan/decim_hist",
-        3.951
+        4.352
       ],
       [
         "pair/wiener",
-        3.404
+        3.58
       ],
       [
         "pair/post",
-        2.63
+        2.369
+      ],
+      [
+        "pair/mpx_canceller",
+        2.14
       ],
       [
         "front/raw_to_iq",
-        1.701
+        1.726
       ],
       [
-        "bm/notch_mono",
-        1.21
+        "demod/pilot_pll",
+        1.619
       ],
       [
         "bm/rmt_mono",
-        1.097
+        1.212
       ]
     ]
-  }
+  },
+  "alloc_top": [
+    {
+      "loc": "C:\\Users\\ootak\\AppData\\Roaming\\uv\\python\\cpython-3.11-windows-x86_64-none\\Lib\\ctypes\\__init__.py:0",
+      "count": 478,
+      "size_mb": 0.04
+    },
+    {
+      "loc": "C:\\Users\\ootak\\AppData\\Local\\hermes\\hermes-agent\\venv\\Lib\\site-packages\\numpy\\_core\\_internal.py:0",
+      "count": 174,
+      "size_mb": 0.02
+    },
+    {
+      "loc": "C:\\Users\\ootak\\AppData\\Local\\hermes\\hermes-agent\\venv\\Lib\\site-packages\\numpy\\_core\\fromnumeric.py:0",
+      "count": 72,
+      "size_mb": 0.01
+    },
+    {
+      "loc": "C:\\Users\\ootak\\OneDrive\\Desktop\\RTLSDR\\tools\\profile_snapshot.py:0",
+      "count": 108,
+      "size_mb": 0.01
+    },
+    {
+      "loc": "C:\\Users\\ootak\\OneDrive\\Desktop\\RTLSDR\\dsp_native.py:0",
+      "count": 99,
+      "size_mb": 0.01
+    },
+    {
+      "loc": "C:\\Users\\ootak\\AppData\\Local\\hermes\\hermes-agent\\venv\\Lib\\site-packages\\numpy\\lib\\_function_base_impl.py:0",
+      "count": 27,
+      "size_mb": 0.0
+    },
+    {
+      "loc": "C:\\Users\\ootak\\AppData\\Local\\hermes\\hermes-agent\\venv\\Lib\\site-packages\\numpy\\lib\\_utils_impl.py:0",
+      "count": 29,
+      "size_mb": 0.0
+    },
+    {
+      "loc": "C:\\Users\\ootak\\OneDrive\\Desktop\\RTLSDR\\dsp_wfm.py:0",
+      "count": 25,
+      "size_mb": 0.0
+    }
+  ]
 }

@@ -55,8 +55,11 @@ def install():
     from cyclostationary_detector import CyclostationaryPilotDetector
     from adaptive_audio import (CognitiveSpeechMusicTracker,
                                 HolographicAudioEnhancer)
-    from adaptive_stereo import SuperSpatialBssStereoSeparator
+    from adaptive_stereo import (SuperSpatialBssStereoSeparator,
+                                QuadratureMpxCanceller)
     P = SdrDspPipeline
+    wrap(QuadratureMpxCanceller, "process", "pair/mpx_canceller")
+    wrap(P, "_update_stereo_pilot", "demod/pilot_pll")
     wrap(P, "raw_to_iq", "front/raw_to_iq")
     wrap(P, "mix_frequency", "front/mix")
     wrap(P, "compute_spectrum", "front/spectrum")

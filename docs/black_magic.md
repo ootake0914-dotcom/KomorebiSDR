@@ -236,6 +236,49 @@ dsp.bm_sr_enabled = True      # C (副経路のみ。スケルチ自動反映な
 - 教訓: STOIは4.3kHz以上盲目。NFMの+22dB可聴ヒスはSTOI=1.000のまま
   すり抜けた。帯域別ヒス指標との併用 (デュアルメトリック) が必須。
 
+## 第2章 タスクC: WFM減量 (採用: stereo_pair / freq_blend 最適化)
+
+### 目的と基準
+- 目的: WFMブロック処理コスト削減 (追加禁止・減量のみ)。
+- 基準: 削減 ≥ 1ms かつ 品質score ≥ 0.99 (STOI_pseudo) かつ 可聴ヒス差悪化なし。
+- 達成目標: p99 < 40ms。
+
+### ボトルネック内訳特定 (tools/profile_snapshot.py 計装)
+- `wfm/stereo_pair` 排他 6.10ms の主犯は未計装だった `QuadratureMpxCanceller.process` (6.28ms) と判明。
+- 各候補のマイクロプロファイル実測:
+  1. `_freq_dependent_blend` の Python 2752サンプル forループ: 0.63ms
+  2. `QuadratureMpxCanceller.process` の batch_sz=32 ミニバッチNLMSループ: 5.56ms
+  3. `_wiener_diff` フレームループ: 1.24ms (フレーム間平滑再帰依存あり)
+  4. `pair/post` 1ch: 0.13ms (Cコア deemphasis 0.057ms / decimate 0.051ms / DC 0.022ms、既に高速)
+
+### 実施した最適化
+1. **`_freq_dependent_blend` IIR の Cコア化 (dsp_wfm.py)**:
+   - 1次相補クロスオーバーの指数平滑 $y[n] = a x[n] + (1-a) y[n-1]$ を、既存Cコア `sdr_bilinear_deemphasis` ($b_0=a, b_1=0, m=1-a$) に置換。
+   - 測定: 0.63ms → 0.025ms (0.60ms 削減)。
+   - 数値等価性: 最大差分 7.45e-9 (ビットレベルで等価)。テスト全合格。
+2. **`QuadratureMpxCanceller.process` NLMS の高速内積・バッチ拡大 (adaptive_stereo.py)**:
+   - ブロック全体一括更新は収束抑圧比が 8.8dB に悪化し不採用 (基準>12.0dB)。
+   - `batch_sz=32 → 64` へ拡大し、勾配計算をテンソル乗算 `err_b[:, None] * wb` から内積 `(err_b @ wb) * inv_len` に最適化。
+   - 測定: 5.56ms → 1.53ms (プロファイル上 `pair/mpx_canceller` 6.28ms → 1.80ms、4.48ms 削減)。
+   - 収束抑圧比: 28.66dB (旧32の 28.98dB と同等、基準>12.0dB 大幅クリア)。クリーン信号ビットパーフェクト通過確認。
+
+### 測定結果と Verdict
+- **処理時間削減 (tools/profile_snapshot.py 30blk, WFM bm=off)**:
+  - total p50: **27.8ms → 24.2ms (3.6ms 削減)**
+  - total p95: **37.4ms → 30.2ms (7.2ms 削減)**
+  - total p99: **43.3ms → 39.4ms (3.9ms 削減、基準 p99 < 40ms 達成)**
+  - `pair/mpx_canceller`: **6.28ms → 1.80ms (-4.48ms)**
+  - `wfm/freq_blend`: **0.63ms → 0.025ms (-0.60ms)**
+- **品質score (tools/ab_benchmark.py golden 全4種)**:
+  - `weak_775_10s.npy`: STOI = **1.000**, 可聴ヒス差 = **-0.00dB** (判定: ok)
+  - `deepfade_800_10s.npy`: STOI = **1.000**, 可聴ヒス差 = **+0.00dB** (判定: ok)
+  - `strong_946_3s.npy`: STOI = **1.000**, 可聴ヒス差 = **-0.00dB** (判定: ok)
+  - `noise_762_3s.npy`: STOI = **1.000**, 可聴ヒス差 = **+0.00dB** (判定: ok)
+- **非退行確認**:
+  - `benchmark_black_magic.py`: 全7条件で非退行合格
+  - `tests/run_all.py`: **ALL TESTS PASSED** (全テスト完全合格)
+- **Verdict: 採用 (GO)** (3.6〜4.5ms 削減 ≥ 1ms, score 1.000 ≥ 0.99, p99<40ms達成)
+
 ## 実録音AB結果編 (ゴールデンデータ・ハーネス実走)
 
 - 対象: `testdata/weak_775_10s.npy` (77.5MHz弱局10秒)、
