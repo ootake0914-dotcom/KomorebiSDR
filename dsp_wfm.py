@@ -898,12 +898,12 @@ class DspWfmMixin:
             tau = float(self.slow_agc_attack) if desired < cur else float(self.slow_agc_release)
             # ファストスタート: 選局直後40ブロック (~2.3秒) は時定数を短縮し
             # 新局レベルへ速く寄せる。定常後は従来時定数に戻りポンピング特性不変。
-            # min()のため試験短縮値 (0.5/1.0) より遅くなることはない。
+            # 持ち上げ側2.0→2.5sへ少し鈍化し、選局直後の行き過ぎ(膨らみ)を抑える。
             try:
                 _ab = int(getattr(self, "_agc_blk", 999)) + 1
                 self._agc_blk = _ab
                 if _ab <= 40:
-                    tau = min(tau, 0.5 if desired < cur else 2.0)
+                    tau = min(tau, 0.5 if desired < cur else 2.5)
             except Exception:
                 pass
             a = 1.0 - float(np.exp(-dt / tau))
@@ -1480,7 +1480,9 @@ class DspWfmMixin:
         # 周波数依存ブレンド用クロスオーバー状態 (1次相補: lo + hi = diff で再構成。
         # blend=1時は_lo/_hiとも1.0で旧スカラー動作とビット一致)
         self.freq_blend_enabled = True
-        self.freq_blend_xo_hz = 3500.0
+        # 3.5k→4.5kHzへ引き上げ、低域ステレオを広く残す (10-14k抑圧は不変で
+        # テストのhi_cut<-1.5dBを維持しつつ、声・楽器の芯を痩せさせない)
+        self.freq_blend_xo_hz = 4500.0
         self._blend_xo_y1 = 0.0
         # 38kHz 直交副搬送波マルチパス適応キャンセラ (サ行シピシピ歪み・混濁の逆位相相殺)
         self.mpx_canceller = QuadratureMpxCanceller(sample_rate=self.audio_rate)
@@ -1499,7 +1501,9 @@ class DspWfmMixin:
         self._mp_var = 0.0
         self.mp_lo = 0.10
         self.mp_hi = 0.35
-        self.mp_depth = 0.7
+        # 0.7→0.5へ緩和 (反射波での三重積によるステレオ痩せ・呼吸を軽減。
+        # 最小gain 0.3→0.5。歪み抑制はCMA自動等化側に委ねる)
+        self.mp_depth = 0.5
         # CMAブラインド等化器 (マルチパス・キャンセル)。手動は実機アンテナの安定性のためデフォルトOFF。
         # cognitive時の強い反射波には、multipath量ヒステリシス＋信号存在ゲートで自動介入する。
         self.multipath_cancel_enabled = False

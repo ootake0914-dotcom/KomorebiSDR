@@ -37,7 +37,9 @@ class AudioOutput:
         self._want_running = False
         self._device_watch_thread = None
         self._device_watch_stop = threading.Event()
-        self.preroll_threshold = 8  # ジッターバッファ: 約400ms (8チャンク) 蓄積して安定再生
+        # 8→5へ短縮 (約459→287ms。初音・選局復帰を速めつつ
+        # GIL詰まり耐性は維持。単体機並みの即応へ寄せる)
+        self.preroll_threshold = 5  # ジッターバッファ: 約287ms (5チャンク) 蓄積して安定再生
         self.last_out_samples = np.zeros(2, dtype=np.float32)
 
         # リアルタイムコールバック内の動的確保を排除 (uac2: pre-allocated pool / single-copy)
@@ -169,10 +171,10 @@ class AudioOutput:
             # 次コールバックの復帰時にフェードインを掛ける (無音→任意振幅の段差防止)
             self._needs_fade_in = True
 
-            # キューが空なら再プレロール(4チャンク)して小刻みなバタつきを防止
+            # キューが空なら再プレロール(3チャンク)して小刻みなバタつきを防止
             if self.audio_queue.empty() and len(self.remainder) == 0:
                 self.is_prerolled = False
-                self.preroll_threshold = 4
+                self.preroll_threshold = 3
 
         data = scratch[:frames]
 

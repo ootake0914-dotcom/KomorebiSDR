@@ -167,7 +167,8 @@ class DspNfmMixin:
             self._ssb_agc_hang = 0
         elif level > self.ssb_agc_level:
             self.ssb_agc_level += 0.1 * (level - self.ssb_agc_level)
-            self._ssb_agc_hang = 20
+            # 20→28blkへ延長 (AM側と同一理由)
+            self._ssb_agc_hang = 28
         elif self._ssb_agc_hang > 0:
             self._ssb_agc_hang -= 1
         else:
@@ -183,7 +184,8 @@ class DspNfmMixin:
             fir_final = self.fir_audio_narrow if self.filter_mode == "narrow" else self.fir_nfm_audio
         audio = self.decimate_with_history(audio, fir_final, 1, "history_ssb_audio")
         audio = self._apply_voice_highpass(audio)
-        audio = self._voice_bandwidth(audio, 3000.0, 2200.0)
+        # 下限2.2k→2.5kHzへ (了解度の下限を確保しつつ自動狭窄は維持)
+        audio = self._voice_bandwidth(audio, 3000.0, 2500.0)
         # SSB/CW経路のRMTは不採用 (狭帯域誤作動。verdict参照)
         # CW自動ピッチ (既定ON): 400-1000Hzのピークを650Hzへ寄せる。
         # SSBは抑制搬送波で盲目基準がなく、誤補正が mistune より有害なため

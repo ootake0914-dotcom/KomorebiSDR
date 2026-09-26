@@ -540,9 +540,10 @@ class SdrApp:
                 _NATIVE.sdr_fast_fpu()
         except Exception:
             pass
-        # GUI描画(GIL)による一時的な処理落ちを吸収する深いバッファ (約6.9秒分)。
-        # 浅いバッファだと溢れた生IQが捨てられ、音声が時間圧縮(早回し+飛び)になる。
-        raw_queue = queue.Queue(maxsize=120)
+        # GUI描画(GIL)による一時的な処理落ちを吸収するバッファ (約3.4秒分)。
+        # 浅すぎると溢れた生IQが捨てられ早回し+飛びになるが、深すぎると
+        # 選局後に旧周波数の古い音が数秒残るため120→60へ半減した。
+        raw_queue = queue.Queue(maxsize=60)
         usb_running = threading.Event()
 
         def on_async_data(raw_bytes):
@@ -819,9 +820,12 @@ class SdrApp:
                 try:
                     if cmd == "FREQ":
                         self._apply_frequency_and_mode(val, self.mode)
+                        # 旧周波数の滞留IQを破棄 (選局後に前局の音が残らない)
+                        _drain_raw_queue()
                     elif cmd == "MODE":
                         # 明示的なモード選択は帯域補正せず尊重する
                         self._apply_frequency_and_mode(self.freq, val, auto=False)
+                        _drain_raw_queue()
                     elif cmd == "SEEK":
                         # 次局/前局シーク (AM/短波ではSW局リスト、FM/その他ではFM局リスト)
                         direction = val

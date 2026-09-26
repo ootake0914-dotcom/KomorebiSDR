@@ -245,7 +245,9 @@ class SdrDspPipeline(DspBlackMagicMixin, DspAmMixin, DspNfmMixin,
         self.slow_agc_min = 0.5          # -6dB (過大局の絞り)
         self.slow_agc_max = 2.0          # +6dB (微弱局の持ち上げ上限)
         self.slow_agc_attack = 2.0       # 絞り方向の時定数 (秒)
-        self.slow_agc_release = 10.0     # 持ち上げ方向の時定数 (秒)
+        # 10→12sへ延長 (クラシック等の緩急への追従=ポンピングを軽減。
+        # 局替わり段差の吸収はファストスタート側で担う)
+        self.slow_agc_release = 12.0     # 持ち上げ方向の時定数 (秒)
         self.slow_agc_gain = 1.0
         self._slow_agc_floor = 1e-4      # -80dBFS未満は無音とみなし凍結
         # 選局直後のファストスタート用ブロックカウンタ (set_offset_freqで0へ。

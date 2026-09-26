@@ -87,7 +87,8 @@ class DspAmMixin:
             self._am_agc_hang = 0
         elif level > self.am_agc_level:
             self.am_agc_level += 0.1 * (level - self.am_agc_level)
-            self._am_agc_hang = 20
+            # 20→28blkへ延長 (語間の息継ぎでのゲイン跳ね上がり呼吸を抑制)
+            self._am_agc_hang = 28
         elif self._am_agc_hang > 0:
             self._am_agc_hang -= 1
         else:
@@ -129,7 +130,8 @@ class DspAmMixin:
         _servo_am = getattr(self, "dc_servo", None)
         if _servo_am is None or not bool(getattr(_servo_am, "enabled", False)):
             audio = self._apply_dc_highpass(audio)
-        audio = self._voice_bandwidth(audio, 4000.0, 2500.0)
+        # 下限2.5k→3.2kHzへ (強〜中電界のこもりを軽減。ヒス時は依然狭窄する)
+        audio = self._voice_bandwidth(audio, 4000.0, 3200.0)
         # AM経路の適応ハムノッチ (既定OFF。短波の電源ハム・ヘテロダイン対策)。
         # WFM側とは履歴を共有しない (chキー分離。帯域・レベルが異なるため)。
         if (getattr(self, "black_magic_enabled", False)
