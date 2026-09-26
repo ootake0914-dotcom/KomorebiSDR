@@ -699,7 +699,7 @@ class DspWfmMixin:
                     # ヒス自身がマスクを上げて抑圧不能になるため)。
                     p_clean = np.maximum(
                         self._wf_p.astype(np.float64) - noise_bin, 0.0)
-                    mask_thr = (p_clean @ self._wf_spread) * self._wf_mask_offset
+                    mask_thr = (p_clean @ self._wf_spread) * self._wf_mask_offset_vec
                     gate = np.minimum(1.0, mask_thr / noise_denom).astype(np.float32)
                     g_use = np.maximum(self._wf_g, gate)
                     g_use[:3] = 1.0  # DC〜低域は保護
@@ -896,6 +896,16 @@ class DspWfmMixin:
             except Exception:
                 dt = 0.05
             tau = float(self.slow_agc_attack) if desired < cur else float(self.slow_agc_release)
+            # ファストスタート: 選局直後40ブロック (~2.3秒) は時定数を短縮し
+            # 新局レベルへ速く寄せる。定常後は従来時定数に戻りポンピング特性不変。
+            # min()のため試験短縮値 (0.5/1.0) より遅くなることはない。
+            try:
+                _ab = int(getattr(self, "_agc_blk", 999)) + 1
+                self._agc_blk = _ab
+                if _ab <= 40:
+                    tau = min(tau, 0.5 if desired < cur else 2.0)
+            except Exception:
+                pass
             a = 1.0 - float(np.exp(-dt / tau))
             gain = cur + a * (desired - cur)
             self.slow_agc_gain = float(gain)
@@ -1438,6 +1448,14 @@ class DspWfmMixin:
         _sp = 15.81 + 7.5 * (_dz + 0.474) - 17.5 * np.sqrt(1.0 + (_dz + 0.474) ** 2)
         self._wf_spread = (10.0 ** (_sp / 10.0)).astype(np.float32)
         self._wf_mask_offset = 0.1  # マスキング閾値オフセット (同時マスキング-10dB相当)
+        # 周波数依存マスキングオフセット (固定spreadの細分化):
+        # 耳が敏感な2〜8kHzは保護寄り (最大2倍→gateが1側へ→番組保全)、
+        # 番組疎でヒス支配の12kHz超は抑圧寄り (最小0.4倍→深く落とす)。
+        # スカラー時と同一の要素積1回で計算量不変。
+        _mid = np.exp(-(((_bf - 4000.0) / 3000.0) ** 2))
+        _hi = 1.0 / (1.0 + np.exp(-(_bf - 12000.0) / 2500.0))
+        self._wf_mask_offset_vec = (
+            0.1 * np.clip(1.0 + 1.0 * _mid - 0.6 * _hi, 0.3, 2.0)).astype(np.float32)
         hf_mask = (np.fft.rfftfreq(self._wf_n, 1.0 / self.audio_rate) >= 6000.0) & \
                   (np.fft.rfftfreq(self._wf_n, 1.0 / self.audio_rate) <= 15000.0)
         self._wf_hf_f2_mean = float(np.mean(self._wf_f2[hf_mask]) + 1e-12)

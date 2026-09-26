@@ -560,6 +560,12 @@ class MonoNoiseSuppressor:
                 ring[(st["eidx"] + np.arange(nf)) % nring] = e
                 st["eidx"] = (st["eidx"] + nf) % nring
                 sel = (e > 1e-12) & (e <= float(np.min(ring)) * self._noise_margin)
+                # 平坦度ゲート: 調性的な静かな音楽パッセージを床学習から除外。
+                # 白色系ノイズ平坦度≈0.56に対し正弦・楽音≈0.00のため0.25で分離。
+                # エネルギー門だけだと静かな楽音が床に混入しブリージングする。
+                _flat = (np.exp(np.mean(np.log(P + 1e-18), axis=1))
+                         / (np.mean(P, axis=1) + 1e-18))
+                sel = sel & (_flat >= 0.25)
                 k = int(np.sum(sel))
                 if k:
                     cols = (st["idx"] + np.arange(k)) % self._floor_frames
