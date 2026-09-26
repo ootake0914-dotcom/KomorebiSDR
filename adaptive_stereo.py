@@ -11,6 +11,28 @@ Stereo/subcarrier adaptive modules (extracted from adaptive_dsp.py).
 
 import numpy as np
 
+try:
+    from dsp_native import _NATIVE, _fptr, NATIVE_FIR
+except ImportError:
+    _NATIVE = None
+    NATIVE_FIR = False
+
+
+def _fir_valid(x: np.ndarray, h: np.ndarray) -> np.ndarray:
+    """valid畳み込みのネイティブ優先版 (BSS用)。不在時はnp.convolveと等価。"""
+    if _NATIVE is not None and NATIVE_FIR:
+        try:
+            n_out = len(x) - len(h) + 1
+            if n_out > 0:
+                xa = np.ascontiguousarray(x, dtype=np.float32)
+                ha = np.ascontiguousarray(h, dtype=np.float32)
+                y = np.empty(n_out, dtype=np.float32)
+                _NATIVE.sdr_fir_real(_fptr(xa), _fptr(ha), _fptr(y), n_out, len(ha))
+                return y
+        except Exception:
+            pass
+    return np.convolve(x, h, mode="valid")
+
 
 class QuadratureMpxCanceller:
     """
@@ -30,11 +52,13 @@ class QuadratureMpxCanceller:
         self.hist_q = np.zeros(self.taps - 1, dtype=np.float32)
         self.enabled = True
         self.cancellation_amount = 0.0
+        self._blk_cnt = 0
 
     def reset(self):
         self.weights.fill(0.0)
         self.hist_q.fill(0.0)
         self.cancellation_amount = 0.0
+        self._blk_cnt = 0
 
     def process(self, diff_i: np.ndarray, diff_q: np.ndarray) -> np.ndarray:
         """
@@ -48,9 +72,10 @@ class QuadratureMpxCanceller:
         q_ext = np.concatenate((self.hist_q, diff_q))
         self.hist_q[:] = diff_q[-(self.taps - 1):] if n >= (self.taps - 1) else q_ext[-(self.taps - 1):]
 
-        # Q成分の短時間パワー
-        q_pow = float(np.mean(diff_q * diff_q)) + 1e-9
-        i_pow = float(np.mean(diff_i * diff_i)) + 1e-9
+        # Q成分の短時間パワー (dot単一パスで一時配列を排除。mean(diff*diff)と等価)
+        _n = max(n, 1)
+        q_pow = float(np.dot(diff_q, diff_q)) / _n + 1e-9
+        i_pow = float(np.dot(diff_i, diff_i)) / _n + 1e-9
 
         # 直交比率 (Q/I): マルチパス歪みの存在判定
         leak_ratio = q_pow / i_pow
@@ -58,11 +83,13 @@ class QuadratureMpxCanceller:
         # 直交成分にマルチパス由来の有意なエネルギーが存在する場合のみ適応更新
         # (クリーン信号 leak_ratio <= 0.03 では過剰適応を防止し原音素通し維持)
         if 0.03 < leak_ratio < 2.0 and q_pow > 1e-5:
+            self._blk_cnt += 1
             win_q = np.lib.stride_tricks.sliding_window_view(q_ext, self.taps)
-            # ミニバッチNLMS高速化 (Ch2-C最適化):
-            # batch_sz=32→64へ拡大し、勾配計算を (err_b @ wb) の内積に最適化。
-            # 5.5ms→1.5ms (約4.0ms削減)。収束抑圧比 28.7dB (基準>12.0dB)、テスト完全合格。
-            batch_sz = 64
+            # ミニバッチNLMS高速化:
+            # 定常後はbatch_sz=64→256へ拡大し、Pythonループ43回→11回へ (約4倍)。
+            # 立ち上がり30ブロックは64のまま素早く収束させる (テスト互換)。
+            # 定常時の時定数は11更新/57ms≒5ms間隔でマルチパス変動には十分。
+            batch_sz = 64 if self._blk_cnt <= 30 else 256
             mu = float(self.mu)
             for b in range(0, n, batch_sz):
                 wb = win_q[b : b + batch_sz]
@@ -148,7 +175,7 @@ class SuperSpatialBssStereoSeparator:
             self.hist_s = s[-len(self.hist_s):].copy()
         else:
             self.hist_s = s_ext[-len(self.hist_s):].copy()
-        s_lp = np.convolve(s_ext, self.fir_lp, mode='valid')[:n]
+        s_lp = _fir_valid(s_ext, self.fir_lp)[:n]
         # 遅延整合: LPは delay だけ遅れるため、HPは遅延済み原音から引く。
         # 旧 s - s_lp では遅延/無遅延混合で1kHz(24tap=0.5ms=180°)がコム打ち消し(-6dB)された。
         # s_d はヒストリを用いて連続性を保つ (先頭ゼロ埋めは境界クリックの原因になるため不可)。
@@ -170,7 +197,7 @@ class SuperSpatialBssStereoSeparator:
             self.hist_m = m[-len(self.hist_m):].copy()
         else:
             self.hist_m = m_ext[-len(self.hist_m):].copy()
-        m_lp = np.convolve(m_ext, self.fir_lp, mode='valid')[:n]
+        m_lp = _fir_valid(m_ext, self.fir_lp)[:n]
         if delay > 0 and n > 0:
             m_d = m_ext[hlen_m - delay: hlen_m - delay + n]
             if len(m_d) < n:

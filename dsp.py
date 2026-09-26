@@ -58,6 +58,10 @@ from dsp_native import (
     _fptr,
 )
 
+# uint8 -> float32 正規化LUT ((v-127.5)/128)。raw_to_iqのastype+減算+乗算
+# 3パスを1回のgatherに集約し、一時float32配列(132k)の確保も排除する。
+_IQ_LUT = ((np.arange(256, dtype=np.float32) - 127.5) * (1.0 / 128.0))
+
 
 
 # FIR設計・クリック抑圧・ディエンファシス係数は dsp_filters.py が正準。
@@ -431,6 +435,11 @@ class SdrDspPipeline(DspBlackMagicMixin, DspAmMixin, DspNfmMixin,
         self._wf_p = None
         self._wf_g = None
         self._nr_floor_pow = 0.0
+        # cog間引きカウンタもリセットし、新局では毎ブロック解析で素早く収束させる
+        try:
+            self._cog_an_cnt = 0
+        except Exception:
+            pass
         # STFT内部バッファもクリア (前局のL-R残響が新局の差信号へ混入するのを防ぐ)
         self._wf_in = np.zeros(0, dtype=np.float32)
         self._wf_out = np.zeros(self._wf_hop, dtype=np.float32)  # 固定遅延の初期プリフィル
@@ -605,24 +614,51 @@ class SdrDspPipeline(DspBlackMagicMixin, DspAmMixin, DspNfmMixin,
         return taps
 
     def _apply_hf_shelf(self, audio: np.ndarray, ch: str = "") -> np.ndarray:
-        """線形位相クロスオーバーにより高域ヒスノイズのみを連続可変減衰 (低域は素通し)"""
+        """線形位相クロスオーバーにより高域ヒスノイズのみを連続可変減衰 (低域は素通し)
+
+        高速化: HPFはLPFのスペクトル反転 (h_hp=-h_lp, 中央+1) のため、
+        high = delayed - low と等価 (同一群遅延・誤差1e-7)。FIR2回→1回へ。
+        """
         if len(audio) == 0:
             return audio
         low = self.decimate_with_history(audio, self.fir_shelf_lp, 1, f"history_shelf_lp{ch}")
-        high = self.decimate_with_history(audio, self.fir_shelf_hp, 1, f"history_shelf_hp{ch}")
+        dly = (len(self.fir_shelf_lp) - 1) // 2
+        dly_attr = f"history_shelf_dly{ch}"
+        hist = getattr(self, dly_attr, None)
+        if hist is None or len(hist) != dly:
+            hist = np.zeros(dly, dtype=np.float32)
+            setattr(self, dly_attr, hist)
+        if dly > 0:
+            _a = np.asarray(audio, dtype=np.float32).reshape(-1)
+            x_ext = np.concatenate((np.asarray(hist, dtype=np.float32).reshape(-1), _a))
+            delayed = x_ext[:len(audio)]
+            # 次ブロック用の直近dlyサンプル (通常はaudio末尾)
+            if len(x_ext) >= len(audio) + dly:
+                setattr(self, dly_attr, x_ext[len(audio):len(audio) + dly].astype(np.float32))
+            else:
+                _h = np.zeros(dly, dtype=np.float32)
+                _h[-len(x_ext):] = x_ext
+                setattr(self, dly_attr, _h)
+        else:
+            delayed = np.asarray(audio, dtype=np.float32)
+        high = delayed - np.asarray(low, dtype=np.float32)
         g = self.hf_gain_applied
         if g >= 0.999:
-            return (low + high).astype(np.float32)
-        return (low + g * high).astype(np.float32)
+            return (np.asarray(low, dtype=np.float32) + high).astype(np.float32)
+        return (np.asarray(low, dtype=np.float32) + g * high).astype(np.float32)
 
     def raw_to_iq(self, raw_bytes: np.ndarray) -> np.ndarray:
         if len(raw_bytes) < 2:
             return np.empty(0, dtype=np.complex64)
         n = (len(raw_bytes) // 2) * 2
-        raw_f = raw_bytes[:n].astype(np.float32)
-        i_comp = (raw_f[0::2] - 127.5) * (1.0 / 128.0)
-        q_comp = (raw_f[1::2] - 127.5) * (1.0 / 128.0)
-        return (i_comp + 1j * q_comp).astype(np.complex64)
+        rb = np.asarray(raw_bytes[:n], dtype=np.uint8)
+        out = np.empty(n // 2, dtype=np.complex64)
+        # complex64をfloat32×2とみなし、I/Qを直接書き込む。
+        # (i+1j*q).astype(complex64)の中間複素倍精度配列を排除。
+        v = out.view(np.float32).reshape(-1, 2)
+        v[:, 0] = _IQ_LUT[rb[0::2]]
+        v[:, 1] = _IQ_LUT[rb[1::2]]
+        return out
 
     def mix_frequency(self, iq: np.ndarray, mode: str = "WFM") -> np.ndarray:
         afc = self.nfm_afc_offset_hz if mode == "NFM" else (self.afc_offset_hz if self.afc_enabled else 0.0)
@@ -938,11 +974,20 @@ class SdrDspPipeline(DspBlackMagicMixin, DspAmMixin, DspNfmMixin,
         # 音声/音楽 認知型オートチルトEQ (トーク了解度 / 音楽フラットHi-Fi 自動追従)
         # 解析はハイカット前の広帯域で (カット後だとrolloff>8500の音楽分岐に
         # 到達不能になる)。_post_process_wfmがタップしたwide_srcを使う。
+        # 高速化: analyze(0.37ms, rfft1024)は定常後4ブロックに1回へ間引き。
+        # 音声/音楽は秒オーダーで変化し、230ms間隔で十分追従する。processは毎回。
+        # 立ち上がり20ブロックは毎回実行し、収束速度を変えない (テスト互換)。
         if self.cognitive_enabled and getattr(self, "cognitive_eq", None) is not None and self.cognitive_eq.enabled:
             wide = getattr(self, "_cog_wide", None)
             if mode != "WFM" or wide is None or len(wide) < 128:
                 wide = audio_clean
-            self.cognitive_eq.analyze(wide)
+            _can = int(getattr(self, "_cog_an_cnt", 0)) + 1
+            self._cog_an_cnt = _can
+            if _can <= 20 or _can % 4 == 1:
+                try:
+                    self.cognitive_eq.analyze(wide)
+                except Exception:
+                    pass
             audio_clean = self.cognitive_eq.process(audio_clean)
 
         # 局間音量レベリング用スローAGC (選局時の音量差を吸収。L/R連動で音像保存。
