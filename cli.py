@@ -234,6 +234,12 @@ def main():
                 continue
 
             try:
+                # 音声バッファ水位を適応リサンプラへ還流 (main.pyと同様。
+                # 無いとcurrent_ratio=1.0固定で水晶偏差が蓄積し周期欠落する)
+                try:
+                    dsp.update_resampler_feedback(float(audio.get_queue_size()))
+                except Exception:
+                    pass
                 pcm, spec_db = dsp.process(raw, mode=args.mode)
                 audio.put_audio(pcm)
 

@@ -171,17 +171,32 @@ class SdrApp:
         return (fm if fm else dfm), (am if am else dam)
 
     def _update_presets_from_scan(self, stations):
-        """スキャン結果の強力なFM局からプリセットを自動生成し、設定へ保存"""
+        """スキャン結果の強力なFM局からプリセットを自動生成し、設定へ保存。
+        スキャン帯域外の既存プリセット (ISS 145.8MHz等) は保持する
+        (上書きで恒久消失するバグの修正)。"""
         fm = [s for s in stations if s["freq_hz"] >= 24000000]
         fm = sorted(fm, key=lambda s: s["snr_db"], reverse=True)[:10]
         if not fm:
             return
+        try:
+            lo = int(self.profile["fm_start_hz"])
+            hi = int(self.profile["fm_end_hz"])
+            kept = [p for p in (self.config.get("presets_fm") or [])
+                    if isinstance(p, dict) and isinstance(p.get("freq_hz"), int)
+                    and not (lo <= p["freq_hz"] <= hi)
+                    and all(abs(p["freq_hz"] - int(s["freq_hz"])) > 50000 for s in fm)]
+        except Exception:
+            kept = []
         fm_presets = [
             {"name": f"{s['freq_mhz']:.1f}", "freq_hz": int(s["freq_hz"]),
              "mode": s.get("mode", "WFM") if isinstance(s.get("mode"), str) else "WFM"}
             for s in fm
         ]
         fm_presets.sort(key=lambda p: p["freq_hz"])
+        try:
+            fm_presets = sorted(fm_presets + kept, key=lambda p: p["freq_hz"])
+        except Exception:
+            pass
         self.config["presets_fm"] = fm_presets
         self.config["presets_region"] = self.profile["region"]
         save_config(self.config)
@@ -358,6 +373,13 @@ class SdrApp:
         self.freq = freq
         self.mode = mode
 
+        # SSB手動BFOは選局で維持する (set_offset_freqがcw_auto_pitch既定で
+        # 無条件クリアするため。CW自動ピッチはCW復調側が所有し再収束する)。
+        try:
+            _bfo_keep = float(self.dsp.bfo_offset_hz) if mode in ("USB", "LSB") else None
+        except Exception:
+            _bfo_keep = None
+
         # AM中波帯 (24MHz未満) の場合はダイレクトサンプリング (Q-branch = 2) を自動有効化
         if freq < 24000000:
             self.driver.set_direct_sampling(2)
@@ -375,6 +397,12 @@ class SdrApp:
 
         # ノイズ推定履歴をリセット (選局先の電界強度へ素早く追従)
         self.dsp.reset_stereo_nr()
+        if _bfo_keep is not None:
+            try:
+                self.dsp.bfo_offset_hz = float(
+                    max(-2000.0, min(2000.0, _bfo_keep)))
+            except Exception:
+                pass
 
         # 短波(HF)は番組表DBから実局名を引く
         st_name = ""
@@ -401,6 +429,34 @@ class SdrApp:
         # 選局変更時は探索状態をリセットして新局へ即座に適応
         if hasattr(self, "controller") and self.use_controller and self.controller.available_gains:
             self.controller.reset_tracking()
+
+    @staticmethod
+    def ham_seek_candidate(ham: list, freq_hz: int, direction: int,
+                           margin: int = 500) -> dict | None:
+        """ハム局リストから次局を1件選ぶ (端ではラップ。自局のみはNone)。
+        FM/SWのseek_nextと操作感を統一するための純粋関数 (テスト容易性)。"""
+        try:
+            sts = [s for s in (ham or [])
+                   if isinstance(s, dict) and isinstance(s.get("freq_hz"), int)]
+        except Exception:
+            return None
+        if not sts:
+            return None
+        try:
+            f = int(freq_hz)
+        except Exception:
+            return None
+        if direction > 0:
+            cands = [s for s in sts if s["freq_hz"] > f + margin]
+            if cands:
+                return cands[0]
+            w = sts[0]
+            return w if abs(w["freq_hz"] - f) > margin else None
+        cands = [s for s in sts if s["freq_hz"] < f - margin]
+        if cands:
+            return cands[-1]
+        w = sts[-1]
+        return w if abs(w["freq_hz"] - f) > margin else None
 
     def set_frequency(self, freq_hz: int):
         self.cmd_queue.put(("FREQ", freq_hz))
@@ -774,23 +830,23 @@ class SdrApp:
                         # (USBストリームを安全に停止しないとread_syncが競合・ハングする)
                         is_sw = (self.mode in ("AM", "USB", "LSB", "CW")) or (self.freq < 24000000)
                         _ham_all = getattr(self.tuner, "discovered_ham", [])
-                        # NFMでもハムVHF帯にいればハムリストを使う (FM放送へ飛ばさない)
+                        # NFMでもハムVHF帯にいればハムリストを使う (FM放送へ飛ばさない)。
+                        # 空リスト時はany()がFalseになるため帯域所属で直接判定する
+                        # (初回SEEKでFM帯スキャンへ誤分岐するバグの修正)。
+                        try:
+                            _in_ham_vhf = any(lo <= self.freq <= hi
+                                              for _, lo, hi, _m in HAM_VHF_BANDS)
+                        except Exception:
+                            _in_ham_vhf = False
                         _use_ham = (self.mode in ("USB", "LSB", "CW")
-                                    or (self.mode == "NFM" and any(s["freq_hz"] > 30000000 for s in _ham_all)))
+                                    or (self.mode == "NFM" and (
+                                        _in_ham_vhf or any(s["freq_hz"] > 30000000 for s in _ham_all))))
                         if _use_ham:
                             # SSB/CW時はアマチュア無線リストから探し、局のモードで同調
                             if not self.tuner.discovered_ham:
                                 safe_ham_scan(t("first_seek_scan"), auto_tune_best=False)
                             ham = getattr(self.tuner, "discovered_ham", [])
-                            st = None
-                            if ham:
-                                margin = 500
-                                if direction > 0:
-                                    cands = [s for s in ham if s["freq_hz"] > self.freq + margin]
-                                    st = cands[0] if cands else None
-                                else:
-                                    cands = [s for s in ham if s["freq_hz"] < self.freq - margin]
-                                    st = cands[-1] if cands else None
+                            st = SdrApp.ham_seek_candidate(ham, self.freq, direction)
                             if st:
                                 next_mode = st.get("mode", "USB")
                                 if next_mode not in ("USB", "LSB", "CW", "NFM"):

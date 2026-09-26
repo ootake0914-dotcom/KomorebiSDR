@@ -608,6 +608,10 @@ class AudioOutput:
             # オーディオ出力なし: キューへ溜め込まず破棄
             return
         arr = np.asarray(samples, dtype=np.float32)
+        # 非有限サニタイズ (DSP異常時のNaN/Infがキュー・last_out_samples・
+        # リミッタ包絡へ拡散し恒久ノイズ化するのを入口で断つ。±1.0へ丸め)
+        if not bool(np.all(np.isfinite(arr))):
+            arr = np.nan_to_num(arr, nan=0.0, posinf=1.0, neginf=-1.0).astype(np.float32)
         if arr.ndim == 1:
             # モノラル -> ステレオ複製
             arr = np.stack((arr, arr), axis=1)
@@ -626,9 +630,16 @@ class AudioOutput:
         except queue.Full:
             self.overflow_count += 1
 
-    def get_queue_size(self) -> int:
-        """キュー内の現在の残存チャンク数 (目標: 3〜5チャンク)"""
-        return self.audio_queue.qsize() + (1 if len(self.remainder) > 0 else 0)
+    # リサンプラ水位換算の nominal 1チャンク (=DSP 1ブロック≈2752サンプル)。
+    # remainderは1チャンク未満の端数のため、0/1の二値ではなく分数で加算する
+    # (1サンプル残存で+1チャンク誤差→800ppm級の誤PI補正・ハンチングの防止)。
+    _CHUNK_FRAMES = 2752
+
+    def get_queue_size(self) -> float:
+        """キュー内の現在の残存チャンク数 (目標: 3〜5チャンク。端数は分数)"""
+        rem = len(self.remainder)
+        frac = min(1.0, rem / float(self._CHUNK_FRAMES)) if rem > 0 else 0.0
+        return self.audio_queue.qsize() + frac
 
     def get_buffer_fill_ratio(self) -> float:
         """バッファキュー充填率 (0.0〜1.0)"""

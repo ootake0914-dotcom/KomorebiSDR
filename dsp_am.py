@@ -78,6 +78,10 @@ class DspAmMixin:
         レベル低下後は約400ms(7ブロック)だけ減衰を保持してからリリースする。
         """
         level = float(np.mean(np.abs(sig)))
+        if not np.isfinite(level) or not bool(np.all(np.isfinite(sig))):
+            # 非有限混入時は状態を汚さず無音で通過 (NaN固着の防止)。
+            # 比較系が全てFalseになりgain/fadeへNaNが拡散するのを断つ。
+            return np.zeros(len(sig), dtype=np.float32)
         if self.am_agc_level <= 0.0:
             self.am_agc_level = max(level, 2e-4)
             self._am_agc_hang = 0

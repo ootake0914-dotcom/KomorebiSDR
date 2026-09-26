@@ -433,7 +433,7 @@ class DspWfmMixin:
                     si = np.sin(self.rds_phase_offset)
                     carrier57 = carrier57 * co - self._last_sin3 * si
                 rds_mix = demod_scaled * carrier57
-                rds_base = self.decimate_with_history(rds_mix, self.fir_am_narrow, 24, "history_rds")
+                rds_base = self.decimate_with_history(rds_mix, self.fir_rds, 24, "history_rds")
                 self.rds.feed(rds_base)
                 self.rds_ps = self.rds.ps_name
                 self.rds_rt = self.rds.radio_text
@@ -1295,7 +1295,13 @@ class DspWfmMixin:
         self.history_pilot_hp = np.zeros(len(self.fir_pilot_hp) - 1, dtype=np.float32)
         self.history_lpr = np.zeros(len(self.fir_if_audio) - 1, dtype=np.float32)
         self.history_lpr_q = np.zeros(len(self.fir_if_audio) - 1, dtype=np.float32)
-        self.history_rds = np.zeros(len(self.fir_am_narrow) - 1, dtype=np.float32)
+        # RDS用LPFはIFレート(288kHz)基準で設計する。fir_am_narrowは
+        # RFレート(1152kHz)基準のため流用すると実効カット875Hzになり
+        # 1187bps BPSK帯域を絞ってしまう。タップ数は同一(97)のため
+        # history長・群遅延は不変。
+        self.fir_rds = design_fir_kaiser(
+            num_taps=97, cutoff_norm=2600.0 / self.if_rate, beta=7.0)
+        self.history_rds = np.zeros(len(self.fir_rds) - 1, dtype=np.float32)
         self.history_final_l = np.zeros(len(self.fir_audio_clean) - 1, dtype=np.float32)
         self.history_final_r = np.zeros(len(self.fir_audio_clean) - 1, dtype=np.float32)
         self.history_shelf_lp_l = np.zeros(len(self.fir_shelf_lp) - 1, dtype=np.float32)

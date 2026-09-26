@@ -62,6 +62,10 @@ class AutoTuner:
         self.discovered_sw = []        # 短波(HF)スキャン結果
         self.discovered_ham = []       # アマチュア無線スキャン結果
         self.last_scan_time = 0.0
+        # 帯域別鮮度 (FM/SWで共有タイマだと他帯域の更新で鮮度誤認する。
+        # last_scan_timeは互換のため両方で更新し続ける)
+        self.last_scan_time_fm = 0.0
+        self.last_scan_time_sw = 0.0
 
     def scan_band(
         self,
@@ -226,6 +230,7 @@ class AutoTuner:
 
         self.discovered_stations = filtered_stations
         self.last_scan_time = time.time()
+        self.last_scan_time_fm = float(self.last_scan_time)
         return filtered_stations
 
     def scan_band_hf(
@@ -343,6 +348,7 @@ class AutoTuner:
         stations.sort(key=lambda s: s["freq_hz"])
         setattr(self, store_attr, stations)
         self.last_scan_time = time.time()
+        self.last_scan_time_sw = float(self.last_scan_time)
         return stations
 
     def scan_band_ham(
@@ -413,6 +419,17 @@ class AutoTuner:
         局リストがTTL超過で古い場合は再スキャンする。
         """
         stations = self.discovered_sw if use_sw else self.discovered_stations
+        # 帯域別タイマ (無ければ互換の共有タイマへフォールバック。
+        # fake等の外部設定last_scan_timeも引き続き有効)
+        try:
+            band_t = float(self.last_scan_time_sw if use_sw else self.last_scan_time_fm)
+        except Exception:
+            band_t = 0.0
+        try:
+            legacy_t = float(self.last_scan_time)
+        except Exception:
+            legacy_t = 0.0
+        fresh_t = band_t if band_t != 0.0 else legacy_t
         if not stations:
             if use_sw:
                 self.scan_band_hf()
@@ -420,7 +437,7 @@ class AutoTuner:
             else:
                 self.scan_band()
                 stations = self.discovered_stations
-        elif float(self.last_scan_time) != 0.0 and (time.time() - float(self.last_scan_time)) > self.SCAN_TTL_SEC:
+        elif fresh_t != 0.0 and (time.time() - fresh_t) > self.SCAN_TTL_SEC:
             # 鮮度切れ: バンドプラン/地域変更後も古い局へ飛ぶのを防止
             # (last_scan_time==0 はテスト用fake等で時刻未設定のため再スキャンしない)
             try:

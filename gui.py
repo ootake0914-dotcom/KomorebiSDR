@@ -552,8 +552,13 @@ class SdrGui:
     # ================================================================
     # 操作ハンドラ
     # ================================================================
+    # ドライバ許容範囲と一致 (範囲外はc_uint32ラップでGHz誤同調になる)。
+    _FREQ_MIN_HZ = 100000
+    _FREQ_MAX_HZ = 1750000000
+
     def _adjust_freq(self, delta):
-        new_freq = max(100000, self.center_freq + delta)
+        new_freq = max(self._FREQ_MIN_HZ,
+                       min(self._FREQ_MAX_HZ, self.center_freq + delta))
         self.center_freq = new_freq
         if self.on_freq_change:
             self.on_freq_change(self.center_freq)
@@ -607,12 +612,49 @@ class SdrGui:
     _SL_VISIBLE = 12
     _SL_WIDTH = 340
 
+    # スペクトラム描画は左右4pxインセット (trace/marker共通)。クリック・
+    # ホバー換算も同一マッピングに統一する (端で約6kHzずれていた)。
+    _SPEC_INSET = 4
+
+    def _spec_x_to_freq(self, mx: int) -> float:
+        """スペクトラムX座標→周波数 (描画と同一のインセット換算)。範囲外は clamp"""
+        r = self.spec_rect
+        sr = self.sample_rate if self.sample_rate > 0 else 1152000
+        span = r.width - 2 * self._SPEC_INSET
+        if span <= 0:
+            return float(self.center_freq)
+        ratio = (mx - (r.x + self._SPEC_INSET)) / span
+        ratio = 0.0 if ratio < 0.0 else (1.0 if ratio > 1.0 else ratio)
+        return (self.center_freq - sr / 2) + ratio * sr
+
+    def _spec_freq_to_x(self, freq_hz: float) -> int:
+        """周波数→スペクトラムX座標 (描画と同一のインセット換算)"""
+        r = self.spec_rect
+        sr = self.sample_rate if self.sample_rate > 0 else 1152000
+        if sr <= 0:
+            return r.centerx
+        ratio = (float(freq_hz) - (self.center_freq - sr / 2)) / sr
+        return r.x + self._SPEC_INSET + int(ratio * (r.width - 2 * self._SPEC_INSET))
+
     def _toggle_station_list(self):
         if not self.detected_stations:
             self.scan_status_text = "検出局なし (スキャンしてください)"
             return
         self.station_list_open = not self.station_list_open
         self.station_list_scroll = 0
+        if self.station_list_open:
+            # 選択局が可視域に入るよう自動スクロール (開いても青表示が
+            # 画面外に隠れる問題の修正)
+            try:
+                sel = self._selected_station_index()
+                if sel is not None:
+                    _, rows, total = self._station_list_layout()
+                    vis = len(rows)
+                    if vis > 0 and total > vis:
+                        self.station_list_scroll = max(
+                            0, min(total - vis, sel - vis // 2))
+            except Exception:
+                pass
 
     def _station_list_layout(self):
         """プルダウンの配置を返す (panel_rect, row_rects, total)。純粋計算のみ。"""
@@ -634,6 +676,40 @@ class SdrGui:
             return 2000 if int(freq_hz) < 30000000 else 50000
         except Exception:
             return 50000
+
+    def _selected_station_index(self, sts: list = None) -> int | None:
+        """現在周波数に最も近い検出局のインデックスを1件だけ返す。
+        マージン内に複数局がいても全行ハイライトしない (複数青表示バグの修正)。
+        判定マージンは候補局側の帯域で取る (HF混在リストでVHF幅が漏れないよう)。
+        該当なし・リスト空ならNone。"""
+        try:
+            sts = list(self.detected_stations) if sts is None else list(sts)
+        except Exception:
+            return None
+        if not sts:
+            return None
+        try:
+            cur = int(self.center_freq)
+        except Exception:
+            return None
+        best_idx = None
+        best_dist = None
+        for idx, st in enumerate(sts):
+            try:
+                if not isinstance(st, dict):
+                    continue
+                fh = st.get("freq_hz")
+                if fh is None or isinstance(fh, bool):
+                    continue
+                fi = int(fh)
+                d = abs(fi - cur)
+                if d < self._station_match_margin(fi) and (
+                        best_dist is None or d < best_dist):
+                    best_dist = d
+                    best_idx = idx
+            except Exception:
+                continue
+        return best_idx
 
     @staticmethod
     def _station_display_name(st) -> str:
@@ -695,8 +771,8 @@ class SdrGui:
                             (30, 60, 90))
         self.screen.blit(title, (panel.x + 14, panel.y + 6))
         start = max(0, min(self.station_list_scroll, max(0, total - len(rows))))
-        cur = int(self.center_freq)
         sts_draw = list(self.detected_stations)
+        sel_idx = self._selected_station_index(sts_draw)
         for i, rc in enumerate(rows):
             idx = start + i
             if idx >= total or idx >= len(sts_draw):
@@ -706,7 +782,7 @@ class SdrGui:
                 fh = st.get("freq_hz")
                 if fh is None:
                     continue
-                sel = abs(int(fh) - cur) < self._station_match_margin(cur)
+                sel = (idx == sel_idx)
             except Exception:
                 continue
             if sel:
@@ -739,8 +815,8 @@ class SdrGui:
             if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
                 self.station_list_open = False
 
-            # マウス移動時の桁ホバー検出
-            if event.type == pygame.MOUSEMOTION:
+            # マウス移動時の桁ホバー検出 (局リストモーダル中は背後を触らない)
+            if event.type == pygame.MOUSEMOTION and not self.station_list_open:
                 mx, my = event.pos
                 self.hovered_freq_digit = None
                 if self.hero_rect.collidepoint(mx, my):
@@ -762,12 +838,14 @@ class SdrGui:
             if wheel_delta != 0:
                 mx, my = pygame.mouse.get_pos()
                 if self.station_list_open:
+                    # モーダル中は全ホイールを消費する (パネル外で背後周波数が
+                    # 変わる素通りバグの修正)。スクロールはパネル上のみ。
                     panel, rows, total = self._station_list_layout()
                     if panel.collidepoint(mx, my) and total > len(rows):
                         self.station_list_scroll = max(
                             0, min(total - len(rows),
                                     self.station_list_scroll - wheel_delta))
-                        wheel_delta = 0
+                    wheel_delta = 0
             if wheel_delta != 0:
                 mx, my = pygame.mouse.get_pos()
                 if self.hero_rect.collidepoint(mx, my):
@@ -787,10 +865,7 @@ class SdrGui:
                     self._station_list_click(mx, my)
                     continue
                 elif self.spec_rect.collidepoint(mx, my) or self.wf_rect.collidepoint(mx, my):
-                    w = self.spec_rect.width
-                    ratio = (mx - self.spec_rect.x) / w if w > 0 else 0.5
-                    sr = self.sample_rate if self.sample_rate > 0 else 1152000
-                    clicked_freq = (self.center_freq - sr / 2) + ratio * sr
+                    clicked_freq = self._spec_x_to_freq(mx)
 
                     snapped_station = None
                     min_dist = float("inf")
@@ -856,11 +931,11 @@ class SdrGui:
         mx, my = pygame.mouse.get_pos()
         is_hover_btn = any(btn.visible and btn.rect.collidepoint(mx, my) for btn in self.buttons)
         is_hover_digit = (self.hovered_freq_digit is not None)
-        # スペクトラム上のホバー周波数 (ワンクリック選局の照準表示)
-        if self.spec_rect.collidepoint(mx, my) and self.spec_rect.width > 0:
-            sr = self.sample_rate if self.sample_rate > 0 else 1152000
-            self.hover_freq_hz = ((self.center_freq - sr / 2)
-                                  + (mx - self.spec_rect.x) / self.spec_rect.width * sr)
+        # スペクトラム上のホバー周波数 (ワンクリック選局の照準表示)。
+        # モーダル中は背後照準を消す。換算は描画と同一マッピング。
+        if (not self.station_list_open and self.spec_rect.collidepoint(mx, my)
+                and self.spec_rect.width > 0):
+            self.hover_freq_hz = self._spec_x_to_freq(mx)
         else:
             self.hover_freq_hz = None
         if is_hover_btn or is_hover_digit or self.hover_freq_hz is not None:
@@ -883,7 +958,13 @@ class SdrGui:
         wf_w = self.wf_rect.width
         self.wf_surface.scroll(0, 2)
 
-        n = len(spectrum_db)
+        try:
+            n = len(spectrum_db)
+        except Exception:
+            return
+        if n < 8:
+            # 空・短小スペクトラムでは補間参照が範囲外になるため描画しない
+            return
         # 補間係数とサーフェスを事前確保 (内容が同じ間は再計算しない)
         if (self._wf_line_surf is None or self._wf_src_n != n
                 or self._wf_line_surf.get_width() != wf_w):
@@ -929,8 +1010,19 @@ class SdrGui:
             self.s_peak_units = su
             self.s_peak_time = now
         elif now - self.s_peak_time > 0.8:
-            # 0.8秒ホールド後に毎秒約6S-unitsの速度でスムーズに減衰
-            self.s_peak_units = max(su, self.s_peak_units - 6.0 * 0.033)
+            # 0.8秒ホールド後に毎秒約6S-unitsの速度でスムーズに減衰。
+            # 固定0.033ではなく実フレーム間隔で減衰させる (負荷時の残像長期化の修正)
+            try:
+                _last = float(getattr(self, "_smeter_decay_t", 0.0))
+                dt = now - _last if _last > 0.0 else 0.033
+                dt = min(max(dt, 0.0), 0.5)
+            except Exception:
+                dt = 0.033
+            self.s_peak_units = max(su, self.s_peak_units - 6.0 * dt)
+        try:
+            self._smeter_decay_t = float(now)
+        except Exception:
+            pass
 
         # 1. ヘッダーテキスト (S-METER見出し & 現在値バッジ)
         lbl = cached_text(self.font_tiny, "S-METER", C_MUTED)
@@ -1207,8 +1299,7 @@ class SdrGui:
                     if sfreq is None:
                         continue
                     if f_min <= sfreq <= f_max:
-                        ratio = (sfreq - f_min) / (f_max - f_min)
-                        m_x = r.x + int(ratio * r.width)
+                        m_x = self._spec_freq_to_x(sfreq)
                         # マーカー線は常時描画 (ラベル省略時も位置は示す)
                         pygame.draw.line(self.screen, (0, 190, 160), (m_x, r.y + 30), (m_x, r.y + 40), 2)
                         st_tag = self._station_display_name(st) or f"{st.get('freq_mhz', float(sfreq) / 1e6):.1f}"
@@ -1240,7 +1331,7 @@ class SdrGui:
         for pk in self.live_peaks[:8]:
             pf = pk["freq_hz"]
             if f_min <= pf <= f_max and (f_max - f_min) > 0:
-                p_x = r.x + int((pf - f_min) / (f_max - f_min) * r.width)
+                p_x = self._spec_freq_to_x(pf)
                 pygame.draw.line(self.screen, (0, 210, 170), (p_x, r.y + 30), (p_x, r.y + 40), 2)
 
         # ホバー周波数表示

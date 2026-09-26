@@ -55,6 +55,9 @@ class DspNfmMixin:
         power_db = 10.0 * np.log10(np.mean(np.abs(iq_if) ** 2) + 1e-12)
         effective_threshold = self.squelch_threshold if self.squelch_enabled else -74.0
         if power_db < effective_threshold:
+            if len(iq_if) > 0:
+                # ミュート中も位相基準だけ進め、復帰時の差分位相クリックを防ぐ
+                self.nfm_last_sample = iq_if[-1]
             return np.zeros(len(iq_if) // self.audio_decim, dtype=np.float32)
 
         # 1. ハードリミッター適用
@@ -156,6 +159,9 @@ class DspNfmMixin:
         # 無信号フロア (AM側と同型): ノイズ2400倍の爆音化を防ぐため滑らかにミュート。
         # ハングタイマ (AM側と同型、約400ms保持)。
         level = float(np.mean(np.abs(audio)))
+        if not np.isfinite(level) or not bool(np.all(np.isfinite(audio))):
+            # 非有限混入時は状態を汚さず無音で通過 (NaN固着の防止)
+            return np.zeros(len(audio), dtype=np.float32)
         if self.ssb_agc_level <= 0.0:
             self.ssb_agc_level = max(level, 2e-4)
             self._ssb_agc_hang = 0

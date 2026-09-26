@@ -174,7 +174,7 @@ class SdrDspPipeline(DspBlackMagicMixin, DspAmMixin, DspNfmMixin,
         self.resampler = AdaptiveDriftResampler(target_chunks=8.0, max_ppm=120.0)
 
         # 復調器ごとの状態初期化は各mixinへ分散 (純粋移動・動作同一)。
-        # AMを先に作る (WFMのhistory_rdsがfir_am_narrowを参照するため)。
+        # AMを先に作る (history_am_narrow/history_ssbがfir_am_narrowを参照するため)。
         self._init_am_state()
         self._init_wfm_state()
         self._init_nfm_state()
@@ -371,6 +371,25 @@ class SdrDspPipeline(DspBlackMagicMixin, DspAmMixin, DspNfmMixin,
             self.dither.reset()
         if hasattr(self, "bss_separator"):
             self.bss_separator.reset()
+        # マルチパス検出・直交キャンセラ・EKFも選局で初期化
+        # (前局の反射推定・適応重みを持ち越すと新局冒頭が誤補正される。
+        # AM/SSBのAGCレベルは意図的に維持し音量ポンピングを避ける)
+        try:
+            self._mp_var = 0.0
+            self.multipath_amount = 0.0
+            self.multipath_gain = 1.0
+        except Exception:
+            pass
+        try:
+            if getattr(self, "mpx_canceller", None) is not None:
+                self.mpx_canceller.reset()
+        except Exception:
+            pass
+        try:
+            if getattr(self, "ekf_demod", None) is not None:
+                self.ekf_demod.reset()
+        except Exception:
+            pass
         if hasattr(self, "riemann_demodulator"):
             self.riemann_demodulator.reset()
         if hasattr(self, "rmt_denoiser"):
@@ -443,6 +462,15 @@ class SdrDspPipeline(DspBlackMagicMixin, DspAmMixin, DspNfmMixin,
         self._wf_p = None
         self._wf_g = None
         self._nr_floor_pow = 0.0
+        # NR遅延線もゼロ化 (set_stereo_nr単独トグル時に前状態が1ブロック混入する。
+        # 長さは維持し群遅延を変えない)
+        try:
+            if getattr(self, "history_mono_delay", None) is not None:
+                self.history_mono_delay.fill(0)
+            if getattr(self, "history_nr_lp", None) is not None:
+                self.history_nr_lp.fill(0)
+        except Exception:
+            pass
         # cog間引きカウンタもリセットし、新局では毎ブロック解析で素早く収束させる
         try:
             self._cog_an_cnt = 0

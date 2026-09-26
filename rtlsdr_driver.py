@@ -205,10 +205,19 @@ class RtlSdrDriver:
             return int(freq_hz)
         return int(round(freq_hz * (1.0 - self.ppm / 1e6)))
 
+    # 同調許容範囲 (プリセット検証と一致。範囲外はc_uint32ラップで
+    # GHz誤同調になるため入口で弾く)
+    FREQ_MIN_HZ = 100000
+    FREQ_MAX_HZ = 1750000000
+
     def set_center_freq(self, freq_hz: int):
         if not self.is_open:
             return
-        tune_hz = self.compensated_freq(int(freq_hz))
+        f = int(freq_hz)
+        if not (self.FREQ_MIN_HZ <= f <= self.FREQ_MAX_HZ):
+            raise ValueError(f"中心周波数 {f} Hz が範囲外です "
+                             f"({self.FREQ_MIN_HZ}〜{self.FREQ_MAX_HZ} Hz)")
+        tune_hz = self.compensated_freq(f)
         res = self._dll.rtlsdr_set_center_freq(self.dev, tune_hz)
         if res != 0:
             raise RuntimeError(f"中心周波数 {freq_hz} Hz の設定に失敗しました")
@@ -264,11 +273,13 @@ class RtlSdrDriver:
         return [val / 10.0 for val in buf]
 
     def set_gain(self, gain_db: float):
-        """ゲインを設定 (dB)"""
+        """ゲインを設定 (dB)。HWが拒否したら例外 (沈黙成功させない)"""
         if not self.is_open:
             return
         gain_tenths = int(round(gain_db * 10))
-        self._dll.rtlsdr_set_tuner_gain(self.dev, gain_tenths)
+        res = self._dll.rtlsdr_set_tuner_gain(self.dev, gain_tenths)
+        if res != 0:
+            raise RuntimeError(f"ゲイン {gain_db} dB の設定に失敗しました (code: {res})")
 
     def set_direct_sampling(self, mode: int):
         """

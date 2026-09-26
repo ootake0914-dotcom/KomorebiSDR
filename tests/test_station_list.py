@@ -78,6 +78,28 @@ def main() -> int:
     print(f"[{'OK' if good else 'FAIL'}] empty list does not open")
     ok &= good
 
+    # 選択ハイライトは単一 (マージン内に複数局でも最近傍1件のみ)
+    gui.detected_stations = [
+        {"freq_hz": 80000000, "freq_mhz": 80.00, "name": "A",
+         "snr_db": 10.0, "quality": "STRONG"},
+        {"freq_hz": 80030000, "freq_mhz": 80.03, "name": "B",
+         "snr_db": 12.0, "quality": "STRONG"},
+    ]
+    gui.center_freq = 80010000  # Aまで10kHz、Bまで20kHz (両方50kHz幅内)
+    sel = gui._selected_station_index()
+    good = sel == 0
+    print(f"[{'OK' if good else 'FAIL'}] single highlight nearest (sel={sel}, want 0)")
+    ok &= good
+
+    # 一致なし・空はNone
+    gui.center_freq = 90000000
+    good = gui._selected_station_index() is None
+    print(f"[{'OK' if good else 'FAIL'}] no match -> None")
+    ok &= good
+    good = gui._selected_station_index([]) is None
+    print(f"[{'OK' if good else 'FAIL'}] empty -> None")
+    ok &= good
+
     gui.close()
     print("OK" if ok else "FAILED")
     return 0 if ok else 1
