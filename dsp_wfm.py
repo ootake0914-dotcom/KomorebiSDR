@@ -951,8 +951,11 @@ class DspWfmMixin:
             self._cog_wide = wide_src
         audio = self.decimate_with_history(audio, fir_final, 1, f"history_final{ch}")
 
-        # DCハイパスフィルタ
-        audio = self._apply_dc_highpass(audio, ch=ch)
+        # DCハイパスフィルタ (ActiveDcServo有効時はバイパスし位相直線性を保つ。
+        # 30Hz 1次HPFは20〜300Hzに位相進み歪みを残すため、最終段のDCサーボへ一本化)
+        _servo = getattr(self, "dc_servo", None)
+        if _servo is None or not bool(getattr(_servo, "enabled", False)):
+            audio = self._apply_dc_highpass(audio, ch=ch)
 
         # Hyper心理音響ハイシェルフ (FM三角雑音を連続減衰) / Cascade離散エキスパンダー
         if self.cognitive_enabled:
@@ -1225,8 +1228,8 @@ class DspWfmMixin:
         self.fir_if_audio = design_fir_kaiser(num_taps=257, cutoff_norm=cutoff_if_audio, beta=7.0)
 
         # 48kHzオーディオ段のアンチエイリアス・ハイカットフィルタ (48kHzレート)
-        # 14kHz: 音楽用Hi-Fiワイド (51タップ)
-        cutoff_audio_wide = 14000.0 / self.audio_rate
+        # 15kHz: 音楽用Hi-Fiワイド (BS.450準拠。強電界でフル帯域開放用。51タップ)
+        cutoff_audio_wide = 15000.0 / self.audio_rate
         self.fir_audio_wide = design_fir_kaiser(num_taps=51, cutoff_norm=cutoff_audio_wide, beta=6.0)
 
         # 8.5kHz: 強力ノイズクリーナー (ヒスノイズ「サー」を消滅させ人の声を鮮明化, 65タップ)

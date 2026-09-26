@@ -125,7 +125,10 @@ class DspAmMixin:
         audio = self.decimate_with_history(audio_raw, self.fir_if_audio, self.audio_decim, "history_if_audio")
 
         audio = self.decimate_with_history(audio, fir_final, 1, "history_final")
-        audio = self._apply_dc_highpass(audio)
+        # ActiveDcServo有効時は30Hz HPFをバイパス (低域位相の一本化。WFM側と同一理由)
+        _servo_am = getattr(self, "dc_servo", None)
+        if _servo_am is None or not bool(getattr(_servo_am, "enabled", False)):
+            audio = self._apply_dc_highpass(audio)
         audio = self._voice_bandwidth(audio, 4000.0, 2500.0)
         # AM経路の適応ハムノッチ (既定OFF。短波の電源ハム・ヘテロダイン対策)。
         # WFM側とは履歴を共有しない (chキー分離。帯域・レベルが異なるため)。

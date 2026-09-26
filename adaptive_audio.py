@@ -234,11 +234,28 @@ class HolographicAudioEnhancer:
         self.fir_hp15k = (-h_lp).astype(np.float32)
         self.fir_hp15k[15] += 1.0
 
+        # 10.5kHz ローパスFIR (二乗前の帯域制限用, 51タップ, Kaiser β=6.0)。
+        # 非線形(二乗)前の種信号を10.5kHz以下に抑え、2次高調波を最大21kHz+
+        # 遷移帯域 (~12kHz→24kHz) に収めて48kHzサンプリングでの折り返し
+        # エイリアシング (24kHz超→可聴帯へ降下) とIMDを防ぐ。
+        _nt = 51
+        _kc = np.arange(_nt, dtype=np.float64) - (_nt - 1) / 2.0
+        _fcn = 10500.0 / self.fs
+        _hlp = 2.0 * _fcn * np.sinc(2.0 * _fcn * _kc) * np.kaiser(_nt, 6.0)
+        _hlp /= np.sum(_hlp)
+        self.fir_lp10k5 = _hlp.astype(np.float32)
+
         hist_len = len(self.fir_hp15k) - 1
         self._histories = {
             "": np.zeros(hist_len, dtype=np.float32),
             "_l": np.zeros(hist_len, dtype=np.float32),
             "_r": np.zeros(hist_len, dtype=np.float32),
+        }
+        _lplen = len(self.fir_lp10k5) - 1
+        self._lp_histories = {
+            "": np.zeros(_lplen, dtype=np.float32),
+            "_l": np.zeros(_lplen, dtype=np.float32),
+            "_r": np.zeros(_lplen, dtype=np.float32),
         }
 
     def process(self, audio: np.ndarray, ch: str = "", speech_prob: float = 0.0, s_meter_dbfs: float = -20.0,
@@ -264,8 +281,18 @@ class HolographicAudioEnhancer:
         if len(src) != len(audio):
             return audio
 
-        # 1. 8k〜14kの微細高域成分の抽出 (一次微分)
-        diff = np.diff(np.asarray(src, dtype=np.float64), prepend=float(src[0]))
+        # 1. 種信号を10.5kHz LPで帯域制限してから微細高域成分を抽出 (一次微分)。
+        # LP無しで12〜14kHzを二乗すると24〜28kHzが生じ24kHzナイキストで
+        # 折り返して可聴帯へ降下するため、種を10.5kHz以下に抑えて
+        # 2次高調波を16〜22kHzに収める (8〜11kHz -> 16〜22kHz)。
+        _lph = self._lp_histories.get(ch)
+        if _lph is None or len(_lph) != len(self.fir_lp10k5) - 1:
+            _lph = np.zeros(len(self.fir_lp10k5) - 1, dtype=np.float32)
+            self._lp_histories[ch] = _lph
+        _buf = np.concatenate((_lph, np.asarray(src, dtype=np.float32)))
+        _filt = np.convolve(_buf, self.fir_lp10k5, mode='valid').astype(np.float64)
+        self._lp_histories[ch] = _buf[len(src):].astype(np.float32)
+        diff = np.diff(_filt, prepend=float(_filt[0]))
 
         # 2. 2次高調波生成 (倍周波数変換: 8〜11kHz -> 16〜22kHz)
         h2 = (diff * diff) * 8.0

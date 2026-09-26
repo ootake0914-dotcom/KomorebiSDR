@@ -590,7 +590,8 @@ class HyperController:
         # 弱端は旧DX相当 (4300Hz/hf0.14/122kHz) に寄せ、手動切替なしで自動到達する。
         sig_c = 1.0 / (1.0 + np.exp(-0.28 * (s - 10.0)))
         sig_a = 1.0 / (1.0 + np.exp(-0.30 * (self.state_audio_snr - 13.0)))
-        cutoff = 4300.0 + 10200.0 * (0.55 * sig_c + 0.45 * sig_a)
+        # 強電界で15kHz (BS.450) まで開放。旧上限14.5kHzでは音楽の空気感が削られた。
+        cutoff = 4300.0 + 10700.0 * (0.55 * sig_c + 0.45 * sig_a)
         # 実機A/B試聴の結果、中〜強電界ではハイシェルフを早めに全開放し
         # 5-8kHzの存在感を保持する特性を採用 (弱電界のみ抑圧)
         hf = float(np.clip((s - 2.0) / 8.0, 0.14, 1.0))
@@ -611,7 +612,7 @@ class HyperController:
                 if_bw = min(if_bw, 145000.0)
 
         if self.filter_override == "wide":
-            cutoff = 14000.0
+            cutoff = 15000.0
             hf = 1.0
             if_bw = 190000.0
         elif self.filter_override == "clean":

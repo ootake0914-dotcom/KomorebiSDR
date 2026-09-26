@@ -221,10 +221,12 @@ class AudioOutput:
             np.multiply(data, vol, out=data)
             self._vol_current = vol
 
-        # ステレオ連動（Linked Stereo）ソフトリミッター (0.85超のみ圧縮)
+        # ステレオ連動（Linked Stereo）ソフトリミッター (0.98超のみ圧縮)
         # 左右チャンネル独立圧縮による音像定位の揺れ・偏りを抑え、左右の音量比を保存。
         # 全て事前確保域で計算しアロケーションゼロ。
-        threshold = 0.85
+        # ワーカー側ルックアヘッドリミッタ (thr=0.98) と統一し、それ以下の
+        # 瞬時tanh整形による高調波歪み (THD) を出さない。安全網として残す。
+        threshold = 0.98
         abs_l = self._absbuf[:frames, 0]
         abs_r = self._absbuf[:frames, 1]
         np.absolute(data[:, 0], out=abs_l)
