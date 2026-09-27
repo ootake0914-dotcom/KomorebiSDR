@@ -84,10 +84,14 @@ class CognitiveSpeechMusicTracker:
         self.hist_l.fill(0.0)
         self.hist_r.fill(0.0)
 
-    def analyze(self, audio: np.ndarray) -> float:
+    def analyze(self, audio: np.ndarray, hiss_db: float = None) -> float:
         """
         48kHz音声チャンクからスペクトルロールオフ・サブベース比率を計算し、
         音声確率 (0.0=音楽 〜 1.0=トーク) を平滑化更新して返す。
+
+        hiss_db: WFMのNRヒス推定 (stereo_hiss_db)。-20dB超のヒス下では
+        ZCR項を無効化する (ヒスが摩擦音に誤認され弱電界音楽がトーク側へ
+        偏る実測不具合の対策。None時は従来動作でテスト互換を保つ)。
         """
         if not self.enabled or len(audio) < 128:
             return self.speech_prob
@@ -133,7 +137,10 @@ class CognitiveSpeechMusicTracker:
             score += 0.5
         elif rolloff_hz < 6500.0:
             score += 0.25
-        if zcr > 0.06:
+        # ヒスゲート: ヒス下のZCR上昇は摩擦音ではないため加算しない。
+        # (弱電界音楽のトーク偏り対策。hiss_db<-20dBの清浄時は従来通り)
+        _hissy = (hiss_db is not None) and bool(np.isfinite(hiss_db)) and (float(hiss_db) > -20.0)
+        if zcr > 0.06 and not _hissy:
             score += 0.2
         # 重低音＋高域ハットを併せ持つ音楽だけを減点 (男声は高域を持たない)。
         # 旧規則の「sub一律・rolloff>6500条件」は男声 (sub高・rolloff低) と

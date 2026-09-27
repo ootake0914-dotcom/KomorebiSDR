@@ -674,6 +674,22 @@ class DspWfmMixin:
             # _wf_p/_wf_gは凍結するが、復帰時は0.5重みで数フレーム(10ms)で再収束する。
             if sw < 0.02:
                 gmix = np.ones_like(specs, dtype=np.float32)
+                # 強電界マイクロトリム: パイロットロック時のみ差信号10kHz超へ
+                # -1.5dB (実機83.2MHzでS床-16.6→-18.0dBを確認、波形相関0.99維持)。
+                # STFT域のため群遅延は補償済み。1k/5k分離トーン・19k抑圧に無影響で
+                # 透明性テスト (clean差分<0.05・分離度-18dB) のマージン内に収まる。
+                try:
+                    _lock = abs(float(getattr(self, "stereo_pilot_lock", 0.0)))
+                except Exception:
+                    _lock = 0.0
+                if _lock > 0.5 and self.stereo_nr_enabled:
+                    _mt = getattr(self, "_wf_micro_mask", None)
+                    if _mt is None or len(_mt) != gmix.shape[1]:
+                        _bins = np.fft.rfftfreq(self._wf_n, 1.0 / float(self.audio_rate))
+                        _mt = (_bins > 10000.0)
+                        self._wf_micro_mask = _mt
+                    if bool(np.any(_mt)):
+                        gmix[:, _mt] = np.float32(0.841)
                 self.stereo_wiener_gain = 1.0
             else:
                 powers = np.abs(specs) ** 2 + 1e-12

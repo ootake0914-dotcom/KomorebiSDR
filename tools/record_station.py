@@ -24,12 +24,16 @@ def main() -> int:
     freq_mhz = float(sys.argv[1]) if len(sys.argv) > 1 else 439.56
     mode = (sys.argv[2] if len(sys.argv) > 2 else "NFM").upper()
     secs = float(sys.argv[3]) if len(sys.argv) > 3 else 15.0
+    # --cog: live Hyper相当 (認知制御+mono抑圧+ヒスゲート有効) で録る。
+    # 既定はwide固定の素性評価用。live挙動の検証は --cog を付ける。
+    live = any(a == "--cog" for a in sys.argv[1:])
     freq_hz = int(freq_mhz * 1e6)
 
     outdir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                           "recordings")
     os.makedirs(outdir, exist_ok=True)
-    base = os.path.join(outdir, f"rec_{freq_mhz:.3f}_{mode}_{secs:g}s")
+    tag = "_live" if live else ""
+    base = os.path.join(outdir, f"rec_{freq_mhz:.3f}_{mode}_{secs:g}s{tag}")
 
     drv = RtlSdrDriver()
     if drv.get_device_count() == 0:
@@ -50,6 +54,20 @@ def main() -> int:
 
         dsp = SdrDspPipeline(1152000, 48000)
         dsp.set_offset_freq(offset)
+        # 本体Hyper経路の強電界相当で録る (既定clean=8.5kHzでは高域評価できない)。
+        # WFMのみwide (15kHz) を使用。AM系は既定のまま narrow/clean を維持する。
+        if live:
+            try:
+                # 強電界相当の認知パラメータでlive挙動を再現する
+                dsp.set_cognitive_parameters(cutoff_hz=15000.0, hf_gain=1.0,
+                                             if_bw_hz=190000.0, enabled=True)
+            except Exception:
+                pass
+        elif mode == "WFM":
+            try:
+                dsp.filter_mode = "wide"
+            except Exception:
+                pass
 
         n_blocks = max(1, int(secs * 1152000 * 2 / BLOCK))
         audios = []
@@ -59,7 +77,16 @@ def main() -> int:
             if len(raw) < BLOCK:
                 continue
             audio, _spec = dsp.process(np.asarray(raw, dtype=np.uint8), mode=mode)
-            audios.append(np.asarray(audio).reshape(-1))
+            a = np.asarray(audio, dtype=np.float32)
+            # ステレオ (N,2) はそのまま保持する。reshape(-1) で潰すと
+            # L/R交互サンプルが1chに化けて解析・再生が壊れるため。
+            # 弱電界でモノラル (N,) /(N,1) に落ちたブロックは2chへ複製し、
+            # 混在時のconcat不一致 (ValueError) を防ぐ。本体put_audioと同一扱い。
+            if a.ndim == 1:
+                a = a.reshape(-1, 1)
+            if a.shape[1] == 1:
+                a = np.concatenate((a, a), axis=1)
+            audios.append(a.reshape(a.shape[0], 2))
         dt = time.monotonic() - t0
     finally:
         try:
@@ -70,9 +97,10 @@ def main() -> int:
     if not audios:
         print("no audio captured", file=sys.stderr)
         return 1
-    y = np.concatenate(audios).astype(np.float32)
-    print(f"captured {len(y) / 48000.0:.1f}s audio in {dt:.1f}s wall "
-          f"(rms={float(np.sqrt(np.mean(y ** 2))):.4f})")
+    y = np.concatenate(audios, axis=0).astype(np.float32)
+    n_ch = y.shape[1] if y.ndim == 2 else 1
+    print(f"captured {y.shape[0] / 48000.0:.1f}s audio in {dt:.1f}s wall "
+          f"(ch={n_ch}, rms={float(np.sqrt(np.mean(y ** 2))):.4f})")
 
     import wave
     pcm = np.clip(y, -1.0, 1.0)

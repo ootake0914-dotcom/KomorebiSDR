@@ -1023,7 +1023,17 @@ class SdrDspPipeline(DspBlackMagicMixin, DspAmMixin, DspNfmMixin,
             self._cog_an_cnt = _can
             if _can <= 20 or _can % 4 == 1:
                 try:
-                    self.cognitive_eq.analyze(wide)
+                    # WFM時はNRヒス推定を渡し、ヒス下のZCR誤認を抑える。
+                    # 他モード・欠損時はNone (従来動作)。
+                    _hiss = None
+                    if mode == "WFM":
+                        try:
+                            _h = float(getattr(self, "stereo_hiss_db", None))
+                            if np.isfinite(_h):
+                                _hiss = _h
+                        except Exception:
+                            _hiss = None
+                    self.cognitive_eq.analyze(wide, hiss_db=_hiss)
                 except Exception:
                     pass
             audio_clean = self.cognitive_eq.process(audio_clean)
@@ -1032,6 +1042,13 @@ class SdrDspPipeline(DspBlackMagicMixin, DspAmMixin, DspNfmMixin,
         # DCサーボ・ディザの前に置き、最終量子化に整形済みレベルが載るようにする)
         if self.slow_agc_enabled:
             audio_clean = self._slow_agc_level(audio_clean)
+
+        # AM (中波・短波) のみのメイクアップ +3dB: ダイレクトサンプリング経路は
+        # 変調密度が低く同一RMSでもFMより小さく聴こえるため。大音量視聴時の
+        # システム音量依存を緩和する。後段のルックアヘッドリミッタ (0.98) が
+        # ピークを抑えるためクリップしない。遅延・位相に影響なし。
+        if mode == "AM":
+            audio_clean = (np.asarray(audio_clean, dtype=np.float32) * 1.41).astype(np.float32)
 
         # ===== オーディオ最終段 =====
         # 位相回転の少ないDCサーボ (20Hz〜20kHzの位相変化を抑えつつ直流オフセットを除去)
