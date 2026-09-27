@@ -36,7 +36,9 @@ class PpmCalibrator:
             err = -float(afc_offset_hz)
         except (TypeError, ValueError):
             return len(self._samples)
-        if f <= 0 or not abs(err) < 20000.0:
+        # 10kHz未満は丸めキー0となりestimate()の除算を壊すため棄却。
+        # (現行呼出側は全て24MHz以上だがAPI直叩き対策の防御。正常系の挙動不変)
+        if f < 10000 or not abs(err) < 20000.0:
             return len(self._samples)
         # 同一局 (10kHz丸め) は最新値で上書き
         self._samples[(f // 10000) * 10000] = err
