@@ -346,6 +346,24 @@ class AutoTuner:
         stations.sort(key=lambda s: s["snr_db"], reverse=True)
         stations = stations[:max_results]
         stations.sort(key=lambda s: s["freq_hz"])
+        # 検出時点で局名を付与する (空名のままプルダウンが「不明な局」化け
+        # していた実害の修正。番組表ヒット優先、なければ周波数表記)。
+        # sw_scheduleは任意依存 (未取得・時間外でも周波数名で動作)。
+        for s in stations:
+            try:
+                _nm = ""
+                try:
+                    from sw_schedule import lookup as _sw_lookup
+                    _hit = _sw_lookup(int(s["freq_hz"]), tolerance_hz=2500)
+                    if _hit and _hit.get("station"):
+                        _nm = str(_hit["station"])
+                except Exception:
+                    _nm = ""
+                if not _nm:
+                    _nm = f"{float(s['freq_hz']) / 1e6:.3f}MHz"
+                s["name"] = _nm
+            except Exception:
+                pass
         setattr(self, store_attr, stations)
         self.last_scan_time = time.time()
         self.last_scan_time_sw = float(self.last_scan_time)

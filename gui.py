@@ -47,8 +47,11 @@ C_BTN_BORDER = (206, 216, 231)
 C_BTN_ACTIVE = (0, 172, 152)
 C_BTN_ACTIVE2 = (86, 118, 168)
 
-# 日本語対応フォント候補
-JP_FONTS = ["meiryo ui", "yu gothic ui", "meiryo", "yu gothic", "msgothic", "arial"]
+# 日本語対応フォント候補 (Windows優先・後段にLinux CJKを追加。
+# Linuxでは前段が全滅しarial落ち→豆腐化けしていたためNoto/TAKAO/IPAを追加)
+JP_FONTS = ["meiryo ui", "yu gothic ui", "meiryo", "yu gothic", "msgothic",
+            "noto sans cjk jp", "noto sans cjk", "takaoexgothic", "takaogothic",
+            "ipapgothic", "ipagothic", "dejavu sans", "arial"]
 LATIN_FONTS = ["segoeui", "arial"]
 
 
@@ -239,6 +242,17 @@ class SdrGui:
         pygame.display.set_caption("KomorebiSDR")
 
         # フォント (日本語対応: Meiryo系を優先)
+        # 解決ファイルを1行ログに残す (Linux等でCJK不在→豆腐化け時の切り分け用)。
+        # Noto CJKが無ければ `sudo apt install fonts-noto-cjk` が必要。
+        try:
+            _matched = None
+            for _fn in JP_FONTS:
+                _matched = pygame.font.match_font(_fn)
+                if _matched:
+                    break
+            print(f"[INFO] GUI JP font: {_matched or 'fallback (CJK missing?)'}")
+        except Exception:
+            pass
         self.font_title = pygame.font.SysFont(JP_FONTS, 14, bold=True)
         self.font_huge = pygame.font.SysFont(LATIN_FONTS, 40, bold=True)
         self.font_station = pygame.font.SysFont(JP_FONTS, 22, bold=True)
@@ -713,15 +727,44 @@ class SdrGui:
 
     @staticmethod
     def _station_display_name(st) -> str:
-        """表示用局名。未同定センチネルは「不明な局」に変換する。
-        (内部センチネルはppm_cal・テストと共有のため維持)"""
+        """表示用局名。未同定センチネルは周波数入りの「不明な局」表記にする
+        (周波数だけの行だと選局判断できないため。内部センチネルは
+        ppm_cal・テストと共有のため維持)。長い局名は後段で幅フィットする。"""
         try:
             name = str(st.get("name", ""))
         except Exception:
             name = ""
         if name == "Unknown FM Station" or not name:
+            try:
+                fh = st.get("freq_hz", None)
+                if fh is not None and not isinstance(fh, bool):
+                    return f"{t('station_unknown')}（{float(fh) / 1e6:.2f}MHz）"
+            except Exception:
+                pass
             return t("station_unknown")
         return name
+
+    @staticmethod
+    def _fit_row_text(font, text: str, max_px: int) -> str:
+        """行幅に収める省略表示 (文字数カット[:18]の置換。全角・長局名の
+        途中切れと行溢れを防ぐ。幅ベースで「…」付きに詰める)"""
+        try:
+            text = str(text)
+            if int(max_px) <= 0 or not text:
+                return text
+            if font.size(text)[0] <= max_px:
+                return text
+            ell = "…"
+            lo, hi = 0, len(text)
+            while lo < hi:
+                mid = (lo + hi + 1) // 2
+                if font.size(text[:mid] + ell)[0] <= max_px:
+                    lo = mid
+                else:
+                    hi = mid - 1
+            return (text[:lo] + ell) if lo > 0 else ell
+        except Exception:
+            return str(text)
 
     def _station_list_click(self, mx: int, my: int) -> bool:
         """プルダウン開閉中のクリック処理。消費したらTrue。"""
@@ -787,13 +830,24 @@ class SdrGui:
                 continue
             if sel:
                 pygame.draw.rect(self.screen, (214, 236, 248), rc, border_radius=6)
-            name = self._station_display_name(st)[:18]
             try:
                 freq = st.get("freq_mhz", float(st.get("freq_hz", 0)) / 1e6)
             except Exception:
                 freq = 0.0
             snr = st.get("snr_db", 0.0)
-            line = cached_text(self.font_small, f"{name}  {freq:.2f}MHz  +{snr:.1f}dB",
+            try:
+                _raw = str(st.get("name", ""))
+            except Exception:
+                _raw = ""
+            if _raw == "Unknown FM Station" or not _raw:
+                # 不明局は表示名に周波数済みのため周波数を重ねない
+                suffix = f"  +{snr:.1f}dB"
+            else:
+                suffix = f"  {freq:.2f}MHz  +{snr:.1f}dB"
+            max_name_px = max(40, int(rc.width) - 12 - self.font_small.size(suffix)[0])
+            name = self._fit_row_text(self.font_small,
+                                      self._station_display_name(st), max_name_px)
+            line = cached_text(self.font_small, f"{name}{suffix}",
                                (30, 50, 80))
             self.screen.blit(line, (rc.x + 8, rc.y + 5))
         if total > len(rows):

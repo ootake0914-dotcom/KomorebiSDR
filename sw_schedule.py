@@ -23,14 +23,16 @@ CACHE_NAME = "eibi_schedule.csv"
 CACHE_MAX_AGE = 14 * 24 * 3600
 DEFAULT_CSV = "http://www.eibispace.de/dx/sked-a26.csv"
 
-# 言語コードの表示名 (EiBi独自の略号。主要なもののみ)
+# 言語コードの表示名 (EiBi独自の略号。主要なもののみ)。
+# GUIフォント (Meiryo/DejaVu系) に無い文字 (キリル/アラビア/タイ等) は
+# 豆腐化けするため、 CJK (中・日) 以外はラテン表記に統一する。
 LANG_NAMES = {
-    "M": "中国語", "E": "English", "S": "Español", "R": "Русский", "F": "Français",
-    "K": "한국어", "VN": "Tiếng Việt", "J": "日本語", "A": "العربية", "D": "Deutsch",
+    "M": "中国語", "E": "English", "S": "Español", "R": "Russian", "F": "Français",
+    "K": "Korean", "VN": "Vietnamese", "J": "日本語", "A": "Arabic", "D": "Deutsch",
     "P": "Português", "I": "Italiano", "HA": "Hausa", "HI": "Hindi", "MO": "Mongolian",
-    "FS": "فارسی", "CA": "Cantonese", "RO": "Română", "AM": "አማርኛ", "PS": "پښتو",
-    "TB": "Tibetan", "NO": "Norsk", "BR": "Burmese", "SW": "Kiswahili",
-    "ID": "Indonesia", "TH": "ไทย", "TR": "Türkçe", "UR": "Urdu", "BE": "Bengali",
+    "FS": "Farsi", "CA": "Cantonese", "RO": "Romanian", "AM": "Amharic", "PS": "Pashto",
+    "TB": "Tibetan", "NO": "Norwegian", "BR": "Burmese", "SW": "Swahili",
+    "ID": "Indonesian", "TH": "Thai", "TR": "Turkish", "UR": "Urdu", "BE": "Bengali",
     "F,E": "Multi", "UI": "", "DR": "", "-CW": "", "-HF": "", "-TS": "", "-TY": "",
     # ISOコード互換 (テスト/外部データ用)
     "ja": "日本語", "zh": "中国語", "en": "English", "ko": "한국어", "de": "Deutsch",
@@ -65,7 +67,8 @@ def find_current_csv(timeout: float = 15.0) -> str | None:
                 letter, num = pr
                 return 2 * int(num) + (1 if letter == "b" else 0)
             best = max(m, key=key)
-            return SCHEDULE_PAGE + f"sked-{best[0]}{best[1]}.csv"
+            # 実パスは dx/ 配下 (付けないと404で番組表が一生空になる実害を確認)
+            return SCHEDULE_PAGE + f"dx/sked-{best[0]}{best[1]}.csv"
     except Exception:
         pass
     return None
