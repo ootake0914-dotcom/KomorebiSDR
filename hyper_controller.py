@@ -81,6 +81,13 @@ class HyperController:
         self.antenna_type_detected = "Auto-Detecting..."
         self.noise_floor_history = []
         self.intermod_warning = False
+        # --- 帯域別アンテナ学習 (Phase 1: 学習+助言のみ。DSP制御不変) ---
+        try:
+            from antenna_profiler import AntennaProfiler
+            self.band_profiler = AntennaProfiler()
+        except Exception:
+            self.band_profiler = None
+        self._last_band = None
 
         # --- ゲイン曲線モデル探索 ---
         self.gain_curve = {}        # gain_db -> 最高観測C/N
@@ -226,6 +233,12 @@ class HyperController:
             ch_half = max(2, int(5000.0 / bin_hz))
             g_in = max(ch_half + 1, int(10000.0 / bin_hz))
             g_out = int(35000.0 / bin_hz)
+        elif mode in ("USB", "LSB", "CW"):
+            # SSB/CWは3kHz級狭帯域。WFM窓(±85kHz)では雑音帯域が28倍に
+            # なり平均SNRが約14dB過小評価されるため専用窓で測る
+            ch_half = max(2, int(2000.0 / bin_hz))
+            g_in = max(ch_half + 1, int(6000.0 / bin_hz))
+            g_out = int(20000.0 / bin_hz)
         else:
             ch_half = max(4, int(85000.0 / bin_hz))
             g_in = max(ch_half + 2, int(115000.0 / bin_hz))
@@ -242,7 +255,7 @@ class HyperController:
 
         sig_mean = float(np.mean(ch))
         sig_peak = float(np.max(ch))
-        if mode in ("AM", "AM_NARROW", "NFM"):
+        if mode in ("AM", "AM_NARROW", "NFM", "USB", "LSB", "CW"):
             guards = np.concatenate((lin[c - g_out: c - g_in + 1], lin[c + g_in: c + g_out + 1]))
             if len(guards) < 4:
                 return None, None
@@ -293,8 +306,11 @@ class HyperController:
             self.antenna_profile = "BALANCED"
             self.antenna_type_detected = "Standard / Tuned Antenna"
 
-    def _measure_audio(self, audio: np.ndarray):
-        """復調後オーディオの番組帯域 vs ヒス帯域パワー比（聴感品質の直接指標）"""
+    def _measure_audio(self, audio: np.ndarray, mode: str = "WFM"):
+        """復調後オーディオの番組帯域 vs ヒス帯域パワー比（聴感品質の直接指標）。
+        狭帯域モード (NFM/SSB/CW/AM_NARROW) では3kHz級LPF後の5.5〜11kHzは
+        ほぼ無音で比が飽和するため、帯域内に寄せた窓で測る
+        (チャンネルSNRの帯域別窓と同型の共有技術)。"""
         # 音声が無いフレームでは直前のオーディオクリップを残さない。
         self.audio_clip_pct = 0.0
         if audio is None or len(audio) < 256:
@@ -323,8 +339,12 @@ class HyperController:
                 return 1e-12
             return float(np.mean(power[i0:i1 + 1]))
 
-        prog = band_mean(300.0, 3000.0)
-        hiss = band_mean(5500.0, 11000.0)
+        if mode in ("NFM", "USB", "LSB", "CW", "AM_NARROW"):
+            prog = band_mean(300.0, 2400.0)
+            hiss = band_mean(2800.0, 3600.0)
+        else:
+            prog = band_mean(300.0, 3000.0)
+            hiss = band_mean(5500.0, 11000.0)
         snr_db = 10.0 * np.log10((prog + 1e-12) / (hiss + 1e-12))
         if not np.isfinite(snr_db):
             return None
@@ -605,11 +625,32 @@ class HyperController:
         elif mode in ("AM", "AM_NARROW"):
             cutoff = min(cutoff, 3500.0 if mode == "AM_NARROW" else 8000.0)
             hf = 1.0  # AM経路はシェルフ非適用 (透明なまま帯域のみ適応)
+        elif mode in ("USB", "LSB", "CW"):
+            # SSB/CW通信帯域: 強〜中電界3500Hz、弱電界2800Hzまで適応狭窄。
+            # WFM式を2800〜3500に写像し直す (そのままでは15000止まりで
+            # 常時3500固定になり弱電界追従が死ぬ)。シェルフ非適用。
+            # IFは48kHz複素段の固定FIRのため目標も48k表示に寄せる。
+            _w = 1.0 / (1.0 + np.exp(-0.30 * (s - 6.0)))
+            cutoff = 2800.0 + 700.0 * _w
+            hf = 1.0
+            if_bw = 48000.0
         else:
             # アンテナ環境別の微小バイアス
             if self.antenna_profile == "LOW_GAIN_MICRO":
                 # 簡易アンテナ: 熱雑音フロアを抑えるためIF帯域を少し狭窄
                 if_bw = min(if_bw, 145000.0)
+
+        # 帯域別バイアス自動選択 (第2段): 学習済み弱電界帯のみ到達点を
+        # 少し狭め寄せする。手動override時は尊重し適用しない。
+        # 未学習時は0.0のため従来動作と完全同一 (テスト互換)。
+        if not self.filter_override:
+            try:
+                _prof = getattr(self, "band_profiler", None)
+                _bk = getattr(self, "_last_band", None)
+                if _prof is not None and _bk:
+                    cutoff += float(_prof.bias_hz(_bk))
+            except Exception:
+                pass
 
         if self.filter_override == "wide":
             cutoff = 15000.0
@@ -640,8 +681,10 @@ class HyperController:
     # メインエントリ
     # ================================================================
     def process_frame(self, raw_bytes: np.ndarray, spectrum_db: np.ndarray = None,
-                      audio: np.ndarray = None, mode: str = "WFM") -> dict:
-        """毎フレームの生IQ・スペクトル・復調音声から統合認知制御を実行"""
+                      audio: np.ndarray = None, mode: str = "WFM",
+                      freq_hz: int = None) -> dict:
+        """毎フレームの生IQ・スペクトル・復調音声から統合認知制御を実行。
+        freq_hz: 帯域別アンテナ学習用 (任意。None時は学習スキップ)"""
         if not self.enabled or raw_bytes is None or len(raw_bytes) < 100:
             return self.last_stats
 
@@ -651,7 +694,7 @@ class HyperController:
         # ---- 計測 ----
         clip_pct, iq_std = self._measure_raw(raw_bytes)
         chan_snr, noise_floor = self._measure_channel_snr(spectrum_db, mode)
-        audio_snr = self._measure_audio(audio)
+        audio_snr = self._measure_audio(audio, mode)
 
         # アンテナ環境の自動同定 (どんなアンテナでも最適化)
         self._profile_antenna(clip_pct, iq_std, noise_floor, mode)
@@ -752,6 +795,24 @@ class HyperController:
                     self.last_action_time = now
                     self._control_tick(now, clip_pct)
 
+        # ---- 帯域別アンテナ学習 (制御不変。助言表示用のみ) ----
+        _band_advice = ""
+        try:
+            if (self.band_profiler is not None and freq_hz is not None
+                    and chan_snr is not None and noise_floor is not None):
+                from antenna_profiler import band_key
+                _bk = band_key(freq_hz)
+                self._last_band = _bk
+                # 1Hz間引き学習 (毎フレームでは瞬時値に引きずられるため)。
+                # _last_bandは毎回更新し、バイアス参照の帯域を正しく保つ。
+                _now = time.time()
+                if _now - float(getattr(self, "_band_prof_t", 0.0)) >= 1.0:
+                    self._band_prof_t = _now
+                    self.band_profiler.update(_bk, float(chan_snr), float(noise_floor))
+                _band_advice = self.band_profiler.advice(_bk)
+        except Exception:
+            _band_advice = ""
+
         # ---- 連続DSPパラメータ更新 ----
         self._map_continuous_parameters(mode)
 
@@ -786,6 +847,7 @@ class HyperController:
             "reacquires": self.reacquires,
             "antenna_profile": self.antenna_profile,
             "antenna_type": self.antenna_type_detected,
+            "band_advice": _band_advice,
             "rf_health": str(getattr(self.dsp, "rf_health_state", "HEALTHY")),
         }
         return self.last_stats

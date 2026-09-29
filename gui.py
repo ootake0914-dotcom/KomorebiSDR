@@ -57,6 +57,8 @@ LATIN_FONTS = ["segoeui", "arial"]
 
 def show_message_screen(title: str, lines: list, width: int = 760, height: int = 400):
     """起動失敗時の案内画面 (キー入力またはウィンドウを閉じると終了)"""
+    if isinstance(lines, str):
+        lines = [lines]
     try:
         pygame.init()
         screen = pygame.display.set_mode((width, height))

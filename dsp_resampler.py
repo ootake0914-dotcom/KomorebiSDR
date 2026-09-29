@@ -17,7 +17,7 @@ class AdaptiveDriftResampler:
 
     def __init__(self, target_chunks: float = 8.0, max_ppm: float = 2000.0):
         self.target_chunks = target_chunks
-        self.deadband_low = 5.5   # 5.5〜10.5チャンク（約275ms〜525ms）の間は不感帯
+        self.deadband_low = 4.5   # 4.5〜10.5チャンク（約230ms〜525ms）の間は不感帯
         self.deadband_high = 10.5
         # ±2000ppm (0.2%, ≈3.5cent) までは聴感上ほぼ知覚不能。
         # クロック偏差に加え、GUI描画(GIL)による微小な処理落ちも吸収し、
@@ -33,7 +33,7 @@ class AdaptiveDriftResampler:
     def update_feedback(self, current_chunks: float, dt: float = 0.05):
         """
         オーディオバッファの残存チャンク数に応じた不感帯付き高精度PI制御。
-        通常時（5.5〜10.5チャンク）は 0ppm・ビットパーフェクト通過。
+        通常時（4.5〜10.5チャンク）は 0ppm・ビットパーフェクト通過。
         """
         # 不感帯（Deadband）判定: 健全領域
         if self.deadband_low <= current_chunks <= self.deadband_high:

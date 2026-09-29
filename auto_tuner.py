@@ -11,6 +11,28 @@ from config import SHORTWAVE_BANDS, SW_MAX_HZ, shortwave_scan_centers
 from config import HAM_BANDS, ham_band_mode
 
 
+def _try_set_scan_gain(driver, target_db: float = 33.8):
+    """スキャン用ゲインのベストエフォート設定。
+    HWが目標値を拒否したら利用可能テーブル中の最近傍へフォールバックし、
+    それも駄目なら現状維持でスキャン継続 (例外で全スキャンを道連れにしない)。"""
+    try:
+        driver.set_gain(target_db)
+        return
+    except Exception:
+        pass
+    try:
+        gains = driver.get_gains()
+    except Exception:
+        return
+    if not gains:
+        return
+    try:
+        nearest = min(gains, key=lambda g: abs(float(g) - float(target_db)))
+        driver.set_gain(float(nearest))
+    except Exception:
+        pass
+
+
 # 日本の主要FM局データベース (関東・茨城・東京・広域)
 KNOWN_STATIONS = {
     # 茨城・水戸周辺
@@ -98,7 +120,7 @@ class AutoTuner:
         self.driver.set_sample_rate(scan_rate)
         self.driver.set_direct_sampling(0)
         self.driver.set_gain_mode(True)
-        self.driver.set_gain(33.8)  # 低利得アンテナでの実測SNR最大スウィートスポット (33.8dB)
+        _try_set_scan_gain(self.driver, 33.8)  # 低利得アンテナでの実測SNR最大スウィートスポット (33.8dB)
 
         stations = []
         fft_size = 1024
@@ -259,7 +281,7 @@ class AutoTuner:
         self.driver.set_sample_rate(int(rate_hz))
         self.driver.set_direct_sampling(2)   # Qブランチ (HF)
         self.driver.set_gain_mode(True)
-        self.driver.set_gain(33.8)           # ダイレクトサンプリングでは実質無効
+        _try_set_scan_gain(self.driver, 33.8)  # ダイレクトサンプリングでは実質無効
 
         centers = shortwave_scan_centers(rate_hz, bands=bands)
         fft_size = 2048

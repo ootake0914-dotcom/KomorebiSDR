@@ -229,7 +229,8 @@ class SuperSpatialBssStereoSeparator:
         except Exception:
             peakiness = 0.0
         tonal = 1.0 if peakiness > 8.0 else (0.0 if peakiness < 6.0 else float(getattr(self, "_tonal", 0.0)))
-        a_t = 1.0 - float(np.exp(-(n / self.fs) / 0.15))
+        # 摩擦音でのパタつき防止に0.15→0.25sへ鈍化 (ヒステリシス6/8は維持)
+        a_t = 1.0 - float(np.exp(-(n / self.fs) / 0.25))
         self._tonal = float(getattr(self, "_tonal", 0.0)) + a_t * (tonal - float(getattr(self, "_tonal", 0.0)))
         gain_hf = float(1.0 - (1.0 - self._tonal) * (1.0 - gain_hf))
 

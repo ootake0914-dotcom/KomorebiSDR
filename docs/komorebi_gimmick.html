@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>KomorebiSDR — 木漏れ日ギミック デザイン案</title>
+<style>
+  :root{
+    --ink:#2b3446; --muted:#76839c; --panel:#f4f7fb; --accent:#00ac98;
+    --gold:rgba(255,214,140,.55); --leaf:rgba(120,190,140,.18);
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:#dfe6f1;color:var(--ink);
+    font-family:"Meiryo UI","Yu Gothic UI",sans-serif;padding:18px}
+  h1{font-size:18px;margin:0 0 4px}
+  p.sub{color:var(--muted);font-size:12px;margin:0 0 14px}
+  .radio{position:relative;overflow:hidden;max-width:1120px;margin:0 auto;
+    background:linear-gradient(180deg,#eef2f9,#dbe3f0);border-radius:16px;
+    padding:14px;box-shadow:0 8px 30px rgba(60,80,120,.18)}
+  /* 木漏れ日: ゆらぐ光斑2層 */
+  .komorebi{position:absolute;inset:-40px;pointer-events:none;opacity:.5;
+    background:
+      radial-gradient(120px 90px at 12% 20%, var(--gold), transparent 70%),
+      radial-gradient(90px 70px at 32% 8%, var(--gold), transparent 70%),
+      radial-gradient(150px 110px at 68% 18%, var(--leaf), transparent 70%),
+      radial-gradient(100px 80px at 85% 30%, var(--gold), transparent 70%),
+      radial-gradient(70px 60px at 55% 6%, var(--gold), transparent 70%);
+    animation:sway 9s ease-in-out infinite alternate;filter:blur(1px)}
+  .komorebi.b{animation-duration:13s;opacity:.3;transform:scale(1.15)}
+  @keyframes sway{
+    from{transform:translate(-14px,6px) rotate(-1deg)}
+    to{transform:translate(16px,-8px) rotate(1.2deg)}
+  }
+  .row{display:flex;gap:12px;position:relative}
+  .card{background:rgba(255,255,255,.82);backdrop-filter:blur(2px);
+    border:1px solid #cfd9e8;border-radius:12px;padding:12px 14px;flex:1}
+  .freq{font-size:40px;font-weight:800;letter-spacing:.5px}
+  .badge{display:inline-block;font-size:11px;background:#e3f4f1;color:#007a6e;
+    border-radius:999px;padding:2px 10px;margin-left:8px}
+  .smeter{display:flex;gap:3px;margin-top:8px;align-items:flex-end}
+  .smeter i{width:14px;border-radius:3px;background:#dde5f0}
+  .smeter i.on{background:var(--accent)}
+  .spec{margin-top:12px;background:#101625;border-radius:12px;height:170px;
+    position:relative;overflow:hidden}
+  .spec svg{position:absolute;inset:0;width:100%;height:100%}
+  .wf{margin-top:12px;border-radius:12px;height:150px;
+    background:repeating-linear-gradient(90deg,#123 0 2px,#0e2a3a 2px 5px,#155e5a 5px 7px);
+    opacity:.9;position:relative;overflow:hidden}
+  .wf:after{content:"";position:absolute;inset:0;
+    background:linear-gradient(90deg,transparent 44%,rgba(255,220,150,.55) 50%,transparent 56%)}
+  .btnrow{display:flex;gap:8px;margin-top:12px;position:relative}
+  button{flex:1;border:1px solid #c9d5e7;background:#f6f9fd;border-radius:10px;
+    padding:10px;font-size:13px;cursor:pointer}
+  button.primary{background:var(--accent);color:#fff;border-color:var(--accent)}
+  .note{max-width:1120px;margin:12px auto 0;color:var(--muted);font-size:12px}
+  @media (prefers-reduced-motion:reduce){.komorebi{display:none}}
+</style>
+</head>
+<body>
+<h1>KomorebiSDR — 木漏れ日ギミック案 (HTMLモック)</h1>
+<p class="sub">方針: 機能配置は現行維持・演出は背景光のみ。信号強度で光量が変わる想定。モーション削減設定では消灯。</p>
+<div class="radio">
+  <div class="komorebi"></div><div class="komorebi b"></div>
+  <div class="row">
+    <div class="card">
+      <div style="font-size:11px;color:var(--muted)">NOW PLAYING HUB</div>
+      <div style="font-size:20px;font-weight:800">TOKYO FM <span class="badge">STEREO</span></div>
+      <div class="freq">80.00<span style="font-size:14px"> MHz</span></div>
+      <div class="smeter" id="smeter"></div>
+    </div>
+    <div class="card">
+      <div style="font-size:11px;color:var(--muted)">BAND SELECTOR</div>
+      <div class="btnrow"><button class="primary">FM Radio</button><button>AMラジオ</button><button>Shortwave</button></div>
+      <div class="btnrow"><button class="primary">FM scan</button><button>MW/SW scan</button><button>HAM scan</button></div>
+    </div>
+  </div>
+  <div class="spec">
+    <svg viewBox="0 0 800 170" preserveAspectRatio="none">
+      <path d="M0,140 L120,138 L200,120 L260,60 L300,40 L340,70 L420,110 L520,135 L800,138"
+        fill="none" stroke="#2fe0c8" stroke-width="2"/>
+      <path d="M0,140 L120,138 L200,120 L260,60 L300,40 L340,70 L420,110 L520,135 L800,138 L800,170 L0,170Z"
+        fill="rgba(47,224,200,.15)"/>
+      <line x1="300" y1="0" x2="300" y2="170" stroke="#ffd88c" stroke-width="2"/>
+    </svg>
+  </div>
+  <div class="wf"></div>
+</div>
+<p class="note">実装案: pygame側は baked背景への光斑2層の加算合成を起動時1回 + 強度のみ毎秒更新。毎フレーム再描画なしで負荷ほぼゼロ。S値連動で .komorebi の opacity を 0.25〜0.6 に写像。</p>
+<script>
+  const m=document.getElementById('smeter');
+  for(let i=0;i<24;i++){const b=document.createElement('i');
+    b.style.height=(8+Math.random()*14)+'px';
+    if(i<17)b.className='on';m.appendChild(b);}
+</script>
+</body>
+</html>

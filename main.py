@@ -370,9 +370,6 @@ class SdrApp:
                     self.gui._sync_bfo_visibility()
             except Exception:
                 pass
-        self.freq = freq
-        self.mode = mode
-
         # SSB手動BFOは選局で維持する (set_offset_freqがcw_auto_pitch既定で
         # 無条件クリアするため。CW自動ピッチはCW復調側が所有し再収束する)。
         try:
@@ -380,20 +377,33 @@ class SdrApp:
         except Exception:
             _bfo_keep = None
 
+        # +150kHzオフセットがHW上限を超える上端近傍では詰める
+        # (1750MHz指定で1750150kHz→ValueErrorになる実害の修正)。
+        # 範囲外のfreq自体はドライバ側の検証に任せ、ここではHW成功まで
+        # self.freq/modeを確定させない (失敗時の表示/HW不整合防止)。
+        try:
+            _fi = int(freq)
+        except Exception:
+            _fi = 0
+        offset = 150000
+        if _fi + offset > 1750000000:
+            offset = max(0, 1750000000 - _fi)
+
         # AM中波帯 (24MHz未満) の場合はダイレクトサンプリング (Q-branch = 2) を自動有効化
         if freq < 24000000:
             self.driver.set_direct_sampling(2)
             # ダイレクトサンプリングはDC付近に巨大なスパイクがあるため、キャリアを
             # +150kHzずらして受信しDSP側で戻す (スパイクがAM復調を汚染しない)
-            offset = 150000
             self.driver.set_center_freq(freq + offset)
             self.dsp.set_offset_freq(offset)
         else:
             self.driver.set_direct_sampling(0)
             # DCスパイクを避けるため +150kHz オフセットしてチューニング
-            offset = 150000
             self.driver.set_center_freq(freq + offset)
             self.dsp.set_offset_freq(offset)
+
+        self.freq = freq
+        self.mode = mode
 
         # ノイズ推定履歴をリセット (選局先の電界強度へ素早く追従)
         self.dsp.reset_stereo_nr()
@@ -932,7 +942,8 @@ class SdrApp:
                 if self.use_controller:
                     if self.controller_type == "hyper":
                         stats = self.controller.process_frame(
-                            raw_bytes, spectrum_db, audio=audio_pcm, mode=self.mode
+                            raw_bytes, spectrum_db, audio=audio_pcm,
+                            mode=self.mode, freq_hz=self.freq
                         )
                     else:
                         stats = self.controller.process_frame(raw_bytes, spectrum_db)
@@ -963,7 +974,7 @@ class SdrApp:
                             f"{rf_tag}"
                         )
                     else:
-                        lock_str = t("lock_fixed") if hard_locked else (t("lock_converged") if stats["converged"] else t("lock_searching"))
+                        lock_str = t("lock_fixed") if stats.get("hard_lock", False) else (t("lock_converged") if stats.get("converged", False) else t("lock_searching"))
                         txt = (
                             f"SNR: {stats['estimated_snr']:.1f}dB | "
                             f"IQ: {stats['iq_std']:.0f} | "

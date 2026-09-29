@@ -216,7 +216,7 @@ class AudioOutput:
             step = (vol - self._vol_current) / max(1, frames)
             rb.fill(step)
             np.cumsum(rb, out=rb)
-            rb += (self._vol_current - step)
+            rb += self._vol_current
             data *= rb[:, None]
             self._vol_current = vol
         else:

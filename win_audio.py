@@ -102,6 +102,7 @@ def _win_enumerate_render_endpoints():
     ole32.CoTaskMemFree.argtypes = [c_void_p]
     ole32.CoTaskMemFree.restype = None
     out = []
+    _co_hr = -1
     try:
         _co_hr = _co_init(ole32)
         pdev = c_void_p()
@@ -225,6 +226,7 @@ def _win_default_output_peak():
     ole32.CoCreateInstance.restype = ctypes.c_long
     ole32.CoUninitialize.argtypes = []
     peak = None
+    _co_hr = -1
     try:
         _co_hr = _co_init(ole32)
         pdev = c_void_p()
@@ -288,6 +290,7 @@ def _win_session_volumes():
     out = []
     enum = None
     hdev = None
+    _co_hr = -1
     try:
         _co_hr = _co_init(ole32)
         pdev = c_void_p()
@@ -428,6 +431,7 @@ def _win_default_output_mute_volume():
     ole32.CoUninitialize.argtypes = []
     muted = None
     volume = None
+    _co_hr = -1
     try:
         _co_hr = _co_init(ole32)
         pdev = c_void_p()
@@ -502,6 +506,7 @@ def _win_default_output_name() -> str | None:
     ole32.CoTaskMemFree.argtypes = [c_void_p]
     ole32.CoTaskMemFree.restype = None
     result = None
+    _co_hr = -1
     try:
         _co_hr = _co_init(ole32)
         pdev = ctypes.c_void_p()

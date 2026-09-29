@@ -6,6 +6,7 @@ Application configuration & region profiles.
 - OSロケールからの国・言語の自動判定
 """
 
+import copy
 import json
 import locale
 import os
@@ -412,10 +413,9 @@ def _clean_black_magic(v) -> dict:
 
 
 def load_config() -> dict:
-    # 浅コピーだとプリセットリストがDEFAULT_CONFIGの参照を共有し、
-    # 呼出側のリスト直接変更で既定値が汚れるため深く複製する
-    cfg = {k: (list(v) if isinstance(v, list) else v)
-           for k, v in DEFAULT_CONFIG.items()}
+    # 浅コピーだとプリセットリストやblack_magic辞書がDEFAULT_CONFIGの
+    # 参照を共有し、呼出側の変更で既定値が汚れるため深く複製する
+    cfg = copy.deepcopy(DEFAULT_CONFIG)
     try:
         with open(CONFIG_PATH, "r", encoding="utf-8") as f:
             loaded = json.load(f)

@@ -182,7 +182,8 @@ class DspAmMixin:
 
         ratio_db = 10.0 * np.log10(band(3200.0, 4500.0) / band(300.0, 3000.0))
         dt = len(audio) / self.audio_rate
-        self._vc_ratio_db += (1.0 - np.exp(-dt / 0.5)) * (ratio_db - self._vc_ratio_db)
+        # 歯擦音 (100〜200ms) での帯域チラつき防止に0.5→0.8sへ鈍化
+        self._vc_ratio_db += (1.0 - np.exp(-dt / 0.8)) * (ratio_db - self._vc_ratio_db)
         x = float(np.clip((self._vc_ratio_db + 32.0) / 20.0, 0.0, 1.0))
         s = x * x * (3.0 - 2.0 * x)
         self.voice_cut_hz = f_max * (f_min / f_max) ** s

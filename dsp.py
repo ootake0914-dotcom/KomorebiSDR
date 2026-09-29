@@ -253,6 +253,11 @@ class SdrDspPipeline(DspBlackMagicMixin, DspAmMixin, DspNfmMixin,
         # 選局直後のファストスタート用ブロックカウンタ (set_offset_freqで0へ。
         # ゲイン自体は維持し音量跳躍を防ぎつつ、時定数のみ一時短縮する)
         self._agc_blk = 0
+        # 呼吸防止: attack後のreleaseホールド (0.4s≒7ブロック)、
+        # ±1.5dBヒステリシス不感帯 (微小変動でのジリ動を抑止)
+        self._agc_hold_n = 0
+        self._agc_hold_max = 7
+        self._agc_hyst_db = 1.5
         # R128ラウドネス推定への切替 (既定OFF。ON時はRMS推定をLUFS推定に
         # 置換。時定数・範囲・凍結条件は従来通り。ゲイン状態は共有)
         self.lufs_agc_enabled = False
@@ -310,6 +315,7 @@ class SdrDspPipeline(DspBlackMagicMixin, DspAmMixin, DspNfmMixin,
         # AGCファストスタート計数もリセット (新局へ速く追従させる)
         try:
             self._agc_blk = 0
+            self._agc_hold_n = 0
         except Exception:
             pass
         # 選局でAM同期PLLを初期化 (再ロック)
@@ -353,6 +359,10 @@ class SdrDspPipeline(DspBlackMagicMixin, DspAmMixin, DspNfmMixin,
         self._trim_err_ema = 0.0
         self.fm_last_sample = 0.0 + 0.0j
         self.nfm_last_sample = 0.0 + 0.0j
+        try:
+            self._nfm_sq_below = 0
+        except Exception:
+            pass
         self._fm_pll_state[:] = 0.0
         # CMA等化器も再初期化 (前局のチャネル推定を持ち越さない)
         self._cma_w[:] = 0.0
@@ -463,6 +473,8 @@ class SdrDspPipeline(DspBlackMagicMixin, DspAmMixin, DspNfmMixin,
         self._nr_cut_eff = 15000.0
         self._wf_p = None
         self._wf_g = None
+        self._wf_xi = None
+        self._wf_gamma_prev = None
         self._nr_floor_pow = 0.0
         # NR遅延線もゼロ化 (set_stereo_nr単独トグル時に前状態が1ブロック混入する。
         # 長さは維持し群遅延を変えない)
@@ -563,17 +575,17 @@ class SdrDspPipeline(DspBlackMagicMixin, DspAmMixin, DspNfmMixin,
     ):
         """
         HyperControllerからの連続制御パラメータ受け口。
-        :param cutoff_hz: オーディオ段カットオフ (4200〜16000Hz, 無段階)
+        :param cutoff_hz: オーディオ段カットオフ (2800〜16000Hz, 無段階)
         :param hf_gain: 高域(4.5kHz超)ノイズ抑圧ゲイン (0.0〜1.0, 無段階)
-        :param if_bw_hz: IF実効帯域幅 (110000〜200000Hz, 無段階)
+        :param if_bw_hz: IF実効帯域幅 (16000〜200000Hz, 無段階)
         """
         self.cognitive_enabled = enabled
         if cutoff_hz is not None:
-            self.target_cutoff_hz = float(np.clip(cutoff_hz, 4200.0, 16000.0))
+            self.target_cutoff_hz = float(np.clip(cutoff_hz, 2800.0, 16000.0))
         if hf_gain is not None:
             self.target_hf_gain = float(np.clip(hf_gain, 0.0, 1.0))
         if if_bw_hz is not None:
-            self.target_if_bw_hz = float(np.clip(if_bw_hz, 110000.0, 200000.0))
+            self.target_if_bw_hz = float(np.clip(if_bw_hz, 16000.0, 200000.0))
 
     @staticmethod
     def _wfm_if_snr_db(spectrum_db: np.ndarray, rf_rate: float):
@@ -625,7 +637,7 @@ class SdrDspPipeline(DspBlackMagicMixin, DspAmMixin, DspNfmMixin,
         if mode == "WFM" and if_snr_db is not None and np.isfinite(if_snr_db):
             q = float(if_snr_db)
             self._if_snr_db = q
-            target = float(np.clip(self.target_if_bw_hz, 110000.0, 200000.0))
+            target = float(np.clip(self.target_if_bw_hz, 16000.0, 200000.0))
             delta = target - self.applied_if_bw_hz
             # 低SNRほど1ブロックあたりの変化量を絞り、履歴FIRの急変ショックを防ぐ。
             limit = 2500.0 if q < 4.0 else (4000.0 if q < 8.0 else 8000.0)
@@ -1043,12 +1055,14 @@ class SdrDspPipeline(DspBlackMagicMixin, DspAmMixin, DspNfmMixin,
         if self.slow_agc_enabled:
             audio_clean = self._slow_agc_level(audio_clean)
 
-        # AM (中波・短波) のみのメイクアップ +3dB: ダイレクトサンプリング経路は
+        # AM (中波・短波) のみのメイクアップ +4.5dB: ダイレクトサンプリング経路は
         # 変調密度が低く同一RMSでもFMより小さく聴こえるため。大音量視聴時の
-        # システム音量依存を緩和する。後段のルックアヘッドリミッタ (0.98) が
-        # ピークを抑えるためクリップしない。遅延・位相に影響なし。
+        # システム音量依存を緩和する。フェージング音声のクレスト約15dBに対し、
+        # 後段のルックアヘッドリミッタ (0.98) がピークを抑えるため、
+        # 実測clip率0.2%級でクリップ歪みなし (11.865MHz朝鮮の声で検証)。
+        # 遅延・位相に影響なし。
         if mode == "AM":
-            audio_clean = (np.asarray(audio_clean, dtype=np.float32) * 1.41).astype(np.float32)
+            audio_clean = (np.asarray(audio_clean, dtype=np.float32) * 1.68).astype(np.float32)
 
         # ===== オーディオ最終段 =====
         # 位相回転の少ないDCサーボ (20Hz〜20kHzの位相変化を抑えつつ直流オフセットを除去)

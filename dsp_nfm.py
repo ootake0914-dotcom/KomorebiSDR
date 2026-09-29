@@ -52,13 +52,28 @@ class DspNfmMixin:
             return np.zeros(0, dtype=np.float32)
 
         # スケルチ判定 (通信用NFMは無信号時の突発ノイズを防止するため、スケルチ必須)
+        # ハングオーバ付き: 閾値割れ単発では閉じず、連続HANGブロックで確定する
         power_db = 10.0 * np.log10(np.mean(np.abs(iq_if) ** 2) + 1e-12)
         effective_threshold = self.squelch_threshold if self.squelch_enabled else -74.0
         if power_db < effective_threshold:
-            if len(iq_if) > 0:
-                # ミュート中も位相基準だけ進め、復帰時の差分位相クリックを防ぐ
-                self.nfm_last_sample = iq_if[-1]
-            return np.zeros(len(iq_if) // self.audio_decim, dtype=np.float32)
+            try:
+                _below = int(getattr(self, "_nfm_sq_below", 0)) + 1
+                self._nfm_sq_below = _below
+                _hang = int(getattr(self, "_nfm_sq_hang", 5))
+            except Exception:
+                _below, _hang = 1, 5
+            if _below <= _hang:
+                pass  # まだ閉じない (ハング中は以下の復調へ進む)
+            else:
+                if len(iq_if) > 0:
+                    # ミュート中も位相基準だけ進め、復帰時の差分位相クリックを防ぐ
+                    self.nfm_last_sample = iq_if[-1]
+                return np.zeros(len(iq_if) // self.audio_decim, dtype=np.float32)
+        else:
+            try:
+                self._nfm_sq_below = 0
+            except Exception:
+                pass
 
         # 1. ハードリミッター適用
         limited = self._apply_hard_limiter(iq_if)
@@ -188,11 +203,17 @@ class DspNfmMixin:
         audio = self._voice_bandwidth(audio, 3000.0, 2500.0)
         # SSB/CW経路のRMTは不採用 (狭帯域誤作動。verdict参照)
         # CW自動ピッチ (既定ON): 400-1000Hzのピークを650Hzへ寄せる。
-        # SSBは抑制搬送波で盲目基準がなく、誤補正が mistune より有害なため
-        # 見送り (手動BFO維持)。CWのみ・明瞭単音のみ・±800Hz clamp。
+        # SSB自動BFO (既定ON): 音声重心サーボ。抑圧搬送波にPLLは効かないため、
+        # 正調音声の重心≈1000HzへBFOを低速追従させる。狭帯域トーン (試験・
+        # FT8/CW混入) では凍結し、±800Hz clamp・1回15Hz制限で誤補正を防ぐ。
         if mode == "CW" and bool(getattr(self, "cw_auto_pitch", True)):
             try:
                 audio = self._cw_auto_pitch(audio)
+            except Exception:
+                pass
+        if mode in ("USB", "LSB") and bool(getattr(self, "ssb_auto_bfo", True)):
+            try:
+                audio = self._ssb_auto_bfo(audio, mode)
             except Exception:
                 pass
         # SSB/CW経路のSR検出プローブ (既定OFF。confidence公開のみ)
@@ -208,6 +229,59 @@ class DspNfmMixin:
         except Exception:
             pass
         return audio.astype(np.float32)
+
+    def _ssb_auto_bfo(self, audio: np.ndarray, mode: str) -> np.ndarray:
+        """SSB自動BFO: 復調音声のスペクトル重心を1000Hz付近へ低速サーボする。
+        正調の音声エネルギーは300〜2700Hzに収まり重心≈0.8〜1.2kHzになる。
+        mistuneで全体がずれた分だけ重心が動くため、その誤差でBFOを補正する。
+        保護: 狭帯域トーン (ピーク突出12dB超=試験/FT8/CW)・無音・非有限時は
+        凍結。4ブロックに1回・1回15Hz・合計±800Hz clamp。音声自体は変えない
+        (BFOは次ブロック以降に反映)。LSBは鏡像のため符号反転する。"""
+        try:
+            x = np.asarray(audio, dtype=np.float64).reshape(-1)
+        except Exception:
+            return audio
+        n = len(x)
+        if n < 1024 or not bool(np.all(np.isfinite(x))):
+            return audio
+        if float(np.sqrt(np.mean(x * x))) < 1e-4:
+            return audio
+        # 間引き (4ブロックに1回。音声の変化は秒オーダーのため十分)
+        _cnt = int(getattr(self, "_ssb_bfo_cnt", 0)) + 1
+        self._ssb_bfo_cnt = _cnt
+        if _cnt % 4 != 1:
+            return audio
+        spec = np.abs(np.fft.rfft(x * np.hanning(n)))
+        freqs = np.fft.rfftfreq(n, 1.0 / float(self.audio_rate))
+        m = (freqs >= 200.0) & (freqs <= 3200.0)
+        if not bool(np.any(m)):
+            return audio
+        band = spec[m]
+        fr = freqs[m]
+        med = float(np.median(band)) + 1e-18
+        # 音声=広帯域に分布、トーン/FT8/CW=狭帯域で弁別する。
+        # ピーク本数・高さでは母音フォルマントが誤判定されるため、
+        # 有意ビン (中央値10倍かつピーク-30dB以上) の占有帯域幅で見る。
+        # ピーク相対条件が無いと、無音に近い帯域で中央値≈0となり
+        # 微小数値ノイズ全域が有意扱いになる (test_ssb退行の実害)。
+        peak = float(np.max(band))
+        thr = max(med * 10.0, peak * 1e-3)
+        strong_idx = np.flatnonzero(band > thr)
+        if len(strong_idx) == 0:
+            return audio
+        span_hz = float(fr[strong_idx[-1]] - fr[strong_idx[0]])
+        if span_hz < 300.0:
+            return audio  # 狭帯域トーン: 触らない
+        centroid = float(np.sum(fr * band) / (np.sum(band) + 1e-18))
+        err = centroid - 1000.0
+        if abs(err) < 40.0 or abs(err) > 900.0:
+            return audio
+        step = float(np.clip(0.05 * err, -15.0, 15.0))
+        cur = float(getattr(self, "bfo_offset_hz", 0.0))
+        # USB/LSBともBFO正=ピッチ上昇 (test_ssbで両側同方向を確認済み)
+        new = cur - step
+        self.bfo_offset_hz = float(min(max(new, -800.0), 800.0))
+        return audio
 
     def _cw_auto_pitch(self, audio: np.ndarray) -> np.ndarray:
         """CW自動ピッチ: 400-1000Hzの最大ピーク (放物線補間で細分) を
@@ -277,10 +351,17 @@ class DspNfmMixin:
         self.nfm_last_sample = 0.0 + 0.0j
         self.nfm_afc_offset_hz = 0.0
         self.nfm_afc_alpha = 0.08  # ISSドップラー追従用時定数
+        # NFMスケルチのハングオーバ (AM/SSB搬送波AGCのhangと同型の共有技術):
+        # 開→閉は5ブロック連続で閾値割れしてから (語間パタつき防止)、
+        # 閉→開は即時 (立ち上がり欠け防止)
+        self._nfm_sq_below = 0
+        self._nfm_sq_hang = 5
         self._voice_hp_state = np.zeros(2, dtype=np.float32)
         # ===== SSB / CW =====
         self.bfo_offset_hz = 0.0     # BFO微調整 (SSB/CWのみ)
-        self.cw_auto_pitch = True    # CW自動ピッチ (650Hzへ。SSBは見送り)
+        self.cw_auto_pitch = True    # CW自動ピッチ (650Hzへ)
+        self.ssb_auto_bfo = True     # SSB自動BFO (音声重心サーボ。狭帯域保護つき)
+        self._ssb_bfo_cnt = 0
         self.ssb_agc_level = 0.0
         self._ssb_agc_hang = 0
         self._ssb_bp_phase = 0.0

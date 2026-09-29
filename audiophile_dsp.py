@@ -41,6 +41,8 @@ class TpdfDitherNoiseShaper:
         self.err1_r = 0.0
         self.err2_r = 0.0
         self.enabled = True
+        # TPDF用RNGはインスタンスで保持 (ブロック毎の再シードを避け連続性を保つ)
+        self._rng = np.random.default_rng()
 
     def reset(self):
         self.err1_l = self.err2_l = 0.0
@@ -72,7 +74,8 @@ class TpdfDitherNoiseShaper:
         if not self.enabled or len(audio_float) == 0:
             return audio_float
         int16_arr = self.process_to_int16(audio_float)
-        return (int16_arr.astype(np.float32) * (1.0 / 32767.0))
+        # -32768/32767=-1.00003の僅かなはみ出しを抑え[-1,1]に収める
+        return np.clip(int16_arr.astype(np.float32) * (1.0 / 32767.0), -1.0, 1.0)
 
     def _shape_channel(self, ch_float: np.ndarray, is_right: bool) -> np.ndarray:
         n = len(ch_float)
@@ -82,7 +85,10 @@ class TpdfDitherNoiseShaper:
         scaled = np.clip(ch_clean * 32767.0, -32768.0, 32767.0)
 
         # 2つの独立した一様乱数の差分による三角分布TPDFディザー [-1.0, 1.0] LSB
-        rng = np.random.default_rng()
+        rng = getattr(self, "_rng", None)
+        if rng is None:
+            rng = np.random.default_rng()
+            self._rng = rng
         u1 = rng.uniform(-0.5, 0.5, n)
         u2 = rng.uniform(-0.5, 0.5, n)
         tpdf = (u1 + u2).astype(np.float32)

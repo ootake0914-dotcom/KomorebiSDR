@@ -85,7 +85,11 @@ class SignalLogger:
 
 def load_rows(path: str) -> list:
     rows = []
-    with open(path, newline="", encoding="utf-8") as f:
+    try:
+        f = open(path, newline="", encoding="utf-8")
+    except (FileNotFoundError, NotADirectoryError, OSError):
+        return []
+    with f:
         for r in csv.DictReader(f):
             row = {}
             for k in COLUMNS:

@@ -701,7 +701,31 @@ class DspWfmMixin:
                 for j in range(nframes):
                     power = powers[j]
                     self._wf_p = 0.5 * power + 0.5 * self._wf_p
-                    g_w = np.maximum(1.0 - noise_bin / (self._wf_p + 1e-12),
+                    # decision-directed事前SNR (Ephraim-Malah):
+                    # 瞬時事後SNRのばらつきを前フレームのゲイン付きで均し、
+                    # ビン毎のゲインチラつき＝ミュージカルノイズを抑える。
+                    gamma = power / (noise_bin + 1e-12)
+                    xi_inst = np.maximum(gamma - 1.0, 0.0)
+                    try:
+                        _xi = getattr(self, "_wf_xi", None)
+                        _gp = getattr(self, "_wf_gamma_prev", None)
+                        _gg = getattr(self, "_wf_g", None)
+                    except Exception:
+                        _xi, _gp, _gg = None, None, None
+                    if (_xi is None or _gp is None or len(_xi) != len(gamma)
+                            or len(_gp) != len(gamma)):
+                        xi = xi_inst.astype(np.float32)
+                    else:
+                        if _gg is None or len(_gg) != len(gamma):
+                            _g2 = np.ones_like(gamma, dtype=np.float32)
+                        else:
+                            _g2 = (np.asarray(_gg, dtype=np.float32) ** 2)
+                        xi = (0.85 * _g2 * np.asarray(_gp, dtype=np.float32)
+                              + 0.15 * xi_inst).astype(np.float32)
+                        xi = np.maximum(xi, 0.0)
+                    self._wf_xi = xi
+                    self._wf_gamma_prev = gamma.astype(np.float32)
+                    g_w = np.maximum(xi / (1.0 + xi + 1e-12),
                                      self._nr_gmin).astype(np.float32)
                     g_w[:3] = 1.0  # DC〜低域は保護
                     if self._wf_g is None or len(self._wf_g) != len(g_w):
@@ -911,13 +935,52 @@ class DspWfmMixin:
                 dt = len(audio) / float(self.audio_rate)
             except Exception:
                 dt = 0.05
-            tau = float(self.slow_agc_attack) if desired < cur else float(self.slow_agc_release)
+            # ファストスタート計数は凍結時も進める (hold中に選局直後扱いが
+            # 永続しないよう先に加算する)
+            try:
+                _ab = int(getattr(self, "_agc_blk", 999)) + 1
+                self._agc_blk = _ab
+            except Exception:
+                _ab = 999
+            # ヒステリシス不感帯 (±1.5dB未満の微小要求は凍結しジリ動を抑止)
+            try:
+                _hyst = float(getattr(self, "_agc_hyst_db", 1.5))
+                _ddb = 20.0 * float(np.log10(max(desired, 1e-9) / max(cur, 1e-9)))
+            except Exception:
+                _hyst, _ddb = 1.5, 99.0
+            if abs(_ddb) < _hyst:
+                return audio
+            is_attack = bool(desired < cur)
+            # ホールド: attack直後のrelease方向を一定ブロック抑止
+            # (語尾・休止での持ち上げ呼吸を防止。attack自体は即時)
+            try:
+                _hold = int(getattr(self, "_agc_hold_n", 0))
+            except Exception:
+                _hold = 0
+            if not is_attack and _hold > 0:
+                try:
+                    self._agc_hold_n = _hold - 1
+                except Exception:
+                    pass
+                return audio
+            # 番組ゲート: 静かな不確定区間の持ち上げは保留する。
+            # speech_probが中間 (0.3〜0.7)＝雑音/間隙らしく、かつRMSが目標の
+            # 半分未満のときだけ凍結。音楽 (0寄り)・音声 (1寄り) の確信時は通す。
+            if not is_attack and rms < float(self.slow_agc_target) * 0.5:
+                try:
+                    _eq = getattr(self, "cognitive_eq", None)
+                    _sp = None
+                    if _eq is not None and bool(getattr(_eq, "enabled", False)):
+                        _sp = float(getattr(_eq, "speech_prob", 0.5))
+                    if _sp is not None and np.isfinite(_sp) and 0.3 < _sp < 0.7:
+                        return audio
+                except Exception:
+                    pass
+            tau = float(self.slow_agc_attack) if is_attack else float(self.slow_agc_release)
             # ファストスタート: 選局直後40ブロック (~2.3秒) は時定数を短縮し
             # 新局レベルへ速く寄せる。定常後は従来時定数に戻りポンピング特性不変。
             # 持ち上げ側2.0→2.5sへ少し鈍化し、選局直後の行き過ぎ(膨らみ)を抑える。
             try:
-                _ab = int(getattr(self, "_agc_blk", 999)) + 1
-                self._agc_blk = _ab
                 if _ab <= 40:
                     tau = min(tau, 0.5 if desired < cur else 2.5)
             except Exception:
@@ -925,6 +988,11 @@ class DspWfmMixin:
             a = 1.0 - float(np.exp(-dt / tau))
             gain = cur + a * (desired - cur)
             self.slow_agc_gain = float(gain)
+            if is_attack:
+                try:
+                    self._agc_hold_n = int(getattr(self, "_agc_hold_max", 7))
+                except Exception:
+                    pass
             if abs(gain - 1.0) < 1e-4:
                 return audio
             return (x * gain).astype(np.float32)
@@ -935,12 +1003,20 @@ class DspWfmMixin:
         """ブレンド低下 (パイロット瞬断フライホイール付き)。
         高ブレンドからの低下要求は25ブロック (~1.4秒) まで凍結し、
         短いパイロット瞬断発作でステレオ像がモノラルへ往復するのを防ぐ。
-        持続喪失では従来通り0.97ランプで floor まで滑らかに落とす。"""
+        持続喪失では floor まで滑らかに落とす。ノイズ量 (_nr_s) に応じて
+        低下を加速し (clean 0.97 → noisy 0.90)、全ノイズをほぼ一定に保つ
+        (定ノイズブレンド。弱電界のノイズハンプ滞留を抑止)。"""
         if (self._stereo_blend > 0.5
                 and self._pilot_hold_n < self._pilot_hold_max):
             self._pilot_hold_n += 1
         else:
-            self._stereo_blend = max(float(floor), self._stereo_blend * 0.97)
+            try:
+                _ns = float(getattr(self, "_nr_s", 0.0))
+                _ns = min(max(_ns, 0.0), 1.0)
+            except Exception:
+                _ns = 0.0
+            _dec = 0.97 - 0.07 * _ns
+            self._stereo_blend = max(float(floor), self._stereo_blend * _dec)
         self.stereo_blend = self._stereo_blend
 
     def _post_process_wfm(self, audio: np.ndarray, ch: str = "") -> np.ndarray:
@@ -1464,6 +1540,8 @@ class DspWfmMixin:
         self._wf_ola = np.zeros(self._wf_n, dtype=np.float32)
         self._wf_p = None                  # 番組パワーの時間平滑
         self._wf_g = None
+        self._wf_xi = None                 # decision-directed事前SNR
+        self._wf_gamma_prev = None         # 前フレーム事後SNR
         self._wf_f2 = np.fft.rfftfreq(self._wf_n, 1.0 / self.audio_rate) ** 2
         # 知覚マスキング行列 (Bark拡散・Schroeder): T = P @ S でビン別マスキング閾値。
         # マスクされるノイズは抑圧不要 (g=1) とし、音楽性ノイズを設計上出さない。
