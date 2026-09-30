@@ -97,7 +97,7 @@ class DspAmMixin:
         fade = min(1.0, level / 2e-4)
         return np.clip((sig * gain - 1.0) * 0.6, -1.0, 1.0) * fade
 
-    def demodulate_am(self, iq_if: np.ndarray) -> np.ndarray:
+    def demodulate_am(self, iq_if: np.ndarray, mode: str = "AM") -> np.ndarray:
         if len(iq_if) == 0:
             return np.zeros(0, dtype=np.float32)
 
@@ -131,7 +131,11 @@ class DspAmMixin:
         if _servo_am is None or not bool(getattr(_servo_am, "enabled", False)):
             audio = self._apply_dc_highpass(audio)
         # 下限2.5k→3.2kHzへ (強〜中電界のこもりを軽減。ヒス時は依然狭窄する)
-        audio = self._voice_bandwidth(audio, 4000.0, 3200.0)
+        # AM_NARROW時は上限も3500Hzに絞り、クリーン時の4000Hzへの抜けを防ぐ
+        if mode == "AM_NARROW":
+            audio = self._voice_bandwidth(audio, 3500.0, 3200.0)
+        else:
+            audio = self._voice_bandwidth(audio, 4000.0, 3200.0)
         # AM経路の適応ハムノッチ (既定OFF。短波の電源ハム・ヘテロダイン対策)。
         # WFM側とは履歴を共有しない (chキー分離。帯域・レベルが異なるため)。
         if (getattr(self, "black_magic_enabled", False)

@@ -73,7 +73,12 @@ class SdrApp:
         self.dsp = SdrDspPipeline(self.sample_rate, self.audio_rate)
         # 地域規格 (ディエンファシス 50/75μs) を適用。
         self.dsp.set_deemphasis(self.profile["deemphasis_us"])
-        # ステレオ・NRは常時ON固定 (保存済み設定に依らず上書き)。
+        # --mono / --no-stereo-nr はセッション限定の素通し指定として尊重する。
+        # 既定は自動ブレンドに任せる (常時ON)。
+        if self.config.get("stereo", True) is False:
+            self.dsp.set_stereo_enabled(False)
+        if self.config.get("stereo_nr", True) is False:
+            self.dsp.set_stereo_nr(False)
         self.dsp.sic_enabled = bool(self.config.get("sic", True))
         self._apply_black_magic_config()
         # オーディオ出力

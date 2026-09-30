@@ -353,9 +353,10 @@ class DspNfmMixin:
         self.nfm_afc_alpha = 0.08  # ISSドップラー追従用時定数
         # NFMスケルチのハングオーバ (AM/SSB搬送波AGCのhangと同型の共有技術):
         # 開→閉は5ブロック連続で閾値割れしてから (語間パタつき防止)、
-        # 閉→開は即時 (立ち上がり欠け防止)
-        self._nfm_sq_below = 0
+        # 閉→開は即時 (立ち上がり欠け防止)。
+        # 初期は閉状態 (選局直後の無局ノイズ漏れを出さない)
         self._nfm_sq_hang = 5
+        self._nfm_sq_below = self._nfm_sq_hang
         self._voice_hp_state = np.zeros(2, dtype=np.float32)
         # ===== SSB / CW =====
         self.bfo_offset_hz = 0.0     # BFO微調整 (SSB/CWのみ)

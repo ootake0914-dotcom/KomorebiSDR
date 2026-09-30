@@ -1,122 +1,158 @@
 {
-  "WFM bm=off": {
-    "p50": 24.19,
-    "p95": 30.21,
-    "p99": 39.43,
+  "AM bm=off": {
+    "p50": 6.2,
+    "p95": 6.9,
+    "p99": 7.13,
     "top": [
       [
-        "demod/wfm",
-        5.23
+        "demod/am",
+        1.748
       ],
       [
         "chan/decim_hist",
-        3.426
-      ],
-      [
-        "pair/wiener",
-        3.094
-      ],
-      [
-        "pair/post",
-        2.212
-      ],
-      [
-        "pair/mpx_canceller",
-        1.805
+        1.402
       ],
       [
         "front/raw_to_iq",
-        1.622
+        0.64
       ],
       [
-        "demod/pilot_pll",
-        1.24
+        "post/cog_an",
+        0.229
       ],
       [
-        "post/bss",
-        0.657
+        "front/spectrum",
+        0.176
+      ],
+      [
+        "post/cog_eq",
+        0.113
+      ],
+      [
+        "front/mix",
+        0.004
+      ],
+      [
+        "wfm/cog_morph",
+        0.003
       ]
     ]
   },
-  "WFM bm=ALL": {
-    "p50": 30.24,
-    "p95": 42.61,
-    "p99": 52.38,
+  "AM bm=ALL": {
+    "p50": 6.58,
+    "p95": 8.6,
+    "p99": 8.67,
     "top": [
       [
-        "demod/wfm",
-        6.302
+        "demod/am",
+        1.651
       ],
       [
         "chan/decim_hist",
-        4.352
+        1.258
       ],
       [
-        "pair/wiener",
-        3.58
-      ],
-      [
-        "pair/post",
-        2.369
-      ],
-      [
-        "pair/mpx_canceller",
-        2.14
+        "bm/notch_mono",
+        0.751
       ],
       [
         "front/raw_to_iq",
-        1.726
+        0.597
       ],
       [
-        "demod/pilot_pll",
-        1.619
+        "post/cog_an",
+        0.219
       ],
       [
-        "bm/rmt_mono",
-        1.212
+        "front/spectrum",
+        0.178
+      ],
+      [
+        "post/cog_eq",
+        0.104
+      ],
+      [
+        "front/mix",
+        0.003
       ]
     ]
   },
-  "alloc_top": [
-    {
-      "loc": "C:\\Users\\ootak\\AppData\\Roaming\\uv\\python\\cpython-3.11-windows-x86_64-none\\Lib\\ctypes\\__init__.py:0",
-      "count": 478,
-      "size_mb": 0.04
-    },
-    {
-      "loc": "C:\\Users\\ootak\\AppData\\Local\\hermes\\hermes-agent\\venv\\Lib\\site-packages\\numpy\\_core\\_internal.py:0",
-      "count": 174,
-      "size_mb": 0.02
-    },
-    {
-      "loc": "C:\\Users\\ootak\\AppData\\Local\\hermes\\hermes-agent\\venv\\Lib\\site-packages\\numpy\\_core\\fromnumeric.py:0",
-      "count": 72,
-      "size_mb": 0.01
-    },
-    {
-      "loc": "C:\\Users\\ootak\\OneDrive\\Desktop\\RTLSDR\\tools\\profile_snapshot.py:0",
-      "count": 108,
-      "size_mb": 0.01
-    },
-    {
-      "loc": "C:\\Users\\ootak\\OneDrive\\Desktop\\RTLSDR\\dsp_native.py:0",
-      "count": 99,
-      "size_mb": 0.01
-    },
-    {
-      "loc": "C:\\Users\\ootak\\AppData\\Local\\hermes\\hermes-agent\\venv\\Lib\\site-packages\\numpy\\lib\\_function_base_impl.py:0",
-      "count": 27,
-      "size_mb": 0.0
-    },
-    {
-      "loc": "C:\\Users\\ootak\\AppData\\Local\\hermes\\hermes-agent\\venv\\Lib\\site-packages\\numpy\\lib\\_utils_impl.py:0",
-      "count": 29,
-      "size_mb": 0.0
-    },
-    {
-      "loc": "C:\\Users\\ootak\\OneDrive\\Desktop\\RTLSDR\\dsp_wfm.py:0",
-      "count": 25,
-      "size_mb": 0.0
-    }
-  ]
+  "USB bm=off": {
+    "p50": 6.08,
+    "p95": 8.26,
+    "p99": 8.35,
+    "top": [
+      [
+        "chan/decim_hist",
+        2.263
+      ],
+      [
+        "demod/ssb",
+        0.838
+      ],
+      [
+        "front/raw_to_iq",
+        0.659
+      ],
+      [
+        "post/cog_an",
+        0.253
+      ],
+      [
+        "front/spectrum",
+        0.213
+      ],
+      [
+        "post/cog_eq",
+        0.118
+      ],
+      [
+        "front/mix",
+        0.004
+      ],
+      [
+        "wfm/cog_morph",
+        0.002
+      ]
+    ]
+  },
+  "USB bm=ALL": {
+    "p50": 6.57,
+    "p95": 8.73,
+    "p99": 10.61,
+    "top": [
+      [
+        "chan/decim_hist",
+        2.279
+      ],
+      [
+        "demod/ssb",
+        0.977
+      ],
+      [
+        "front/raw_to_iq",
+        0.71
+      ],
+      [
+        "post/cog_an",
+        0.26
+      ],
+      [
+        "front/spectrum",
+        0.204
+      ],
+      [
+        "post/cog_eq",
+        0.12
+      ],
+      [
+        "front/mix",
+        0.004
+      ],
+      [
+        "wfm/cog_morph",
+        0.002
+      ]
+    ]
+  }
 }

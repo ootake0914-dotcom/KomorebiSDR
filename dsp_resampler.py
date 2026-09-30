@@ -17,8 +17,10 @@ class AdaptiveDriftResampler:
 
     def __init__(self, target_chunks: float = 8.0, max_ppm: float = 2000.0):
         self.target_chunks = target_chunks
-        self.deadband_low = 4.5   # 4.5〜10.5チャンク（約230ms〜525ms）の間は不感帯
-        self.deadband_high = 10.5
+        # 不感帯は目標水位から派生 (target-3.5〜+2.5)。既定8.0では
+        # 4.5〜10.5チャンク (約230ms〜525ms) となり、preroll 5chを帯域内に含む。
+        self.deadband_low = target_chunks - 3.5
+        self.deadband_high = target_chunks + 2.5
         # ±2000ppm (0.2%, ≈3.5cent) までは聴感上ほぼ知覚不能。
         # クロック偏差に加え、GUI描画(GIL)による微小な処理落ちも吸収し、
         # バッファ枯渇(音飛び)を未然に防ぐ。

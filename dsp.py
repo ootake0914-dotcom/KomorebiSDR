@@ -360,7 +360,7 @@ class SdrDspPipeline(DspBlackMagicMixin, DspAmMixin, DspNfmMixin,
         self.fm_last_sample = 0.0 + 0.0j
         self.nfm_last_sample = 0.0 + 0.0j
         try:
-            self._nfm_sq_below = 0
+            self._nfm_sq_below = int(getattr(self, "_nfm_sq_hang", 5))
         except Exception:
             pass
         self._fm_pll_state[:] = 0.0
@@ -946,7 +946,7 @@ class SdrDspPipeline(DspBlackMagicMixin, DspAmMixin, DspNfmMixin,
         if mode == "NFM":
             audio = self.demodulate_nfm(iq_if)
         elif mode in ("AM", "AM_NARROW"):
-            audio = self.demodulate_am(iq_if)
+            audio = self.demodulate_am(iq_if, mode)
         elif mode in ("USB", "LSB", "CW"):
             iq_48 = self.decimate_with_history(iq_if, self.fir_if_audio, self.audio_decim, "history_ssb2")
             audio = self.demodulate_ssb(iq_48, mode)
@@ -1059,7 +1059,7 @@ class SdrDspPipeline(DspBlackMagicMixin, DspAmMixin, DspNfmMixin,
         # 変調密度が低く同一RMSでもFMより小さく聴こえるため。大音量視聴時の
         # システム音量依存を緩和する。フェージング音声のクレスト約15dBに対し、
         # 後段のルックアヘッドリミッタ (0.98) がピークを抑えるため、
-        # 実測clip率0.2%級でクリップ歪みなし (11.865MHz朝鮮の声で検証)。
+        # 実測clip率0.2%級でクリップ歪みなし (11MHz帯・強フェージング音声サンプルで検証)。
         # 遅延・位相に影響なし。
         if mode == "AM":
             audio_clean = (np.asarray(audio_clean, dtype=np.float32) * 1.68).astype(np.float32)
