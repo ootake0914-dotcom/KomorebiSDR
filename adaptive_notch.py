@@ -48,7 +48,16 @@ class AdaptiveNotchCanceller:
         self.blocks = 0
 
     def _lines_batch(self, xa, freqs):
-        """[(f, 線振幅, 床振幅)] を一括計算 (Cコア1コール＋numpy代替)。"""
+        """[(f, 線振幅, 床振幅)] を一括計算 (Cコア1コール＋numpy代替)。
+        先にDCを除去する: AM復調音声には残留DCが載り、その矩形窓サイド
+        ローブが近傍floorドット (±15/30Hz) に漏れて線SNRを潰す実害を確認
+        (50Hzハム+20%に対しs50が-6.8dB止まりで永続不検出)。
+        DC除去は検出専用で音声には触れない。"""
+        try:
+            xa = np.asarray(xa, dtype=np.float64).reshape(-1)
+            xa = xa - float(np.mean(xa))
+        except Exception:
+            pass
         n = len(xa)
         flist = [float(f) for f in freqs]
         # 各線＋近傍4点 (±15/±30Hz) をまとめて要求する

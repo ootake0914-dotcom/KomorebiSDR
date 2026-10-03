@@ -71,6 +71,7 @@ from dsp_filters import (
     design_fir_highpass,
     design_fir_lowpass,
     suppress_click_transients,
+    blank_impulses_iq,
     _deemph_sections,
 )
 
@@ -372,6 +373,21 @@ class SdrDspPipeline(DspBlackMagicMixin, DspAmMixin, DspNfmMixin,
         self._cma_auto = False
         self.reset_stereo_nr()
         self.am_sync_lock = 0.0
+        # AM側波帯合成の状態も選局でリセット (前局の汚染判定を持ち越さない)
+        self._am_sb_w = 0.0
+        self._am_sb_dirty = False
+        self._am_sb_hold = 0
+        self._am_sb_fest = 0.0
+        self._am_sb_fest_ok = False
+        self._am_sb_phase = 0.0
+        self._am_sb_baseU = None
+        self._am_sb_baseL = None
+        # 狭帯域NRの状態も選局でリセット (前局のノイズPSDを持ち越さない)
+        try:
+            if getattr(self, "nbm_nr", None) is not None:
+                self.nbm_nr.reset()
+        except Exception:
+            pass
         if hasattr(self, "ultra_squelch"):
             self.ultra_squelch.reset()
         if hasattr(self, "cognitive_eq"):
@@ -446,6 +462,10 @@ class SdrDspPipeline(DspBlackMagicMixin, DspAmMixin, DspNfmMixin,
         self.rds_pi = 0
         self.rds_pty = None
         self.rds_groups = 0
+        self.rds_bler = 0.0
+        self.rds_groups_checked = 0
+        self.rds_groups_failed = 0
+        self.rds_sync_losses = 0
 
     def update_resampler_feedback(self, current_chunks: float, dt: float = 0.05):
         """オーディオバッファの残存チャンク数をリサンプラにフィードバック (クロック自動同期)"""

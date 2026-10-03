@@ -103,6 +103,18 @@ class RdsDecoder:
         self._ps = [None] * 8
         self._rt = [None] * 64      # 生バイト値 (0x0D=CR 終端を検出可能にする)
         self._rt_ab = None          # RadioText A/Bフラグ (切替でバッファリセット)
+        # --- BLER計装 (成功カウンタのみだった所へ追加。音声処理には一切触れない) ---
+        # groups_checked: CRC評価した104bitグループ数 (同期中の全評価＋獲得時)。
+        #   未同期サーチ中の全探索試行は数えない (試行数が位置依存で膨らむため)。
+        # groups_failed: CRC不正で破棄したグループ数。sync_losses: 同期喪失回数。
+        # sync_misses: 同期が取れずにpendingを切り捨てた回数 (取りこぼし)。
+        # bler: 失敗率のEMA (1グループ87.6ms、alpha=0.2で約5群≒0.44秒の時定数)。
+        self.groups_checked = 0
+        self.groups_failed = 0
+        self.sync_losses = 0
+        self.sync_misses = 0
+        self.bler = 0.0
+        self.bler_alpha = 0.2
 
     def reset(self):
         """選局・モード切替時にデコーダ状態をリセットする。"""
@@ -121,6 +133,11 @@ class RdsDecoder:
         self.clock = None
         self.groups = 0
         self.blocks = 0
+        self.groups_checked = 0
+        self.groups_failed = 0
+        self.sync_losses = 0
+        self.sync_misses = 0
+        self.bler = 0.0
         self._ps = [None] * 8
         self._rt = [None] * 64
         self._rt_ab = None
@@ -205,6 +222,24 @@ class RdsDecoder:
             v = (v << 1) | b
         return v
 
+    def _note_group_result(self, ok: bool):
+        """BLER計装の共通後段。評価1件ごとにEMAを進める (成功でも失敗でも)。
+        非有限ガードつき (NaN混入でblerが固着しないように)。"""
+        try:
+            self.groups_checked += 1
+            if not ok:
+                self.groups_failed += 1
+            a = float(self.bler_alpha)
+            if not np.isfinite(a):
+                a = 0.2
+            a = min(max(a, 0.01), 1.0)
+            b = float(self.bler)
+            if not np.isfinite(b):
+                b = 0.0 if ok else 1.0
+            self.bler = b + a * ((0.0 if ok else 1.0) - b)
+        except Exception:
+            pass
+
     def _decode_groups(self):
         if not self._sync:
             if len(self._pending) < 130:
@@ -222,6 +257,7 @@ class RdsDecoder:
                     drop = len(self._pending) - 160
                     del self._pending[:drop]
                     self._search_from = max(0, len(self._pending) - 104 + 1)
+                    self.sync_misses += 1
                 else:
                     self._search_from = max(0, len(self._pending) - 104 + 1)
                 return
@@ -234,10 +270,13 @@ class RdsDecoder:
             # 同期後もCRCを再検証する (ノイズ・ビットずれによる誤PS/RT防止)。
             # 1ブロックでも不正なら同期を外して再探索へ (ずれ続けると誤情報を出すため)。
             if not self._group_valid(group):
+                self._note_group_result(False)
                 self._sync = False
+                self.sync_losses += 1
                 self._search_from = 0
                 self._pending = group + self._pending  # 捨てずに再探索へ
                 break
+            self._note_group_result(True)
             self._process_group(group)
 
     def _process_group(self, bits: list):

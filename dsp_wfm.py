@@ -440,6 +440,11 @@ class DspWfmMixin:
                 self.rds_pi = self.rds.pi
                 self.rds_pty = self.rds.pty
                 self.rds_groups = self.rds.groups
+                # BLER早期警報用に失敗計装も公開 (制御への使用は相関確認までは行わない)
+                self.rds_bler = float(getattr(self.rds, "bler", 0.0))
+                self.rds_groups_checked = int(getattr(self.rds, "groups_checked", 0))
+                self.rds_groups_failed = int(getattr(self.rds, "groups_failed", 0))
+                self.rds_sync_losses = int(getattr(self.rds, "sync_losses", 0))
             except Exception:
                 pass
 
@@ -1454,6 +1459,11 @@ class DspWfmMixin:
         self.rds_pi = 0
         self.rds_pty = None
         self.rds_groups = 0
+        # BLER早期警報用 (デコーダ未生成時の既定。feed後に実値で上書き)
+        self.rds_bler = 0.0
+        self.rds_groups_checked = 0
+        self.rds_groups_failed = 0
+        self.rds_sync_losses = 0
         # BS.450/EN 50067準拠キャリア生成のため追加回転は不要 (0.0)
         self.rds_phase_offset = 0.0
         self._stereo_blend = 0.0

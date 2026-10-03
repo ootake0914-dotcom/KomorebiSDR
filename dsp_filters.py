@@ -90,6 +90,61 @@ def suppress_click_transients(audio: np.ndarray, threshold: float = 0.48) -> np.
     return out
 
 
+def blank_impulses_iq(iq_if: np.ndarray, thr_k: float = 6.0,
+                       thr_ratio: float = 2.5, max_width: int = 48,
+                       max_rate: float = 0.02, stride: int = 16) -> np.ndarray:
+    """IQドメインのインパルスノイズブランカ (モード共通の正準実装)。
+    振幅包絡の中央値/MAD基準で孤立パルスだけを検出し、端点コサイン補間で消去する。
+    変調ピークや選択性フェージングの谷には触れない (長い区間は残す)。
+    検出率がmax_rate超のブロックは信号とみなして無処理 (安全装置)。
+    AM (288kHz, max_width=48) から純粋移動したもので、NFM (288kHz)・
+    SSB (48kHz, max_width=8へスケール) でパラメータのみ変えて使う。
+    """
+    try:
+        n = len(iq_if)
+    except Exception:
+        return iq_if
+    if n < 64:
+        return iq_if
+    try:
+        mag = np.abs(iq_if).astype(np.float32)
+        # 統計は間引き＋partition直取り (np.medianはNaN検査経路で遅い。
+        # 期待値同一のため検出性能不変。順序統計量単点で十分)
+        sm = mag[::stride] if n > 256 else mag
+        k = len(sm) // 2
+        med = float(np.partition(sm, k)[k])
+        if med < 1e-9:
+            return iq_if
+        dev = np.abs(sm - med)
+        mad = float(np.partition(dev, k)[k]) + 1e-12
+        thr = max(med + thr_k * mad, med * thr_ratio)
+        mask = mag > thr
+        if float(np.mean(mask)) > max_rate:
+            return iq_if
+        edges = np.diff(mask.astype(np.int8))
+        starts = list(np.flatnonzero(edges == 1) + 1)
+        ends = list(np.flatnonzero(edges == -1) + 1)
+        if mask[0]:
+            starts.insert(0, 0)
+        if mask[-1]:
+            ends.append(n)
+        if not starts:
+            return iq_if
+        out = iq_if.copy()
+        for s, e in zip(starts[:512], ends[:512]):
+            if e - s > max_width:
+                continue  # 長い区間は信号として残す
+            l = out[s - 1] if s > 0 else out[e]
+            r = out[e] if e < n else l
+            kk = (e - s)
+            # Smooth cosine interpolation prevents phase/envelope kinks
+            w = 0.5 * (1.0 - np.cos(np.pi * np.arange(1, kk + 1, dtype=np.float32) / (kk + 1.0)))
+            out[s:e] = (l * (1.0 - w) + r * w).astype(out.dtype)
+        return out
+    except Exception:
+        return iq_if
+
+
 def _deemph_sections(tau_us: float):
     """時定数に対応する2縦続1次IIR係数 [(b0,b1,minus_a1)×2] を返す。
     48kHz用に実測フィットした値で、アナログ1次LPF特性に帯域内±0.03dBで一致。

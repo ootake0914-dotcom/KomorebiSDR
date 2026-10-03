@@ -6,11 +6,16 @@
 
 import numpy as np
 
-from dsp_filters import design_fir_kaiser
+from dsp_filters import design_fir_kaiser, blank_impulses_iq
 from dsp_native import (
     _NATIVE,
     _fptr,
 )
+
+try:
+    from narrowband_nr import NarrowbandNr
+except ImportError:
+    NarrowbandNr = None
 
 
 class DspNfmMixin:
@@ -75,7 +80,14 @@ class DspNfmMixin:
             except Exception:
                 pass
 
-        # 1. ハードリミッター適用
+        # 1. ハードリミッター適用 (前段でIQインパルスを除去。
+        #    NFMは定包絡のため振幅スパイクは雑音と断定できる。
+        #    AMと同一の正準実装・IF帯パラメータ。既定ON)
+        if bool(getattr(self, "nfm_impulse_blanker_enabled", True)):
+            try:
+                iq_if = blank_impulses_iq(iq_if)
+            except Exception:
+                pass
         limited = self._apply_hard_limiter(iq_if)
 
         # 2. 瞬時位相差分法 (FM復調)
@@ -121,6 +133,18 @@ class DspNfmMixin:
         # 7. 通信用300Hz音声ハイパスフィルタ
         audio = self._apply_voice_highpass(audio)
 
+        # 狭帯域音声NR (既定OFF。定常ヒス専用の古典LSA。WFMのRMTとは別物で
+        # 狭帯域でも壊れない設計。ON時のみ追加コスト約5ms/ブロック)
+        if bool(getattr(self, "nbm_nr_enabled", False)):
+            try:
+                if getattr(self, "nbm_nr", None) is None and NarrowbandNr is not None:
+                    self.nbm_nr = NarrowbandNr("NFM")
+                if self.nbm_nr is not None:
+                    audio = self.nbm_nr.process(audio, preset="NFM")
+                    audio = np.asarray(audio, dtype=np.float32)
+            except Exception:
+                pass
+
         # NFM経路のRMTは不採用 (狭帯域誤作動。verdict参照)
         # NFM経路のSR検出プローブ (既定OFF。confidence公開のみ)
         try:
@@ -147,6 +171,15 @@ class DspNfmMixin:
         USB=+1.5kHz帯, LSB=-1.5kHz帯, CW=+650Hz±350Hz (BFOで微調整可能)。"""
         if len(iq_48) == 0:
             return np.zeros(0, dtype=np.float32)
+
+        # IQインパルス除去 (48kHz複素IF。パルス幅は帯域比でスケール:
+        # 288kHzの48サンプル ≒ 48kHzの8サンプル=167μs。音声立ち上がりは
+        # msオーダーのため触れない。既定ON)
+        if bool(getattr(self, "ssb_impulse_blanker_enabled", True)):
+            try:
+                iq_48 = blank_impulses_iq(iq_48, max_width=8)
+            except Exception:
+                pass
 
         if mode == "USB":
             center, taps, attr = 1500.0, self.fir_ssb_lp, "history_ssb_lp"
@@ -201,6 +234,18 @@ class DspNfmMixin:
         audio = self._apply_voice_highpass(audio)
         # 下限2.2k→2.5kHzへ (了解度の下限を確保しつつ自動狭窄は維持)
         audio = self._voice_bandwidth(audio, 3000.0, 2500.0)
+        # 狭帯域音声NR (既定OFF。SSBはSSBプリセット、CWはCWプリセット。
+        # ピッチ・BFOサーボの前に置く (NRで重心が動く前に終わらせる))
+        if bool(getattr(self, "nbm_nr_enabled", False)):
+            try:
+                if getattr(self, "nbm_nr", None) is None and NarrowbandNr is not None:
+                    self.nbm_nr = NarrowbandNr("SSB")
+                if self.nbm_nr is not None:
+                    audio = self.nbm_nr.process(
+                        audio, preset=("CW" if mode == "CW" else "SSB"))
+                    audio = np.asarray(audio, dtype=np.float32)
+            except Exception:
+                pass
         # SSB/CW経路のRMTは不採用 (狭帯域誤作動。verdict参照)
         # CW自動ピッチ (既定ON): 400-1000Hzのピークを650Hzへ寄せる。
         # SSB自動BFO (既定ON): 音声重心サーボ。抑圧搬送波にPLLは効かないため、
@@ -351,6 +396,12 @@ class DspNfmMixin:
         self.nfm_last_sample = 0.0 + 0.0j
         self.nfm_afc_offset_hz = 0.0
         self.nfm_afc_alpha = 0.08  # ISSドップラー追従用時定数
+        # IQインパルスブランカ (AM正準実装の流用。NFM/SSBは既定ON、WFMは未配線=OFF)
+        self.nfm_impulse_blanker_enabled = True
+        self.ssb_impulse_blanker_enabled = True
+        # 狭帯域音声NR (既定OFF。ON時のみ遅延生成。プリセット切替でリセット)
+        self.nbm_nr_enabled = False
+        self.nbm_nr = None
         # NFMスケルチのハングオーバ (AM/SSB搬送波AGCのhangと同型の共有技術):
         # 開→閉は5ブロック連続で閾値割れしてから (語間パタつき防止)、
         # 閉→開は即時 (立ち上がり欠け防止)。
