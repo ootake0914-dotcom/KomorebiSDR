@@ -40,6 +40,12 @@ TOLS = {
     "real_fm_lucky60_nr_gain_min": 0.10,
     "real_fm_nhk60_hiss_db": 1.0,
     "real_fm_nhk60_nr_gain_min": 0.15,
+    "wfm_fr_excess_15k_db": 0.8,
+    "wfm_sep_1k_db": 1.5,
+    "wfm_thd_overmod_db": 1.5,
+    "wfm_clip_pin_frac": 0.002,
+    "real_fm_lucky60_clip_flat_frac": 0.002,
+    "real_fm_nhk60_clip_flat_frac": 0.002,
 }
 
 
@@ -85,6 +91,62 @@ def _band_floor(x, lo, hi, q=10, n=2752):
         x[k * n:(k + 1) * n] * np.hanning(n)))[sel] ** 2))
         for k in range(len(x) // n)]
     return 10 * np.log10(np.percentile(vals, q) + 1e-24)
+
+
+DEEMPH_US = 50.0
+
+
+def _wfm_tone_raw(freq_hz, dev_hz=75000.0, l_amp=0.95, r_amp=0.0, dur=4.0,
+                  pilot=0.09):
+    """ラボ用: プリエンファシス無しステレオMPXトーン→FM→ADC生uint8。"""
+    rf = 1152000.0
+    n = int(dur * rf)
+    t = np.arange(n) / rf
+    l = l_amp * np.sin(2 * np.pi * freq_hz * t)
+    r = r_amp * np.sin(2 * np.pi * freq_hz * t)
+    mpx = (0.45 * (l + r) + 0.45 * (l - r) * np.sin(2 * np.pi * 38000.0 * t)
+           + pilot * np.sin(2 * np.pi * 19000.0 * t))
+    mpx = mpx / (float(np.max(np.abs(mpx))) + 1e-9)
+    ph = 2 * np.pi * float(dev_hz) * np.cumsum(mpx) / rf
+    iq = 0.6 * np.exp(1j * ph)
+    raw = np.empty(2 * len(iq), dtype=np.uint8)
+    raw[0::2] = np.clip(np.round(iq.real * 127.5 + 127.5), 0, 255)
+    raw[1::2] = np.clip(np.round(iq.imag * 127.5 + 127.5), 0, 255)
+    return raw
+
+
+def _tone_pow(x, f, fs=FS):
+    x = np.asarray(x, dtype=np.float64)
+    x = x - x.mean()
+    n = len(x)
+    X = np.abs(np.fft.rfft(x * np.hanning(n))) ** 2
+    i = int(round(f * n / fs))
+    return float(np.sum(X[max(0, i - 2):i + 3]))
+
+
+def _thd_plus_n(x, f, fs=FS, lo=20.0, hi=20000.0):
+    x = np.asarray(x, dtype=np.float64)
+    x = x - x.mean()
+    n = len(x)
+    X = np.abs(np.fft.rfft(x * np.hanning(n))) ** 2
+    fr = np.fft.rfftfreq(n, 1.0 / fs)
+    i0, i1 = int(lo * n / fs), int(hi * n / fs)
+    fund = res = 0.0
+    for i in range(i0, i1 + 1):
+        if abs(fr[i] - f) <= 3.0:
+            fund += X[i]
+        else:
+            res += X[i]
+    return float(10.0 * np.log10(res / (fund + 1e-24) + 1e-24))
+
+
+def _deemph_db(f, tau_us=DEEMPH_US):
+    return -10.0 * np.log10(1.0 + (2 * np.pi * f * tau_us * 1e-6) ** 2)
+
+
+def _clip_flat_frac(x, tol=1e-4):
+    x = np.asarray(x)
+    return float(np.mean(np.abs(np.abs(x) - 1.0) < tol))
 
 
 def measure(full=False):
@@ -187,6 +249,45 @@ def measure(full=False):
         float(np.sqrt(np.mean(b1[:nn] ** 2))) /
         (float(np.sqrt(np.mean(b0[:nn] ** 2))) + 1e-18) + 1e-18)
 
+    # 7) WFM前面特性 (wide設定・NR/AGC/認知OFF): 15k超過減衰/分離度/過変調歪
+    def _wf_front():
+        d = SdrDspPipeline(1152000, FS)
+        d.set_offset_freq(0.0)
+        d.afc_enabled = False
+        d.cognitive_enabled = False
+        d.slow_agc_enabled = False
+        d.filter_mode = "wide"
+        d.set_stereo_nr(False)
+        if hasattr(d, "set_stereo_enabled"):
+            d.set_stereo_enabled(True)
+        return d
+
+    y_low = _decode_stereo(_wf_front(), _wfm_tone_raw(1000.0), BLOCK_WFM)[:, 0]
+    y_hi = _decode_stereo(_wf_front(), _wfm_tone_raw(15000.0), BLOCK_WFM)[:, 0]
+    meas = 10.0 * np.log10(_tone_pow(y_hi[-FS:], 15000.0)
+                           / (_tone_pow(y_low[-FS:], 1000.0) + 1e-24) + 1e-24)
+    m["wfm_fr_excess_15k_db"] = float(
+        meas - (_deemph_db(15000.0) - _deemph_db(1000.0)))
+    y_sep = _decode_stereo(_wf_front(), _wfm_tone_raw(1000.0, dur=5.0),
+                           BLOCK_WFM)
+    seg = y_sep[-FS:]
+    m["wfm_sep_1k_db"] = float(10.0 * np.log10(
+        (_tone_pow(seg[:, 0], 1000.0) + 1e-24)
+        / (_tone_pow(seg[:, 1], 1000.0) + 1e-24)))
+    y_om = _decode_stereo(_wf_front(), _wfm_tone_raw(1000.0, dev_hz=100000.0),
+                          BLOCK_WFM)[:, 0]
+    m["wfm_thd_overmod_db"] = _thd_plus_n(y_om[-FS:], 1000.0)
+    # ハードクリップ固定率は process のリサンプラで平滑化されるため、
+    # 復調直後 (demodulate_wfm) を直接見る
+    d = _wf_front()
+    raw = _wfm_tone_raw(1000.0, dev_hz=100000.0)
+    iq_if = d.decimate(d.mix_frequency(d.raw_to_iq(raw), mode="WFM"),
+                       d.fir_if, d.if_decim)
+    y_pin = np.asarray(d.demodulate_wfm(iq_if))
+    if y_pin.ndim == 2:
+        y_pin = y_pin[:, 0]
+    m["wfm_clip_pin_frac"] = _clip_flat_frac(y_pin[-FS:])
+
     if full:
         from fast import CachedAsr
         from cer_ab import cer
@@ -217,6 +318,7 @@ def measure(full=False):
                 m[f"real_{name}_hiss_db"] = (_band_floor(s1, 8000, 12000)
                                              - _band_floor(s0, 8000, 12000))
                 m[f"real_{name}_nr_gain_min"] = float(info["nr_gain_min"])
+                m[f"real_{name}_clip_flat_frac"] = _clip_flat_frac(y0[FS * 2:])
         except Exception as e:
             print(f"real metrics skipped: {e}")
     return m

@@ -2,10 +2,10 @@
   "version": 1,
   "full": true,
   "provenance": {
-    "date": "2026-10-04T05:41:45",
+    "date": "2026-10-04T06:37:27",
     "python": "3.11.15",
     "numpy": "2.4.6",
-    "git_head": "7818dc9",
+    "git_head": "d129a10",
     "git_dirty": true,
     "faster_whisper": "1.2.1",
     "onnxruntime": "1.30.0",
@@ -21,15 +21,15 @@
       "tol": 0.8
     },
     "wfm_side_hiss_db": {
-      "value": -8.323660090492552,
+      "value": -7.844101486643822,
       "tol": 0.8
     },
     "wfm_mid_err_db": {
-      "value": -136.72842407226562,
+      "value": -136.57733154296875,
       "tol": 1.5
     },
     "am_sinr_gain_db": {
-      "value": 0.4375778774371431,
+      "value": 0.43751725858222523,
       "tol": 1.0
     },
     "nr_ssb_delta_rms_db": {
@@ -45,20 +45,44 @@
       "tol": 0.08
     },
     "real_fm_lucky60_hiss_db": {
-      "value": -13.411586978339908,
+      "value": -11.717692141628692,
       "tol": 1.0
     },
     "real_fm_lucky60_nr_gain_min": {
-      "value": 1.0,
+      "value": 0.870498082561883,
       "tol": 0.1
     },
     "real_fm_nhk60_hiss_db": {
-      "value": -0.04648856044793348,
+      "value": -0.053307123284525915,
       "tol": 1.0
     },
     "real_fm_nhk60_nr_gain_min": {
       "value": 1.0,
       "tol": 0.15
+    },
+    "wfm_fr_excess_15k_db": {
+      "value": -0.12914507264276587,
+      "tol": 0.8
+    },
+    "wfm_sep_1k_db": {
+      "value": 29.192069886164123,
+      "tol": 1.5
+    },
+    "wfm_thd_overmod_db": {
+      "value": -35.1657245673223,
+      "tol": 1.5
+    },
+    "wfm_clip_pin_frac": {
+      "value": 2.0833333333333333e-05,
+      "tol": 0.002
+    },
+    "real_fm_lucky60_clip_flat_frac": {
+      "value": 5.210968765812595e-06,
+      "tol": 0.002
+    },
+    "real_fm_nhk60_clip_flat_frac": {
+      "value": 0.0,
+      "tol": 0.002
     }
   }
 }
