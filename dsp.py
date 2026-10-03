@@ -203,6 +203,12 @@ class SdrDspPipeline(DspBlackMagicMixin, DspAmMixin, DspNfmMixin,
         self.hf_gain_applied = 1.0
         self.cognitive_alpha = 0.18  # 1フレームあたりの平滑追従率 (ポップノイズ抑制)
         self._if_snr_db = 10.0  # WFM復調前の局所チャンネルSNR推定（IFモーフィング用）
+        # 隣接チャンネル妨害のD/U推定 (左右別。大きいほど隣接が弱い)
+        self._aci_l_db = 99.0
+        self._aci_r_db = 99.0
+        # 隣接帯がノイズ床上どれだけ高いか (ACI発動のゲート)
+        self._aci_l_above_db = 0.0
+        self._aci_r_above_db = 0.0
         self._fir_cache = OrderedDict()
 
 
@@ -663,6 +669,43 @@ class SdrDspPipeline(DspBlackMagicMixin, DspAmMixin, DspNfmMixin,
             return None
         return float(snr_db)
 
+    @staticmethod
+    def _wfm_aci_db(spectrum_db: np.ndarray, rf_rate: float):
+        """隣接チャンネル妨害 (ACI) のD/U推定 (左右別)。
+
+        自局 ±85kHz 平均電力と ±110〜300kHz の隣接帯平均電力を比較する。
+        戻り値 (left_db, right_db) は D/U = 10log10(自局/隣接)。負値=隣接が
+        強い。自局占有帯域 (±100kHz) を除外し、隣接局の裾を拾う。
+        """
+        if spectrum_db is None:
+            return None
+        spec = np.asarray(spectrum_db, dtype=np.float64).reshape(-1)
+        if len(spec) < 128:
+            return None
+        spec = np.nan_to_num(spec, nan=-120.0, posinf=0.0, neginf=-120.0)
+        lin = np.power(10.0, spec / 10.0)
+        n = len(lin)
+        c = n // 2
+        bin_hz = float(rf_rate) / float(n)
+        own_half = max(4, int(85000.0 / bin_hz))
+        i_in = max(2, int(110000.0 / bin_hz))
+        i_out = min(c - 2, int(300000.0 / bin_hz))
+        if i_out <= i_in or c - i_out < 0:
+            return None
+        own = float(np.mean(lin[c - own_half: c + own_half + 1])) + 1e-12
+        left = float(np.mean(lin[c - i_out: c - i_in])) + 1e-12
+        right = float(np.mean(lin[c + i_in: c + i_out])) + 1e-12
+        noise_p = float(np.percentile(lin, 25)) + 1e-12
+        du_l = 10.0 * np.log10(own / left)
+        du_r = 10.0 * np.log10(own / right)
+        # 隣接帯がノイズ床上どれだけ高いか (低ゲイン録音の床を隣接局と
+        # 誤認しないためのガード。真の隣接局は床より十分高い)
+        above_l = 10.0 * np.log10(left / noise_p)
+        above_r = 10.0 * np.log10(right / noise_p)
+        if not all(np.isfinite(v) for v in (du_l, du_r, above_l, above_r)):
+            return None
+        return (float(du_l), float(du_r), float(above_l), float(above_r))
+
     def _update_cognitive_morph(self, if_snr_db=None, mode="WFM"):
         """離散切替ではなくサンプル単位で滑らかにフィルタを変形 (クリック・ポップ抑制)
 
@@ -950,6 +993,15 @@ class SdrDspPipeline(DspBlackMagicMixin, DspAmMixin, DspNfmMixin,
         # 過渡ショックだけを抑える（最終帯域＝Hyper目標のまま）。
         if mode == "WFM":
             _if_snr = self._wfm_if_snr_db(spectrum_db, self.rf_rate)
+            # 隣接妨害D/U (左右別) も毎ブロック更新する (制御・表示用)
+            _aci = self._wfm_aci_db(spectrum_db, self.rf_rate)
+            if _aci is not None:
+                _dt = len(iq_shifted) / float(self.rf_rate)
+                _aa = 1.0 - float(np.exp(-_dt / 0.5))
+                self._aci_l_db += _aa * (_aci[0] - self._aci_l_db)
+                self._aci_r_db += _aa * (_aci[1] - self._aci_r_db)
+                self._aci_l_above_db += _aa * (_aci[2] - self._aci_l_above_db)
+                self._aci_r_above_db += _aa * (_aci[3] - self._aci_r_above_db)
             if self.cognitive_enabled:
                 self._update_cognitive_morph(_if_snr, mode="WFM")
             else:

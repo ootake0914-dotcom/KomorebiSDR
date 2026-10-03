@@ -154,7 +154,7 @@ class DspWfmMixin:
                 if self.stereo_nr_enabled:
                     cut = self._nr_cut_eff
                     blend = self._stereo_blend * self.stereo_nr_gain
-                    blend *= self.multipath_gain
+                    blend *= self.multipath_gain * self.aci_gain
                     diff = self._diff_lowpass(diff_raw, cut)
                     diff = self._wiener_diff(diff)
                     # 周波数依存ブレンド: 弱電界で高域から先にモノラル化
@@ -168,7 +168,8 @@ class DspWfmMixin:
                     # mono遅延履歴だけは更新し、再有効時の継ぎ目を無くす
                     # (出力は遅延させない。遅延させると未遅延diffと2msずれる)。
                     stereo_diff = (diff_raw
-                                   * (self._stereo_blend * self.multipath_gain)).astype(np.float32)
+                                   * (self._stereo_blend * self.multipath_gain
+                                      * self.aci_gain)).astype(np.float32)
                     self._delay_mono(mono)
                     self.stereo_wiener_gain = 1.0
 
@@ -232,7 +233,7 @@ class DspWfmMixin:
                 except Exception:
                     pass
             blend = self._stereo_blend * (self.stereo_nr_gain if self.stereo_nr_enabled else 1.0) \
-                * self.multipath_gain
+                * self.multipath_gain * self.aci_gain
             self.is_stereo = blend > 0.5
             if blend > 0.85:
                 self.stereo_status = "STEREO"
@@ -270,6 +271,19 @@ class DspWfmMixin:
             tau = 1.5 if s > self.multipath_amount else 2.5
             self.multipath_amount += (1.0 - np.exp(-dt_mp / tau)) * (s - self.multipath_amount)
             self.multipath_gain = 1.0 - self.mp_depth * self.multipath_amount
+
+        # 0b. 隣接妨害 (ACI) ガード: 左右どちらかのD/Uが12dB未満なら、L-R側を
+        # 最大60%絞る (周波数依存ブレンドと併用で高域から先にモノラル化)。
+        # ACIは38kHz副搬送波を先に汚すため、モノラル音声よりL-Rを守る方が効く。
+        # 隣接帯がノイズ床+6dB未満の側は「局ではなく床」とみなし発動しない。
+        _du_l = float(self._aci_l_db) if self._aci_l_above_db > 6.0 else 99.0
+        _du_r = float(self._aci_r_db) if self._aci_r_above_db > 6.0 else 99.0
+        _min_du = min(_du_l, _du_r)
+        _x = float(np.clip((12.0 - _min_du) / 12.0, 0.0, 1.0))
+        _aci_target = 1.0 - self.aci_depth * _x
+        dt_a = len(iq_if) / float(self.if_rate)
+        tau_a = 0.3 if _aci_target < self.aci_gain else 1.5
+        self.aci_gain += (1.0 - float(np.exp(-dt_a / tau_a))) * (_aci_target - self.aci_gain)
 
         # 1. CMA等化 (マルチパス・キャンセル) + ハードリミッター適用
         use_cma = self._update_cma_auto_gate()
@@ -1725,6 +1739,12 @@ class DspWfmMixin:
         self.multipath_enabled = True
         self.multipath_amount = 0.0
         self.multipath_gain = 1.0
+        # 隣接妨害 (ACI) ガード: 左右いずれかのD/U悪化でL-R側を先に絞る
+        # (38kHz副搬送波が先に汚れるため)。クリーン時は1.0でビット等価。
+        # depth=0 (既定OFF) は検出・テレメトリのみ。耳テスト後に有効化する
+        # (sweep hook: aci.depth、ABで採否を決める)。
+        self.aci_gain = 1.0
+        self.aci_depth = 0.0
         self._mp_var = 0.0
         self.mp_lo = 0.10
         self.mp_hi = 0.35

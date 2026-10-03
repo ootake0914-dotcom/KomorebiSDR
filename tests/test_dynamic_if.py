@@ -22,6 +22,25 @@ def test_wfm_if_snr_estimator():
     print("[OK] IF SNR estimator")
 
 
+def test_wfm_aci_estimator():
+    n = 1024
+    spec = np.full(n, -90.0)
+    c = n // 2
+    spec[c - 75:c + 76] = 5.0        # 自局 (±85kHz)
+    spec[c + 100:c + 160] = 15.0     # 右隣接が自局より10dB強い
+    r = SdrDspPipeline._wfm_aci_db(spec, 1152000.0)
+    assert r is not None
+    du_l, du_r, ab_l, ab_r = r
+    assert du_r < -5.0, f"right ACI not detected: {du_r:.1f} dB"
+    assert du_l > 20.0, f"left side should be clean: {du_l:.1f} dB"
+    assert ab_r > ab_l, "adjacent-above-floor should flag the right side"
+    flat = np.full(n, -80.0)
+    r0 = SdrDspPipeline._wfm_aci_db(flat, 1152000.0)
+    assert r0 is not None and abs(r0[0]) < 3.0 and abs(r0[1]) < 3.0
+    assert SdrDspPipeline._wfm_aci_db(np.zeros(10), 1152000.0) is None
+    print("[OK] ACI estimator")
+
+
 def test_if_morph_snr_slew():
     dsp = SdrDspPipeline(1152000, 48000)
     dsp.cognitive_enabled = True
@@ -43,5 +62,6 @@ def test_if_morph_snr_slew():
 
 if __name__ == "__main__":
     test_wfm_if_snr_estimator()
+    test_wfm_aci_estimator()
     test_if_morph_snr_slew()
     print("\nALL DYNAMIC IF TESTS PASSED!")

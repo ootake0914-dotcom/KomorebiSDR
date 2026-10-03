@@ -66,6 +66,7 @@ HOOKS = {
         (d._wf_mask_offset_vec * np.float32(v)).astype(np.float32)),
     "wf.gmin": lambda d, v, c: setattr(d, "_nr_gmin", float(v)),
     "agc.hyst": lambda d, v, c: setattr(d, "_agc_hyst_db", float(v)),
+    "aci.depth": lambda d, v, c: setattr(d, "aci_depth", float(v)),
 }
 BASE_HOOK = {"SSB": "nr.on", "NFM": "nr.on", "CW": "nr.on",
              "AM": "am.on", "WFM": "wfm.on"}

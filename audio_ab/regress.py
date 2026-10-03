@@ -52,6 +52,8 @@ TOLS = {
     "wfm_if_stop_106k_db": 3.0,
     "wfm_if_alias_200k_db": 3.0,
     "wfm_adj_sisdr_db": 1.0,
+    "wfm_aci_du_r_db": 2.0,
+    "wfm_aci_above_r_db": 3.0,
 }
 
 
@@ -323,6 +325,14 @@ def measure(full=False):
     ya = _decode_stereo(_wf_pipe(False), wf_adj, BLOCK_WFM)
     nn_adj = min(len(y0), len(ya))
     m["wfm_adj_sisdr_db"] = si_sdr(y0[:nn_adj, 0], ya[:nn_adj, 0], align=True)
+
+    # 7d) ACI検出: +200kHz・+10dBの強妨害で右側D/Uが下がる (床ガード付き)
+    wf_adj10 = build("wfm-adjacent", utts2, 20.0, seed=99,
+                     intf_db=10.0, offset_hz=200000.0)
+    d_a10 = _wf_pipe(False)
+    _decode_stereo(d_a10, wf_adj10, BLOCK_WFM)
+    m["wfm_aci_du_r_db"] = float(d_a10._aci_r_db)
+    m["wfm_aci_above_r_db"] = float(d_a10._aci_r_above_db)
 
     # 8) TDA位相スリップ補修: 既知スリップ注入時のクリーン基準との誤差低減
     rf = 1152000.0
