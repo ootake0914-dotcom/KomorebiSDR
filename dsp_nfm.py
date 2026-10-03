@@ -175,9 +175,11 @@ class DspNfmMixin:
         # IQインパルス除去 (48kHz複素IF。パルス幅は帯域比でスケール:
         # 288kHzの48サンプル ≒ 48kHzの8サンプル=167μs。音声立ち上がりは
         # msオーダーのため触れない。既定ON)
+        # thr_k=8: 合成パルス+音声のCER実測 (3シード) でk=6比 回復+0.02・
+        # クリーン誤検出1/3 (435/1280サンプル)・SIG劣化なし。k>=9は回復低下。
         if bool(getattr(self, "ssb_impulse_blanker_enabled", True)):
             try:
-                iq_48 = blank_impulses_iq(iq_48, max_width=8)
+                iq_48 = blank_impulses_iq(iq_48, thr_k=8.0, max_width=8)
             except Exception:
                 pass
 
