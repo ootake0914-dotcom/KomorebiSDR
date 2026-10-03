@@ -34,6 +34,10 @@ assets_screenshot_test.png
 *.raw
 *.iq
 *.bin
+testdata/day_*.npy
+testdata/night_*.npy
+testdata/*_rec_*.npy
+
 
 # Audio AB artefacts (large binaries / local model weights)
 audio_ab/out/
