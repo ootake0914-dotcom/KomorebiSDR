@@ -162,14 +162,38 @@ def _demod_blocks(dsp, data, fn, nblk, blen):
 
 
 def t_nr_ssb(noise="white", secs=10, snr_db=5.0):
+    # 正しいSSB合成 (ssb_synth): 解析信号ベースバンド直入れ。
+    # 実信号への+1500Hz掛けはDSBになり了解度が壊れるため禁止。
+    import sys as _sys
+    _sys.path.insert(0, os.path.join(ROOT, "audio_ab"))
+    from ssb_synth import noisy_ssb_iq, analytic
     n = FS * secs
     v = _vowel_paused(n, seed=2) * 0.5
-    nz = _white(n, seed=3) if noise == "white" else _pink_kellet(n, seed=3)
-    nz = nz / (float(np.sqrt(np.mean(nz.astype(np.float64) ** 2))) + 1e-12)
-    nz = (nz * np.sqrt(float(np.mean(v.astype(np.float64) ** 2))
-                       / (10.0 ** (snr_db / 10.0)))).astype(np.float32)
-    t = np.arange(n) / FS
-    iq = ((v + nz) * np.exp(1j * 2 * np.pi * 1500.0 * t)).astype(np.complex64)
+    if noise == "pink":
+        # 複素ピンク雑音 (I/Q独立Kellet)。USB帯域内のみ効くのは白色と同一。
+        def _pink_stream(seed):
+            rng = np.random.default_rng(seed)
+            w = rng.standard_normal(n)
+            b = np.zeros(7)
+            y = np.zeros(n)
+            for i, x in enumerate(w):
+                b[0] = 0.99886 * b[0] + x * 0.0555179
+                b[1] = 0.99332 * b[1] + x * 0.0750759
+                b[2] = 0.96900 * b[2] + x * 0.1538520
+                b[3] = 0.86650 * b[3] + x * 0.3104856
+                b[4] = 0.55000 * b[4] + x * 0.5329522
+                b[5] = -0.7616 * b[5] - x * 0.0168980
+                y[i] = (b[0] + b[1] + b[2] + b[3] + b[4] + b[5] + b[6] + x * 0.5362)
+                b[6] = x * 0.115926
+            return (y * 0.11).astype(np.float32)
+        yr, yi = _pink_stream(3), _pink_stream(33)
+        nz = (yr + 1j * yi).astype(np.complex64)
+        nz = nz / (float(np.sqrt(np.mean(np.abs(nz) ** 2))) + 1e-12)
+        sig_pow = float(np.mean(v.astype(np.float64) ** 2))
+        nz = (nz * np.sqrt(sig_pow / (10.0 ** (snr_db / 10.0)))).astype(np.complex64)
+        iq = (np.asarray(analytic(v), dtype=np.complex64) + nz).astype(np.complex64)
+    else:
+        iq = noisy_ssb_iq(v, snr_db, seed=3)
     bl = 2208
     nb = n // bl
     d0 = SdrDspPipeline(1152000, FS)
