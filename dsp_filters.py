@@ -107,7 +107,11 @@ def blank_impulses_iq(iq_if: np.ndarray, thr_k: float = 6.0,
     if n < 64:
         return iq_if
     try:
-        mag = np.abs(iq_if).astype(np.float32)
+        mag = np.abs(iq_if)
+        # complex64入力ではabsが既にfloat32。astypeの二重コピーを避ける
+        # (complex128入力時のみ変換)
+        if mag.dtype != np.float32:
+            mag = mag.astype(np.float32)
         # 統計は間引き＋partition直取り (np.medianはNaN検査経路で遅い。
         # 期待値同一のため検出性能不変。順序統計量単点で十分)
         sm = mag[::stride] if n > 256 else mag
@@ -115,15 +119,20 @@ def blank_impulses_iq(iq_if: np.ndarray, thr_k: float = 6.0,
         med = float(np.partition(sm, k)[k])
         if med < 1e-9:
             return iq_if
-        dev = np.abs(sm - med)
+        dev = sm - med
+        # 絶対値は二乗和ではなく符号付き偏差の順序統計なのでabsが要る
+        # (madは絶対偏差の中央値。負値は中央値より下で無視される)
+        np.abs(dev, out=dev)
         mad = float(np.partition(dev, k)[k]) + 1e-12
         thr = max(med + thr_k * mad, med * thr_ratio)
         mask = mag > thr
         if float(np.mean(mask)) > max_rate:
             return iq_if
-        edges = np.diff(mask.astype(np.int8))
-        starts = list(np.flatnonzero(edges == 1) + 1)
-        ends = list(np.flatnonzero(edges == -1) + 1)
+        # 立ち上がり/立ち下がりをbool演算で直接抽出 (diff+astypeの2確保を排除)
+        rise = mask[1:] & ~mask[:-1]
+        fall = ~mask[1:] & mask[:-1]
+        starts = list(np.flatnonzero(rise) + 1)
+        ends = list(np.flatnonzero(fall) + 1)
         if mask[0]:
             starts.insert(0, 0)
         if mask[-1]:
@@ -131,15 +140,45 @@ def blank_impulses_iq(iq_if: np.ndarray, thr_k: float = 6.0,
         if not starts:
             return iq_if
         out = iq_if.copy()
-        for s, e in zip(starts[:512], ends[:512]):
-            if e - s > max_width:
-                continue  # 長い区間は信号として残す
-            l = out[s - 1] if s > 0 else out[e]
-            r = out[e] if e < n else l
-            kk = (e - s)
-            # Smooth cosine interpolation prevents phase/envelope kinks
-            w = 0.5 * (1.0 - np.cos(np.pi * np.arange(1, kk + 1, dtype=np.float32) / (kk + 1.0)))
-            out[s:e] = (l * (1.0 - w) + r * w).astype(out.dtype)
+        # パルス補間を一括ベクトル化: パルス毎のnp.arange/np.cos確保と
+        # Pythonループ (実測10パルスで0.4ms) を排除。数式は従来と同一
+        # (各サンプル w=0.5*(1-cos(pi*(i+1)/(k+1)))、端点は線形→コサイン)。
+        widths = np.asarray(ends[:512], dtype=np.int32) - \
+            np.asarray(starts[:512], dtype=np.int32)
+        starts_a = np.asarray(starts[:512], dtype=np.int32)
+        ends_a = np.asarray(ends[:512], dtype=np.int32)
+        valid = (widths > 0) & (widths <= max_width)
+        if np.any(valid):
+            wv = widths[valid]
+            sv = starts_a[valid]
+            ev = ends_a[valid]
+            total = int(wv.sum())
+            # 少数パルス (<=4) はベクトル化の固定費 (repeat/arange) が
+            # 上回るため従来ループ。SSB (2208, 幅8, パルス1-2本) の実測で
+            # ループ0.20ms < ベクトル0.29ms、多数パルス (NFM等) は逆転。
+            if len(wv) <= 4:
+                for s, e in zip(sv.tolist(), ev.tolist()):
+                    l = out[s - 1] if s > 0 else out[e]
+                    r = out[e] if e < n else l
+                    kk = (e - s)
+                    w = 0.5 * (1.0 - np.cos(
+                        np.pi * np.arange(1, kk + 1, dtype=np.float32)
+                        / (kk + 1.0)))
+                    out[s:e] = (l * (1.0 - w) + r * w).astype(out.dtype)
+            elif total > 0:
+                starts_rep = np.repeat(sv, wv)
+                ends_rep = np.repeat(ev, wv)
+                cum = np.cumsum(wv) - wv
+                pos = (np.arange(total, dtype=np.int64)
+                       - np.repeat(cum, wv))
+                kp1 = np.repeat(wv + 1.0, wv)
+                w = (0.5 * (1.0 - np.cos(np.pi * (pos + 1) / kp1))
+                     ).astype(np.float32)
+                left_idx = np.where(sv > 0, sv - 1, ev)
+                right_idx = np.where(ev < n, ev, left_idx)
+                lv = out[np.repeat(left_idx, wv)]
+                rv = out[np.repeat(right_idx, wv)]
+                out[starts_rep + pos] = (lv * (1.0 - w) + rv * w)
         return out
     except Exception:
         return iq_if

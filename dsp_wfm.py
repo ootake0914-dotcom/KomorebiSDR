@@ -723,6 +723,12 @@ class DspWfmMixin:
                 noise_bin = c_noise * self._wf_f2
                 noise_denom = noise_bin + 1e-12
                 gmix = np.empty_like(specs, dtype=np.float32)
+                # マスキング閾値の超低速EMAは8フレーム毎に更新する。
+                # 毎フレーム (43回/ブロック) のベクトルEMAは約0.2ms/ブロックの
+                # 実測コストがあり、τ8秒に対して8フレーム粒度で十分等価
+                # (alphaを8フレーム分に換算)。
+                a_ms8 = 1.0 - float(np.exp(
+                    -(8.0 * hop / float(self.audio_rate)) / 8.0))
                 for j in range(nframes):
                     power = powers[j]
                     self._wf_p = 0.5 * power + 0.5 * self._wf_p
@@ -768,13 +774,17 @@ class DspWfmMixin:
                     p_clean = np.maximum(
                         self._wf_p.astype(np.float64) - noise_bin, 0.0)
                     mask_thr = (p_clean @ self._wf_spread) * self._wf_mask_offset_vec
-                    _ms = getattr(self, "_wf_mask_slow", None)
+                    _ms = self._wf_mask_slow
                     if _ms is None or len(_ms) != len(mask_thr):
                         self._wf_mask_slow = mask_thr.astype(np.float64)
+                        self._wf_mask_cnt = 1
                         _ms = self._wf_mask_slow
                     else:
-                        a_ms = 1.0 - np.exp(-(hop / float(self.audio_rate)) / 8.0)
-                        _ms += a_ms * (mask_thr - _ms)
+                        _cnt = getattr(self, "_wf_mask_cnt", 0) + 1
+                        if _cnt >= 8:
+                            _cnt = 0
+                            _ms += a_ms8 * (mask_thr - _ms)
+                        self._wf_mask_cnt = _cnt
                     gate = np.minimum(1.0, _ms / noise_denom).astype(np.float32)
                     g_use = np.maximum(self._wf_g, gate)
                     g_use[:3] = 1.0  # DC〜低域は保護
@@ -1588,6 +1598,8 @@ class DspWfmMixin:
         self._wf_g = None
         self._wf_xi = None                 # decision-directed事前SNR
         self._wf_gamma_prev = None         # 前フレーム事後SNR
+        self._wf_mask_slow = None          # マスキング閾値の低速EMA (幅呼吸防止)
+        self._wf_mask_cnt = 0              # 8フレーム間引きカウンタ
         self._wf_f2 = np.fft.rfftfreq(self._wf_n, 1.0 / self.audio_rate) ** 2
         # 知覚マスキング行列 (Bark拡散・Schroeder): T = P @ S でビン別マスキング閾値。
         # マスクされるノイズは抑圧不要 (g=1) とし、音楽性ノイズを設計上出さない。
