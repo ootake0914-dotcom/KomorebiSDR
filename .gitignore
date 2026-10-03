@@ -24,6 +24,11 @@ Thumbs.db
 *.swp
 *~
 
+# HTML documents and design mockups
+*.html
+doc/
+
+
 # Temporary test / scratch files
 scratch/
 test_*.png
