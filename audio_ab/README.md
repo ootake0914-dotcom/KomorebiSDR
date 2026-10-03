@@ -11,7 +11,9 @@ python audio_ab/run_ab.py --list              # 項目一覧
 python audio_ab/run_ab.py                     # 全項目のAB生成 (数分)
 python audio_ab/run_ab.py --items E1,E4       # 指定だけ
 python audio_ab/score_mos.py --p835           # 全ペアをMOS採点 (Scoreq+DNSMOS)
-python audio_ab/cer_ab.py                     # TTS→雑音→NRのCER/MOS
+python audio_ab/cer_ab.py --list              # シナリオ一覧
+python audio_ab/cer_ab.py --scenario ssb --snrs 0,5   # 文単位CER+CI (既定6文×2シード)
+python audio_ab/cer_ab.py --scenario ssb-clicks --mos # クリック耐性+MOS
 python audio_ab/summary.py --csv              # 結果一覧
 python audio_ab/record_raw.py 7.100 LSB 30 --tag night   # 生IQ録音
 ```
@@ -34,7 +36,23 @@ python audio_ab/record_raw.py 7.100 LSB 30 --tag night   # 生IQ録音
   16k化してから渡す (48kを渡すとlibrosa新APIと衝突)。
 - **CER** (`cer_ab.py`): VOICEVOX原稿 (既知) → 雑音チェーン → faster-whisper
   書き起こし → 文字誤り率。了解度の代用。カタカナ・固有名詞は床を上げるので
-  原稿は平易な日本語にする。クリーン床を毎回校正して比べる。
+  原稿は平易な日本語にする。
+
+## 測定基盤v2 (文単位試行 × 統計ゲート)
+
+旧版は16.8秒連結原稿で1条件1サンプル (CER量子化±0.014、シード分散大) だった。
+v2は文ごとに試行を増やし、平均±CIと対の符号検定で判定する:
+
+- `corpus.py` — VOICEVOX 10文×4話者 (ずんだもん/めたん/つむぎ/武宏)。
+  1文=1試行として使う。tts/にキャッシュ (gitignore)。
+- `simulate.py` — 名前付き標準チャネル: `ssb` / `ssb-clicks` /
+  `ssb-onesided` / `am` / `am-onesided` / `nfm` / `nfm-clicks` /
+  `wfm` (ステレオMPX・75µsプリエンファシス)。SNR・クリック・片側/両側
+  妨害・フェードが引数で再現可能。tempスクリプトの書き捨てを廃止する。
+- `stats.py` — bootstrap CI・符号検定・実用ゲート (効果量0.01未満やCIが0を
+  跨ぐものは「差なし」と報告し、1文字差を有意と誤認しない)。
+- `cer_ab.py` — 文×シード×条件を同じ雑音実現で対にして回し、全試行を
+  `out/cer_stats_{scenario}.json` に保存する。
 
 ## 試聴手順 (耳をやる場合)
 
@@ -67,8 +85,8 @@ Scoreq NR-MOS の off→on 比較 (差の向きのみ信じる):
 
 | 項目 | MOS off → on | CER (off→on) | 所見 |
 |---|---|---|---|
-| C1 0dB | 1.307 → 1.221 (on, 4シード) | 0.378 → 0.362 (paired Δ-0.016±0.011) | 了解度は微改善、MOSは減 |
-| C1 5dB | — | 0.317 → 0.362 (paired Δ+0.045±0.087) | 有意差なし (分散大) |
+| C1 0dB (v2, 12対) | — | 0.225 → 0.296 (Δ+0.071, CI[-0.03,+0.21]) | 改善は確認できず |
+| C1 5dB (v2, 12対) | — | 0.119 → 0.212 (Δ+0.093, CI[+0.04,+0.15], 符号検定n.s.) | 悪化方向 |
 | C1 10dB | 1.421 → 1.245 (off) | 0.333 → 0.308 (on) | 参考値 (旧1シード) |
 | E1 NR-SSB白 | 1.311 → 1.344 (on) | — | 母音プロキシではMOSも微改善 |
 | E2 NR-SSB桃 | 1.425 → 1.434 (on) | — | 同等〜微改善 |
@@ -89,13 +107,16 @@ Scoreq NR-MOS の off→on 比較 (差の向きのみ信じる):
 | R5 実音楽apod | 1.139 → 1.135 (off) | — | 透明 |
 
 **読み方の注意**:
-- CERとMOSは役割が違う。C1は「NRで言葉が通じやすくなる (0dBで相対-4%。
-  5dB以上は有意差なし) が総合MOSは微減」— 了解度と自然さの古典的トレードオフ。
-- 狭帯域NRパラメータスイープ (4シード・0dB): over_sub 1.0→1.5/2.0/3.0、
-  floor -12→-18/-6を比較したが、現行baseのみCERが改善 (他は中立〜+0.045悪化)。
-  P.835はbaseで BAK +0.94 / SIG -0.87 / OVRL ±0.01 → 「雑音は下がるが音声も
-  少し傷める、総合は横ばい」。  よってPRESETS変更はせず・既定OFFのまま。
-  (原稿16.8秒ではCER量子化±0.014のため、0.01級の差は追わない)
+- C1はv2 (10文×4話者・文単位12対) で測り直した結果、NR-onのCER改善は
+  確認できず、5dBでは悪化方向 (Δ+0.093, CI[+0.04,+0.15]。符号検定n.s.)。
+  旧版の「0dBで相対-4%改善」は1話者・連結1サンプルで過小出力だった。
+  一方P.835はBAK改善/SIG低下、Scoreqは微減 (雑音は下がるが声も傷む)。
+  よって狭帯域NRは既定OFF・プリセット変更なしが結論 (v2でも変わらず)。
+- 狭帯域NRパラメータスイープ (旧ハーネス: 4シード・連結原稿・話者1・0dB):
+  over_sub 1.0→1.5/2.0/3.0、floor -12→-18/-6を比較したが、現行baseのみ
+  改善方向だった (他は中立〜+0.045悪化)。v2の結果を踏まえると「攻めない」
+  ことが本質で、baseはその中で最良。P.835はbaseで BAK +0.94 / SIG -0.87 /
+  OVRL ±0.01。よってPRESETS変更はせず・既定OFFのまま。
 - ブランカSSB (E11): thr_k 6→8へ変更 (dsp_nfm SSB経路)。クリーン音声での
   誤検出が1280→435サンプルに減り、パルス回復は3シード全てでk8>k6
   (k9以上は回復不足)。NFM/AM経路は今回未測定のためk=6のまま。
