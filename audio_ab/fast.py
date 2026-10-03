@@ -25,9 +25,11 @@ class CachedAsr:
     """AsrSpotter互換 + ディスクキャッシュ + beam選択。"""
 
     def __init__(self, model: str = "small", beam: int = 5,
-                 cache: bool = True, cache_dir: str = None):
-        from score_noref import AsrSpotter
-        self._sp = AsrSpotter(model)
+                 cache: bool = True, cache_dir: str = None, spotter=None):
+        if spotter is None:
+            from score_noref import AsrSpotter
+            spotter = AsrSpotter(model)
+        self._sp = spotter
         self.model = model
         self.beam = int(beam)
         self.cache = bool(cache)
