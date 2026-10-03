@@ -86,7 +86,7 @@ def build_am(utts, snr_db, seed, intf_db=None, intf_hz=2500.0, sides="one",
     env = 1e-4 * (1.0 + 0.5 * v)
     iq = (env * np.exp(1j * 2 * np.pi * carrier_hz * t)).astype(np.complex64)
     rng = np.random.default_rng(seed)
-    nz = (rng.standard_normal(n) + 1j * rng.standard_normal(n)).astype(np.float64)
+    nz = (rng.standard_normal(n) + 1j * rng.standard_normal(n)).astype(np.complex128)
     nz = nz / (float(np.sqrt(np.mean(np.abs(nz) ** 2))) + 1e-12)
     sig_pow = float(np.mean(env ** 2))
     iq = iq + (nz * np.sqrt(sig_pow / 10 ** (float(snr_db) / 10.0))).astype(np.complex64)

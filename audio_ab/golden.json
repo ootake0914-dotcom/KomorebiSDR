@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "full": false,
+  "metrics": {
+    "ssb_clean_blank_changed": {
+      "value": 37.0,
+      "tol": 120.0
+    },
+    "ssb_click_resid_db": {
+      "value": -9.24384190589551,
+      "tol": 0.8
+    },
+    "wfm_side_hiss_db": {
+      "value": -28.639782340415266,
+      "tol": 0.8
+    },
+    "wfm_mid_err_db": {
+      "value": -137.1936798095703,
+      "tol": 1.5
+    },
+    "am_sinr_gain_db": {
+      "value": 0.4375778774371431,
+      "tol": 1.0
+    },
+    "nr_ssb_delta_rms_db": {
+      "value": -0.5183096016156836,
+      "tol": 0.5
+    }
+  }
+}

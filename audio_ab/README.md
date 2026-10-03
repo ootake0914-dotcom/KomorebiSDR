@@ -14,6 +14,10 @@ python audio_ab/score_mos.py --p835           # 全ペアをMOS採点 (Scoreq+DN
 python audio_ab/cer_ab.py --list              # シナリオ一覧
 python audio_ab/cer_ab.py --scenario ssb --snrs 0,5   # 文単位CER+CI (既定6文×2シード)
 python audio_ab/cer_ab.py --scenario ssb-clicks --mos # クリック耐性+MOS
+python audio_ab/sweep.py --list               # スイープ軸一覧
+python audio_ab/sweep.py --scenario ssb --axis nr.floor_db=-18,-12 --snrs 5
+python audio_ab/regress.py                    # goldenドリフト検査 (約6s)
+python audio_ab/regress.py --update [--full]  # 基準更新 (--fullでCER追加)
 python audio_ab/summary.py --csv              # 結果一覧
 python audio_ab/record_raw.py 7.100 LSB 30 --tag night   # 生IQ録音
 ```
@@ -53,6 +57,21 @@ v2は文ごとに試行を増やし、平均±CIと対の符号検定で判定�
   跨ぐものは「差なし」と報告し、1文字差を有意と誤認しない)。
 - `cer_ab.py` — 文×シード×条件を同じ雑音実現で対にして回し、全試行を
   `out/cer_stats_{scenario}.json` に保存する。
+
+## スイープと回帰
+
+- `sweep.py` — `--axis name=v1,v2` でDSPパラメータを宣言的にスイープ。
+  全バリアントを同一雑音試行で対比較し、baseとのΔをCI・符号検定・
+  実用ゲートで報告、全試行を `out/sweep_{scenario}.json` に保存する。
+  軸 (`--list`): `nr.on` / `nr.over_sub` / `nr.floor_db` / `nr.gain_smooth` /
+  `nr.noise_beta` / `nr.dd_alpha` / `ssb.blank_k` / `am.on` / `wfm.on` /
+  `wf.mask_scale` / `wf.gmin` / `agc.hyst`。`--base nr.on=0` で基準条件を
+  上書きできる (バリアントにも継承される)。
+- `regress.py` — 標準シナリオの決定的DSP指標6つ (ブランカ偽検出・クリック
+  残差・WFM sideヒス/mid透過・AM SINR利得・NR指纹) を `audio_ab/golden.json`
+  と比較し、ドリフトでexit 1。約6秒。`--full` でSSB CER 2指標も検査。
+  run_allの二値テストでは拾えない「静かな悪化」(抑圧量が1dB変わる等) を
+  検出する。goldenは `--update` で手動更新し、無断で書き換えない。
 
 ## 試聴手順 (耳をやる場合)
 
