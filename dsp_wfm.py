@@ -1608,7 +1608,11 @@ class DspWfmMixin:
         _dz = _bk[:, None] - _bk[None, :]
         _sp = 15.81 + 7.5 * (_dz + 0.474) - 17.5 * np.sqrt(1.0 + (_dz + 0.474) ** 2)
         self._wf_spread = (10.0 ** (_sp / 10.0)).astype(np.float32)
-        self._wf_mask_offset = 0.1  # マスキング閾値オフセット (同時マスキング-10dB相当)
+        # マスキング閾値オフセット。合成ステレオ (音声L/R・75µsプリエンファシス、
+        # 強/弱電界) で0.1→0.05に半減: ヒス10-14kが+5〜6dB深くなり、side番組
+        # 誤差は-35dB以下・幅変化0.3dB以下を維持 (0.02相当まで攻めると誤差-21dB
+        # と可聴域に入る)。バイパス時 (sw<0.02) は従来通り無処理。
+        self._wf_mask_offset = 0.05
         # 周波数依存マスキングオフセット (固定spreadの細分化):
         # 耳が敏感な2〜8kHzは保護寄り (最大2倍→gateが1側へ→番組保全)、
         # 番組疎でヒス支配の12kHz超は抑圧寄り (最小0.4倍→深く落とす)。
@@ -1616,7 +1620,7 @@ class DspWfmMixin:
         _mid = np.exp(-(((_bf - 4000.0) / 3000.0) ** 2))
         _hi = 1.0 / (1.0 + np.exp(-(_bf - 12000.0) / 2500.0))
         self._wf_mask_offset_vec = (
-            0.1 * np.clip(1.0 + 1.0 * _mid - 0.6 * _hi, 0.3, 2.0)).astype(np.float32)
+            0.05 * np.clip(1.0 + 1.0 * _mid - 0.6 * _hi, 0.3, 2.0)).astype(np.float32)
         hf_mask = (np.fft.rfftfreq(self._wf_n, 1.0 / self.audio_rate) >= 6000.0) & \
                   (np.fft.rfftfreq(self._wf_n, 1.0 / self.audio_rate) <= 15000.0)
         self._wf_hf_f2_mean = float(np.mean(self._wf_f2[hf_mask]) + 1e-12)
