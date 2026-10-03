@@ -208,6 +208,7 @@ def test_sweep_hooks() -> bool:
 
 def test_reference_metrics() -> bool:
     from metrics import evaluate, seg_snr, shift, si_sdr, stoi_score
+    from metrics import estoi_score, si_sar_sir
     rng = np.random.default_rng(0)
     t = np.arange(48000) / 48000.0
     ref = (0.4 * np.sin(2 * np.pi * 440 * t)
@@ -223,9 +224,18 @@ def test_reference_metrics() -> bool:
            and seg_snr(ref, noisy) < seg_snr(ref2, delayed))
     ev = evaluate(ref2, delayed)
     ok4 = (set(ev) == {"si_sdr", "seg_snr", "stoi"} and ev["stoi"] > 0.98)
-    ok = bool(ok1 and ok2 and ok3 and ok4)
+    nz = 0.25 * rng.standard_normal(len(ref))
+    noisy2 = ref + nz
+    d3 = si_sar_sir(ref, noisy2, nz)
+    ok5 = (abs(d3["sdr"] - si_sdr(ref, noisy2)) < 0.5
+           and d3["sir"] < d3["sar"] - 5.0
+           and si_sar_sir(ref, noisy2)["sir"] is None)
+    ok6 = (estoi_score(ref, ref) > 0.99
+           and estoi_score(ref, noisy) < estoi_score(ref2, delayed))
+    ok = bool(ok1 and ok2 and ok3 and ok4 and ok5 and ok6)
     print(f"[{'OK' if ok else 'FAIL'}] reference metrics "
-          f"(clean={ok1} delay={ok2} noisy={ok3} keys={ok4})")
+          f"(clean={ok1} delay={ok2} noisy={ok3} keys={ok4} "
+          f"sir/sar={ok5} estoi={ok6})")
     return ok
 
 

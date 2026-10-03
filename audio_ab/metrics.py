@@ -89,6 +89,60 @@ def seg_snr(ref, test, fs=48000, align=True, frame_ms=20.0, clip_db=35.0,
     return float(np.mean(v[keep]))
 
 
+def si_sar_sir(ref, est, interf=None, align=True, max_lag=4800) -> dict:
+    """SI-SDR/SIR/SARの3成分分解 (Le Roux et al. 2019)。
+
+    ref: 目的信号参照。est: 評価対象。interf: 干渉信号参照
+    (NRが「消し残し」と「人工物」を分ける用途。省略時はSDRのみ)。
+    いずれもレベル・遅延にロバスト (整列後に最適スケールで分解)。
+    """
+    r = np.asarray(ref, dtype=np.float64).reshape(-1)
+    t = np.asarray(est, dtype=np.float64).reshape(-1)
+    n = min(len(r), len(t))
+    r, t = r[:n], t[:n]
+    if align:
+        t = shift(t, xcorr_lag(r, t, max_lag))
+    r = r - np.mean(r)
+    t = t - np.mean(t)
+    alpha = float(np.dot(t, r)) / (float(np.dot(r, r)) + 1e-18)
+    s_target = alpha * r
+    e_res = t - s_target
+    pt = float(np.sum(s_target ** 2))
+    out = {"sdr": float(10.0 * np.log10(pt / (float(np.sum(e_res ** 2)) + 1e-24)))}
+    if interf is None:
+        out["sir"] = None
+        out["sar"] = None
+        return out
+    f = np.asarray(interf, dtype=np.float64).reshape(-1)
+    f = f[:n] - np.mean(f[:n])
+    beta = float(np.dot(e_res, f)) / (float(np.dot(f, f)) + 1e-18)
+    e_interf = beta * f
+    e_artif = e_res - e_interf
+    out["sir"] = float(10.0 * np.log10(
+        pt / (float(np.sum(e_interf ** 2)) + 1e-24)))
+    out["sar"] = float(10.0 * np.log10(
+        float(np.sum((s_target + e_interf) ** 2))
+        / (float(np.sum(e_artif ** 2)) + 1e-24)))
+    return out
+
+
+def estoi_score(ref, test, sr=48000, align=True) -> float:
+    """拡張STOI (変調雑音に頑健。参照側は音声明瞭度の補完指標)。"""
+    from pystoi.stoi import stoi
+    from scipy.signal import resample_poly
+    from math import gcd
+    r = np.asarray(ref, dtype=np.float64).reshape(-1)
+    t = np.asarray(test, dtype=np.float64).reshape(-1)
+    if align:
+        t = shift(t, xcorr_lag(r, t))
+    n = min(len(r), len(t))
+    r, t = r[:n], t[:n]
+    g = gcd(int(sr), 10000)
+    r10 = resample_poly(r, 10000 // g, int(sr) // g)
+    t10 = resample_poly(t, 10000 // g, int(sr) // g)
+    return float(stoi(r10, t10, 10000, extended=True))
+
+
 def stoi_score(ref, test, sr=48000, align=True) -> float:
     from score_wav import stoi
     r = np.asarray(ref, dtype=np.float64).reshape(-1)
