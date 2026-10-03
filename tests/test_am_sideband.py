@@ -52,6 +52,7 @@ def test_clean_transparent() -> bool:
                        + 1j * rng.standard_normal(n))).astype(np.complex64)
 
     d_off = SdrDspPipeline(1152000, 48000)
+    d_off.am_sideband_enabled = False
     y_off = _run(d_off, iq)
     d_on = SdrDspPipeline(1152000, 48000)
     d_on.am_sideband_enabled = True
@@ -80,6 +81,7 @@ def test_onesided_interference() -> bool:
                        + 1j * rng.standard_normal(n))).astype(np.complex64)
 
     d_off = SdrDspPipeline(1152000, 48000)
+    d_off.am_sideband_enabled = False
     y_off = _run(d_off, iq)
     d_on = SdrDspPipeline(1152000, 48000)
     d_on.am_sideband_enabled = True
@@ -108,6 +110,35 @@ def test_onesided_interference() -> bool:
     return bool(ok and click_ok)
 
 
+def test_symmetric_no_trigger() -> bool:
+    # 両側波帯へ同量のトーン妨害: 側波帯ACエネルギーが釣り合うため
+    # 自動判定は発動せず、OFF版とビット等価のまま (誤発動しない)。
+    rng = np.random.default_rng(17)
+    n = BLK * NBLK
+    t = np.arange(n) / RATE
+    audio = np.cos(2 * np.pi * 1000.0 * t)
+    env = 1e-4 * (1.0 + 0.5 * audio)
+    iq = (env * np.exp(1j * 2 * np.pi * 15.0 * t)).astype(np.complex64)
+    gate = np.ones(n)
+    gate[:BLK * 6] = 0.0
+    iq = iq + (gate * 3e-5 * np.exp(1j * 2 * np.pi * 2500.0 * t)).astype(np.complex64)
+    iq = iq + (gate * 3e-5 * np.exp(1j * 2 * np.pi * -2500.0 * t)).astype(np.complex64)
+    iq = iq + (5e-6 * (rng.standard_normal(n)
+                       + 1j * rng.standard_normal(n))).astype(np.complex64)
+
+    d_off = SdrDspPipeline(1152000, 48000)
+    d_off.am_sideband_enabled = False
+    y_off = _run(d_off, iq)
+    d_on = SdrDspPipeline(1152000, 48000)
+    y_on = _run(d_on, iq)
+    diff = float(np.max(np.abs(y_on - y_off)))
+    w_end = float(getattr(d_on, "_am_sb_w", 0.0))
+    ok = diff == 0.0 and w_end == 0.0
+    print(f"[{'OK' if ok else 'FAIL'}] symmetric stays transparent "
+          f"(max|on-off|={diff:.3e}, w={w_end:.2f})")
+    return bool(ok)
+
+
 def test_unlocked_fallback() -> bool:
     # 無搬送波ノイズでは側波帯パスが発動せず包絡線相当 (発散・爆音なし)
     rng = np.random.default_rng(3)
@@ -129,6 +160,7 @@ def test_unlocked_fallback() -> bool:
 def main() -> int:
     ok = test_clean_transparent()
     ok &= test_onesided_interference()
+    ok &= test_symmetric_no_trigger()
     ok &= test_unlocked_fallback()
     print("OK" if ok else "FAILED")
     return 0 if ok else 1
