@@ -124,6 +124,11 @@ class HyperController:
         self.target_hf_gain = 1.0
         self.target_if_bw_hz = 190000.0
         self.filter_override = None  # None / "wide" / "clean" / "narrow"
+        # 帯域マッピング用の遅い聴感SNR (tau5秒)。_measure_audioは直近21ms窓
+        # のため番組内容で4〜41dB振れ、これでカットオフを直接動かすと
+        # 「呼吸」になる (83.2MHz実録で10.4k〜15kを0.1〜0.4Hz往復を実測)。
+        self._map_audio_snr_slow = None
+        self._map_cut_t = 0.0
 
         # --- 統計 ---
         self.frames = 0
@@ -173,6 +178,10 @@ class HyperController:
         self.last_action_time = 0.0
         self.last_verify_time = 0.0
         self.settle_frames = 1
+        # 帯域マッピングの遅い聴感SNRも新局で初期化 (前局の番組内容を
+        # 引きずらず、新局の実測から5秒時定数で立ち上げる)
+        self._map_audio_snr_slow = None
+        self._map_cut_t = 0.0
 
         if not self.available_gains:
             return
@@ -605,11 +614,29 @@ class HyperController:
         if not hasattr(self.dsp, "set_cognitive_parameters"):
             return
 
+        # 帯域制御の時間軸 (ブロック毎。dtは実測・クランプ)
+        now = time.time()
+        dt = now - self._map_cut_t if self._map_cut_t > 0.0 else 0.06
+        self._map_cut_t = now
+        dt = float(min(max(dt, 0.02), 0.5))
+
+        # 帯域マッピングの聴感SNRは5秒EMAを使う。_measure_audioは直近21ms窓
+        # の番組/ヒス比で、トークの合間や静かな楽句で4〜41dB振れる。これを
+        # そのまま使うとカットオフが10.4k〜15kを0.1〜0.4Hzで往復し「呼吸」と
+        # して聞こえる (83.2MHz実録の実測)。表示・ゲイン目的関数は従来の
+        # state_audio_snrを維持し、帯域だけ鈍い推定で駆動する。
+        if self._map_audio_snr_slow is None:
+            self._map_audio_snr_slow = float(self.state_audio_snr)
+        else:
+            a_s = 1.0 - np.exp(-dt / 5.0)
+            self._map_audio_snr_slow += a_s * (
+                float(self.state_audio_snr) - self._map_audio_snr_slow)
+
         s = self.state_channel_snr
         # 実機実測(弱電界C/N 1〜6dB)に基づく再校正: 弱電界では狭帯域へ、十分強ければ開放。
         # 弱端は旧DX相当 (4300Hz/hf0.14/122kHz) に寄せ、手動切替なしで自動到達する。
         sig_c = 1.0 / (1.0 + np.exp(-0.28 * (s - 10.0)))
-        sig_a = 1.0 / (1.0 + np.exp(-0.30 * (self.state_audio_snr - 13.0)))
+        sig_a = 1.0 / (1.0 + np.exp(-0.30 * (self._map_audio_snr_slow - 13.0)))
         # 強電界で15kHz (BS.450) まで開放。旧上限14.5kHzでは音楽の空気感が削られた。
         cutoff = 4300.0 + 10700.0 * (0.55 * sig_c + 0.45 * sig_a)
         # 実機A/B試聴の結果、中〜強電界ではハイシェルフを早めに全開放し
@@ -639,6 +666,11 @@ class HyperController:
             if self.antenna_profile == "LOW_GAIN_MICRO":
                 # 簡易アンテナ: 熱雑音フロアを抑えるためIF帯域を少し狭窄
                 if_bw = min(if_bw, 145000.0)
+            # 強電界では番組内容に関係なく帯域を開く: C/Nが十分なら
+            # 狭帯域化で隠すヒスが無く、絞る理由がない (呼吸の主因対策)。
+            _fw = float(np.clip((sig_c - 0.85) / 0.15, 0.0, 1.0))
+            _fw = _fw * _fw * (3.0 - 2.0 * _fw)
+            cutoff = max(cutoff, 13000.0 * _fw)
 
         # 帯域別バイアス自動選択 (第2段): 学習済み弱電界帯のみ到達点を
         # 少し狭め寄せする。手動override時は尊重し適用しない。
@@ -667,6 +699,17 @@ class HyperController:
         # DXモード中に手動overrideがある場合は表示と音の乖離を避けるため
         # DX狭帯域を維持しつつcutoffのみ上書き済みである旨を統計側で扱う
         # (hf/ifはoverrideプリセットへ連動させ、表示=wideでも音がDXのままにならない)
+
+        # 不感帯±300Hz＋スルーレート4000Hz/s (自動時のみ。手動overrideは即時)。
+        # 制御由来の微小振動を目標段で二重に殺し、選局過渡は数秒で完了させる。
+        if self.filter_override is None:
+            prev = float(self.target_cutoff_hz)
+            delta = cutoff - prev
+            if abs(delta) < 300.0:
+                cutoff = prev
+            else:
+                step = 4000.0 * dt
+                cutoff = prev + float(np.clip(delta, -step, step))
 
         self.target_cutoff_hz = cutoff
         self.target_hf_gain = hf
