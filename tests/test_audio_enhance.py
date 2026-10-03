@@ -83,7 +83,10 @@ def amp(x, freq, sr=48000):
 
 def test_freq_dependent_blend():
     print("===== test_freq_dependent_blend =====")
-    noisy = make_raw(stereo=True, snr_db=9.0)
+    # 9dBはヒス推定がNR発動しきい値ぎりぎりで、旧実装では起動直後の
+    # EKF誤発動 (初期s_meter=-45dBFS) が作るnr_gainに依存していた。
+    # C/N化で誤発動が消えたため、NRが正規に発動する2dBへ変更。
+    noisy = make_raw(stereo=True, snr_db=2.0)
     _, pcm_on = run_blocks(noisy, freq_blend_enabled=True)
     _, pcm_off = run_blocks(noisy, freq_blend_enabled=False)
     lr_on = pcm_on[:, 0] - pcm_on[:, 1]

@@ -239,9 +239,12 @@ class DspWfmMixin:
                 self.stereo_status = "BLEND"
             else:
                 self.stereo_status = "MONO"
-            # WFM経路も±1.0へクリップ (AM/SSBと統一。過偏移・弱電界ノイズで
-            # ±1.82超→後段int16変換でのラップ歪みを防止)
-            return np.clip(np.stack([left, right], axis=1), -1.0, 1.0).astype(np.float32)
+            # NaN/Infサニタイズと暴走時のみの安全クランプ (±4)。ピーク処理は
+            # 最終段ルックアヘッドリミッタに任せる (±1で切るとスローAGC前の
+            # 過変調・スパイク歪みが残り、AGC後も消えない)。
+            out = np.nan_to_num(np.stack([left, right], axis=1), nan=0.0,
+                                posinf=4.0, neginf=-4.0)
+            return np.clip(out, -4.0, 4.0).astype(np.float32)
         return None
 
     def demodulate_wfm(self, iq_if: np.ndarray) -> np.ndarray:
@@ -310,7 +313,11 @@ class DspWfmMixin:
         if (getattr(self, "ekf_enabled", False)
                 and getattr(self, "ekf_demod", None) is not None
                 and self._stereo_blend <= 0.05):
-            w_ekf = float(np.clip((-38.0 - self.s_meter_dbfs) / 10.0, 0.0, 1.0))
+            # 切替はレベル(dBFS)でなくC/N (_if_snr_db) で行う。dBFSはHyperの
+            # ゲインで動き、弱局を拾おうとゲインを上げると補助が外れる逆動作
+            # になる。推定値は合成chSNR+約14dB (実測): 26dBで0、20dBで1。
+            _cn = float(getattr(self, "_if_snr_db", 26.0))
+            w_ekf = float(np.clip((26.0 - _cn) / 6.0, 0.0, 1.0))
             if w_ekf > 0.01:
                 demod_ekf = self.ekf_demod.demodulate(limited)
                 if len(demod_ekf) == len(demod):
@@ -319,12 +326,16 @@ class DspWfmMixin:
         # 位相スリップ防止FM復調 (弱電界フェージング時のクリック雑音抑制)
         if (getattr(self, "riemann_demodulator", None) is not None
                 and self.riemann_demodulator.enabled
-                and (self.cognitive_enabled or getattr(self, "riemann_always", False))
-                and self.s_meter_dbfs < -35.0):
-            w_riemann = float(np.clip((-35.0 - self.s_meter_dbfs) / 12.0, 0.0, 0.75))
-            demod_riemann = self.riemann_demodulator.demodulate(iq_if)
-            if len(demod_riemann) == len(demod):
-                demod = ((1.0 - w_riemann) * demod + w_riemann * demod_riemann).astype(np.float32)
+                and (self.cognitive_enabled or getattr(self, "riemann_always", False))):
+            # EKFと同じくC/N基準 (dBFS条件はゲイン依存のため廃止)。
+            # 28dBで0、22dB以下で0.75上限。
+            _cn = float(getattr(self, "_if_snr_db", 28.0))
+            w_riemann = float(np.clip((28.0 - _cn) / 6.0, 0.0, 0.75))
+            if w_riemann > 0.01:
+                demod_riemann = self.riemann_demodulator.demodulate(iq_if)
+                if len(demod_riemann) == len(demod):
+                    demod = ((1.0 - w_riemann) * demod
+                             + w_riemann * demod_riemann).astype(np.float32)
 
         # 超音波三角ノイズ比追従型 オートスケルチ
         ultra_gain = 1.0
@@ -500,7 +511,8 @@ class DspWfmMixin:
                         pass
             except Exception:
                 pass
-        return np.clip(out_mono, -1.0, 1.0)
+        out_mono = np.nan_to_num(out_mono, nan=0.0, posinf=4.0, neginf=-4.0)
+        return np.clip(out_mono, -4.0, 4.0)
 
     def _delay_mono(self, mono: np.ndarray) -> np.ndarray:
         """monoを群遅延分だけ遅延させ、NRフィルタ通過後の差信号と時間整合を取る。
@@ -1096,7 +1108,11 @@ class DspWfmMixin:
 
         # オーディオ段ハイカットフィルタ (Hyper時は無段階モーフィング)
         if self.cognitive_enabled:
-            fir_final = self._get_dynamic_filter("audio", self.applied_cutoff_hz)
+            if self.applied_cutoff_hz >= 14800.0:
+                # 最大帯域開放: IF段が15kHzまで平坦なため素通し (同一遅延)
+                fir_final = self.fir_audio_flat_dly
+            else:
+                fir_final = self._get_dynamic_filter("audio", self.applied_cutoff_hz)
         elif self.filter_mode == "wide":
             fir_final = self.fir_audio_wide
         elif self.filter_mode == "narrow":
@@ -1383,16 +1399,21 @@ class DspWfmMixin:
 
     def _init_wfm_state(self):
         """WFM用FIR・パイロットPLL・NR・CMA等の状態初期化 (__init__ から純粋移動)。"""
-        # 19kHzパイロットトーンを抑えるIF段オーディオフィルタ (288kHzレート)
-        # カットオフ 15kHz, 19kHzで -60dB以上の急峻減衰 (257タップ。
-        # 97タップでは19kHzで-25.8dBしかなく超音波漏洩していた)
-        cutoff_if_audio = 15000.0 / self.if_rate
-        self.fir_if_audio = design_fir_kaiser(num_taps=257, cutoff_norm=cutoff_if_audio, beta=7.0)
+        # 19kHzパイロット/38kHz副搬送波を抑えるIF段オーディオフィルタ (288kHzレート)
+        # 通過域15kHzを平坦に保ちつつ19kHzで-75dB以上 (337タップ)。旧設計は
+        # -6dB点が15kHzで、48kHz段と重なると15kHzで-12dBだった (実測)。
+        cutoff_if_audio = 17000.0 / self.if_rate
+        self.fir_if_audio = design_fir_kaiser(num_taps=337, cutoff_norm=cutoff_if_audio, beta=7.3)
 
         # 48kHzオーディオ段のアンチエイリアス・ハイカットフィルタ (48kHzレート)
-        # 15kHz: 音楽用Hi-Fiワイド (BS.450準拠。強電界でフル帯域開放用。51タップ)
-        cutoff_audio_wide = 15000.0 / self.audio_rate
-        self.fir_audio_wide = design_fir_kaiser(num_taps=51, cutoff_norm=cutoff_audio_wide, beta=6.0)
+        # 15kHz: 音楽用Hi-Fiワイド (BS.450準拠。強電界でフル帯域開放用。81タップ。
+        # 通過域15kHz平坦・19kHz -85dB。旧51タップは15kHzで-6dBだった)
+        cutoff_audio_wide = 16500.0 / self.audio_rate
+        self.fir_audio_wide = design_fir_kaiser(num_taps=81, cutoff_norm=cutoff_audio_wide, beta=7.3)
+        # Hyper最大帯域時 (カットオフ15kHz) は動的フィルタを同一遅延の素通し線へ
+        # 置換する (15kHzでさらに-6dB落ちる二重減衰の回避。遅延40サンプル)
+        self.fir_audio_flat_dly = np.zeros(81, dtype=np.float32)
+        self.fir_audio_flat_dly[40] = 1.0
 
         # 8.5kHz: 強力ノイズクリーナー (ヒスノイズ「サー」を消滅させ人の声を鮮明化, 65タップ)
         cutoff_audio_clean = 8500.0 / self.audio_rate
