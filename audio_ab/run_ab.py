@@ -418,9 +418,40 @@ TREATMENTS = {
 }
 
 
+def _lufs_gain(x, target=-20.0):
+    """ブロック統合LUFSをtargetへ寄せるゲイン (聞き手のラウドネスバイアス除去)。"""
+    try:
+        from audiophile_dsp import LoudnessNormalizer
+        ln = LoudnessNormalizer(FS, target_lufs=target)
+        v = None
+        for k in range(0, len(x), 2752):
+            r = ln.push(np.asarray(x[k:k + 2752], dtype=np.float64))
+            if r is not None:
+                v = r
+        if v is None or not np.isfinite(v):
+            return 1.0
+        return float(ln.gain_for(v))
+    except Exception:
+        return 1.0
+
+
+def _loudness_match(a, b):
+    """A/Bペアを同一LUFSへ。ピーク超過時は両者を同じ比率で下げる。"""
+    ga = _lufs_gain(_to_mono(a))
+    gb = _lufs_gain(_to_mono(b))
+    A = np.asarray(a, dtype=np.float64) * ga
+    B = np.asarray(b, dtype=np.float64) * gb
+    peak = max(float(np.max(np.abs(A))), float(np.max(np.abs(B))))
+    if peak > 0.99:
+        A *= 0.99 / peak
+        B *= 0.99 / peak
+    return A, B
+
+
 def main(argv):
     sel = list(ITEMS)
     out = os.path.join(ROOT, "audio_ab", "out")
+    match = "--no-match" not in argv
     i = 0
     while i < len(argv):
         if argv[i] == "--items" and i + 1 < len(argv):
@@ -462,6 +493,9 @@ def main(argv):
         sc["identical"] = identical
         flip = random.Random(item).random() < 0.5
         A, B = (off, on) if flip else (on, off)
+        if match:
+            A, B = _loudness_match(A, B)
+        sc["loudness_matched"] = bool(match)
         key[item] = {"A": ("on" if flip else "off"),
                      "B": ("off" if flip else "on")}
         pa, ca = _stereo_wav(os.path.join(out, f"{item}_A.wav"), A)

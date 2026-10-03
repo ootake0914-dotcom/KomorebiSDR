@@ -52,9 +52,15 @@ def test_stats() -> bool:
     d3 = {"mean": 0.05, "lo": 0.01, "hi": 0.09, "p_sign": 1.0,
           "significant": True}
     ok5 = verdict(d3) == "trend only (sign test n.s.)"
-    print(f"[{'OK' if all((ok1, ok2, ok3, ok4, ok5)) else 'FAIL'}] "
-          f"stats (ci={ok1} sign={ok2} paired={ok3} gate={ok4} {ok5})")
-    return bool(all((ok1, ok2, ok3, ok4, ok5)))
+    from stats import holm, n_for_effect
+    adj = holm([0.01, 0.02, 0.03, 0.04])
+    ok6 = bool(np.allclose(adj, [0.04, 0.06, 0.06, 0.06]))
+    ok7 = n_for_effect(0.1, 0.1) == 8 and n_for_effect(0.1, 0.2) < 8
+    ok = bool(all((ok1, ok2, ok3, ok4, ok5, ok6, ok7)))
+    print(f"[{'OK' if ok else 'FAIL'}] "
+          f"stats (ci={ok1} sign={ok2} paired={ok3} gate={ok4} {ok5} "
+          f"holm={ok6} power={ok7})")
+    return ok
 
 
 def test_scenarios_shape() -> bool:
@@ -79,10 +85,20 @@ def test_scenarios_shape() -> bool:
     raw = build("wfm", [u, u], 20.0, 3)
     ok6 = (raw.dtype == np.uint8 and len(raw) % 2 == 0
            and abs(len(raw) // 2 - len(x) * 1152000 / 48000) <= 2)
-    ok = all((ok1, ok2, ok3, ok4, ok5, ok6))
+    ok7 = True
+    for name in ("ssb-fade", "ssb-step", "wfm-fade", "wfm-multipath",
+                 "wfm-adjacent"):
+        sc = SCENARIOS[name]
+        d = build(name, [u, u], 10.0, 4)
+        if sc["io"] == "raw":
+            good = d.dtype == np.uint8 and len(d) % 2 == 0 and len(d) >= sc["block"]
+        else:
+            good = d.dtype == np.complex64 and len(d) >= sc["block"]
+        ok7 = ok7 and bool(good)
+    ok = all((ok1, ok2, ok3, ok4, ok5, ok6, ok7))
     print(f"[{'OK' if ok else 'FAIL'}] scenario shapes "
           f"(ssb={ok1} clicks={ok2} nfm288k={ok3} am={ok4} am_iq={ok5} "
-          f"wfm={ok6}, am imag/real={ratio:.2f})")
+          f"wfm={ok6} new={ok7}, am imag/real={ratio:.2f})")
     return bool(ok)
 
 
@@ -144,6 +160,7 @@ def test_fast_cache() -> bool:
             return "stub-text"
 
     tmp = tempfile.mkdtemp(prefix="asr_cache_")
+    tmp2 = tempfile.mkdtemp(prefix="asr_evict_")
     try:
         asr = CachedAsr(spotter=Stub(), beam=5, cache=True, cache_dir=tmp)
         x = _tone(secs=0.5)
@@ -154,10 +171,17 @@ def test_fast_cache() -> bool:
         asr.cache = False
         asr.transcribe(x, 48000)
         ok = ok and len(calls) == 2
+        for j in range(6):
+            with open(os.path.join(tmp2, f"k{j}.txt"), "w") as f:
+                f.write("x")
+        CachedAsr(spotter=Stub(), cache=True, cache_dir=tmp2, max_files=3)
+        ok_ev = len(os.listdir(tmp2)) <= 3
+        ok = ok and ok_ev
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+        shutil.rmtree(tmp2, ignore_errors=True)
     print(f"[{'OK' if ok else 'FAIL'}] asr disk cache "
-          f"(calls={len(calls)}, hits=1 expected)")
+          f"(calls={len(calls)}, evict={ok_ev})")
     return bool(ok)
 
 
@@ -227,6 +251,34 @@ def test_realdata_registry() -> bool:
     return ok
 
 
+def test_provenance_and_loudness() -> bool:
+    from provenance import stamp
+    s = stamp()
+    ok1 = all(k in s for k in ("date", "python", "numpy")) \
+        and ("git_head" in s)
+    from run_ab import _loudness_match
+    from audiophile_dsp import LoudnessNormalizer
+
+    def lufs(x):
+        ln = LoudnessNormalizer(48000)
+        v = None
+        for k in range(0, len(x), 2752):
+            r = ln.push(np.asarray(x[k:k + 2752], dtype=np.float64))
+            if r is not None:
+                v = r
+        return v if v is not None else -99.0
+    t = np.arange(int(48000 * 4)) / 48000.0
+    prog = 0.3 * np.sin(2 * np.pi * 440 * t) + 0.15 * np.sin(2 * np.pi * 1200 * t)
+    a = (prog * 0.5).astype(np.float32)
+    b = (prog * 0.05).astype(np.float32)
+    A, B = _loudness_match(a, b)
+    ok2 = abs(lufs(A) - lufs(B)) < 0.5 and float(np.max(np.abs(A))) <= 1.0
+    ok = bool(ok1 and ok2)
+    print(f"[{'OK' if ok else 'FAIL'}] provenance+loudness "
+          f"(stamp={ok1}, LUFS diff={abs(lufs(A) - lufs(B)):.2f})")
+    return ok
+
+
 def test_regress_golden() -> bool:
     import regress
     ttsdir = os.path.join(os.path.dirname(os.path.dirname(
@@ -254,6 +306,7 @@ def main() -> int:
     ok &= test_sweep_hooks()
     ok &= test_reference_metrics()
     ok &= test_realdata_registry()
+    ok &= test_provenance_and_loudness()
     ok &= test_regress_golden()
     print("OK" if ok else "FAILED")
     return 0 if ok else 1

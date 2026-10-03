@@ -6,6 +6,7 @@ CER等は試行間分散が大きく、原稿16.8秒では量子化±0.014だっ
 """
 
 import math
+from statistics import NormalDist
 
 import numpy as np
 
@@ -65,3 +66,35 @@ def verdict(delta, min_effect: float = 0.01, alpha: float = 0.05) -> str:
     if float(delta.get("p_sign", 1.0)) >= alpha:
         return "trend only (sign test n.s.)"
     return "improvement" if m < 0.0 else "regression"
+
+
+def holm(pvals, alpha: float = 0.05):
+    """Holm法の調整p値 (step-up)。多数バリアントの多重比較補正。"""
+    p = np.asarray(pvals, dtype=np.float64)
+    m = len(p)
+    adj = np.empty(m)
+    if m == 0:
+        return adj
+    prev = 0.0
+    order = np.argsort(p)
+    for rank, idx in enumerate(order):
+        prev = max(prev, (m - rank) * float(p[idx]))
+        adj[idx] = min(1.0, prev)
+    return adj
+
+
+def holm_reject(pvals, alpha: float = 0.05):
+    """Holm補正後に棄却されるか (alpha水準)。"""
+    return holm(pvals, alpha) < alpha
+
+
+def n_for_effect(sigma, effect, alpha: float = 0.05, power: float = 0.8) -> int:
+    """対応のある平均差を検出力powerで検出するのに必要な試行数 (正規近似)。
+    例: sigma=0.1, effect=0.1 → 8試行。スイープ前に必要数を決める。"""
+    s = float(sigma)
+    e = float(effect)
+    if s <= 0.0 or e <= 0.0:
+        return 0
+    z_a = NormalDist().inv_cdf(1.0 - alpha / 2.0)
+    z_p = NormalDist().inv_cdf(power)
+    return int(np.ceil(((z_a + z_p) ** 2) * (s ** 2) / (e ** 2)))

@@ -25,7 +25,8 @@ class CachedAsr:
     """AsrSpotter互換 + ディスクキャッシュ + beam選択。"""
 
     def __init__(self, model: str = "small", beam: int = 5,
-                 cache: bool = True, cache_dir: str = None, spotter=None):
+                 cache: bool = True, cache_dir: str = None, spotter=None,
+                 max_files: int = 20000):
         if spotter is None:
             from score_noref import AsrSpotter
             spotter = AsrSpotter(model)
@@ -36,8 +37,23 @@ class CachedAsr:
         self.dir = cache_dir or os.path.join(ROOT, "audio_ab", "out", "asr_cache")
         if self.cache:
             os.makedirs(self.dir, exist_ok=True)
+            self._evict(int(max_files))
         self.hits = 0
         self.misses = 0
+
+    def _evict(self, max_files: int):
+        """容量上限: 超過時は古い順に削除して9割まで戻す (放置で肥大化しない)。"""
+        try:
+            names = os.listdir(self.dir)
+            if len(names) <= max_files:
+                return
+            paths = sorted((os.path.join(self.dir, n) for n in names),
+                           key=os.path.getmtime)
+            keep = max(1, int(max_files * 0.9))
+            for p in paths[:len(paths) - keep]:
+                os.unlink(p)
+        except Exception:
+            pass
 
     def _key(self, x, sr) -> str:
         a = np.ascontiguousarray(

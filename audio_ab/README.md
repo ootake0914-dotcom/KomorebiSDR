@@ -51,11 +51,14 @@ v2は文ごとに試行を増やし、平均±CIと対の符号検定で判定�
 - `corpus.py` — VOICEVOX 10文×4話者 (ずんだもん/めたん/つむぎ/武宏)。
   1文=1試行として使う。tts/にキャッシュ (gitignore)。
 - `simulate.py` — 名前付き標準チャネル: `ssb` / `ssb-clicks` /
-  `ssb-onesided` / `am` / `am-onesided` / `nfm` / `nfm-clicks` /
-  `wfm` (ステレオMPX・75µsプリエンファシス)。SNR・クリック・片側/両側
-  妨害・フェードが引数で再現可能。tempスクリプトの書き捨てを廃止する。
+  `ssb-onesided` / **`ssb-fade` (2波フェージング)** / **`ssb-step`
+  (選局切替)** / `am` / `am-onesided` / `nfm` / `nfm-clicks` / `wfm`
+  (ステレオMPX・75µsプリエンファシス) / **`wfm-fade` (全帯域ディップ)** /
+  **`wfm-multipath` (遅延エコー+ドップラー)** / **`wfm-adjacent` (隣接強
+  トーン)**。SNR・クリック・妨害・フェードが引数で再現可能。
 - `stats.py` — bootstrap CI・符号検定・実用ゲート (効果量0.01未満やCIが0を
-  跨ぐものは「差なし」と報告し、1文字差を有意と誤認しない)。
+  跨ぐものは「差なし」と報告し、1文字差を有意と誤認しない)。さらに
+  `holm` (多重比較補正) と `n_for_effect` (効果量→必要試行数の逆算)。
 - `cer_ab.py` — 文×シード×条件を同じ雑音実現で対にして回し、全試行を
   `out/cer_stats_{scenario}.json` に保存する。
 - `metrics.py` — 参照あり指標 (SI-SDR / segSNR / STOI)。クリーン原稿が
@@ -76,7 +79,9 @@ v2は文ごとに試行を増やし、平均±CIと対の符号検定で判定�
   軸 (`--list`): `nr.on` / `nr.over_sub` / `nr.floor_db` / `nr.gain_smooth` /
   `nr.noise_beta` / `nr.dd_alpha` / `ssb.blank_k` / `am.on` / `wfm.on` /
   `wf.mask_scale` / `wf.gmin` / `agc.hyst`。`--base nr.on=0` で基準条件を
-  上書きできる (バリアントにも継承される)。
+  上書きできる (バリアントにも継承される)。出力に `p_holm` (Holm補正後) と
+  `n(.05)` (その効果量を検出するのに必要な試行数) を含み、CIが0を外れても
+  Holmで落ちたものは「trend only」に降格する。
 - `regress.py` — 標準シナリオの決定的DSP指標6つ (ブランカ偽検出・クリック
   残差・WFM sideヒス/mid透過・AM SINR利得・NR指纹) を `audio_ab/golden.json`
   と比較し、ドリフトでexit 1。約6秒。`--full` でSSB CER 2指標も検査。
@@ -91,7 +96,11 @@ v2は文ごとに試行を増やし、平均±CIと対の符号検定で判定�
   1推論で4コアを使い切るため効果なし (24.9→25.6s)、beam=5→1も26→29sで
   順位が変わるため探索にも不採用。キャッシュが本命。
   `cer_ab`/`sweep`/`regress --full` が自動で使う (`--no-cache` で無効、
-  `--beam` で変更可。終了時にヒット率を表示)。
+  `--beam` で変更可。終了時にヒット率を表示)。20000件超は古い順に淘汰
+  (放置しても肥大化しない)。
+- 結果JSON (`cer_stats_*.json` / `sweep_*.json` / golden) には provenance
+  (git HEAD・dirty・python/numpy/onnxruntime/torch版) を刻む。数値比較は
+  同一来歴の間でのみ意味を持つため。
 - `subjective.py` — `listen_log.csv` (prefer=A/B/same) と scores.json を
   突き合わせ、指標ごとの符号一致率・Spearmanを出す。未記入でも `--xcorr`
   で指標同士の相関行列 (どの指標が冗長か) を出せる。現状listen_logは
@@ -103,6 +112,9 @@ v2は文ごとに試行を増やし、平均±CIと対の符号検定で判定�
 1. `key.json` を見ない。A/Bを順不同・複数回聴く (ヘッドホン推奨、音量固定)
 2. `prefer` に A / B / same、確信度 1-3、コメントを書く
 3. 全部終わったら `key.json` を開封して集計する
+
+AB WAVはR128ラウドネス整合済み (「大きい方が選ばれる」バイアスを除去)。
+`run_ab.py --no-match` で無効化できる。
 
 ## 項目表
 

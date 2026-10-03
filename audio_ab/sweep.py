@@ -26,7 +26,8 @@ sys.path.insert(0, os.path.join(ROOT, "audio_ab"))
 
 from cer_ab import cer, decode_trial  # noqa: E402
 from corpus import FS, load as load_corpus  # noqa: E402
-from stats import bootstrap_ci, paired, verdict  # noqa: E402
+from provenance import stamp  # noqa: E402
+from stats import bootstrap_ci, holm, n_for_effect, paired, verdict  # noqa: E402
 
 _ORIG_BLANK = [None]
 
@@ -192,24 +193,49 @@ def main(argv):
               f"({time.perf_counter() - t00:.0f}s)", flush=True)
 
     base_c = np.array([c for *_, c in res["base"]])
+    labels = [l for l, _ in variants if l != "base"]
+    deltas = {}
+    for label in labels:
+        arr = np.array([c for *_, c in res[label]])
+        deltas[label] = (arr, paired(base_c, arr, seed=13))
+    p_holm = holm([deltas[l][1]["p_sign"] for l in labels]) if labels else np.zeros(0)
     summary = {}
     print(f"\n{'variant':28s} {'CER':>6s} {'delta':>8s} {'CI':>18s} "
-          f"{'p':>6s}  verdict")
+          f"{'p':>6s} {'p_holm':>7s} {'n(.05)':>6s}  verdict")
     for label, _ in variants:
-        arr = np.array([c for *_, c in res[label]])
-        d = paired(base_c, arr, seed=13)
+        if label == "base":
+            arr = base_c
+            d = {"mean": 0.0, "lo": 0.0, "hi": 0.0, "p_sign": 1.0,
+                 "significant": False}
+            p_h, nneed = 1.0, 0
+        else:
+            arr, d = deltas[label]
+            d = dict(d)
+            idx = labels.index(label)
+            p_h = float(p_holm[idx])
+            d["p_holm"] = p_h
+            sigma = float(np.std(arr - base_c))
+            nneed = n_for_effect(sigma, 0.05)
         v = verdict(d, min_effect=0.01)
+        if label != "base" and d.get("significant") and p_h >= 0.05:
+            v = "trend only (Holm n.s.)"
         summary[label] = {"cer_mean": round(float(arr.mean()), 4),
                           "delta": {k: round(float(d[k]), 4)
                                     for k in ("mean", "lo", "hi", "p_sign")},
-                          "significant": d["significant"], "verdict": v}
+                          "p_holm": round(p_h, 4),
+                          "holm_significant": bool(p_h < 0.05),
+                          "n_for_0.05": int(nneed),
+                          "significant": bool(d.get("significant", False)),
+                          "verdict": v}
         print(f"{label:28s} {arr.mean():6.3f} {d['mean']:+8.4f} "
-              f"[{d['lo']:+.4f},{d['hi']:+.4f}] {d['p_sign']:6.3f}  {v}")
+              f"[{d['lo']:+.4f},{d['hi']:+.4f}] {d['p_sign']:6.3f} "
+              f"{p_h:7.3f} {nneed:6d}  {v}")
 
     path = os.path.join(out, f"sweep_{scenario}.json")
     with open(path, "w", encoding="utf-8") as f:
         json.dump({"scenario": scenario, "snrs": snrs, "axes": axes,
                    "base": base_over, "summary": summary,
+                   "provenance": stamp(),
                    "trials": {k: [{"snr": s, "utt": u, "seed": sd, "cer": c}
                                   for s, u, sd, c in v] for k, v in res.items()}},
                   f, ensure_ascii=False, indent=2)

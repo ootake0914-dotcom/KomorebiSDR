@@ -1,6 +1,16 @@
 {
   "version": 1,
   "full": true,
+  "provenance": {
+    "date": "2026-10-03T18:46:15",
+    "python": "3.11.15",
+    "numpy": "2.4.6",
+    "git_head": "4d5f732",
+    "git_dirty": true,
+    "faster_whisper": "1.2.1",
+    "onnxruntime": "1.30.0",
+    "torch": "2.14.1+cpu"
+  },
   "metrics": {
     "ssb_clean_blank_changed": {
       "value": 37.0,

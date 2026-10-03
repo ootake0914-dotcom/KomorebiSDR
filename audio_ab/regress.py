@@ -22,6 +22,7 @@ sys.path.insert(0, ROOT)
 sys.path.insert(0, os.path.join(ROOT, "audio_ab"))
 
 from corpus import FS, load as load_corpus  # noqa: E402
+from provenance import stamp  # noqa: E402
 
 GOLDEN = os.path.join(ROOT, "audio_ab", "golden.json")
 BLOCK_WFM, BLOCK_IF, BLOCK_SSB = 132096, 16512, 2208
@@ -227,13 +228,23 @@ def main(argv):
     t0 = time.perf_counter()
     cur = measure(full=full)
     if update:
-        gold = {"version": 1, "full": full,
-                "metrics": {k: {"value": float(v), "tol": float(TOLS.get(k, 0.1))}
-                            for k, v in cur.items()}}
+        old = {}
+        try:
+            with open(GOLDEN, encoding="utf-8") as f:
+                old = json.load(f).get("metrics", {})
+        except Exception:
+            pass
+        metrics = dict(old)
+        for k, v in cur.items():
+            metrics[k] = {"value": float(v), "tol": float(TOLS.get(k, 0.1))}
+        gold = {"version": 1,
+                "full": bool(full or any(k.startswith(("ssb_cer", "real_"))
+                                         for k in metrics)),
+                "provenance": stamp(), "metrics": metrics}
         with open(GOLDEN, "w", encoding="utf-8") as f:
             json.dump(gold, f, indent=2)
         print(f"golden updated ({GOLDEN}, {time.perf_counter() - t0:.0f}s)")
-        for k, v in cur.items():
+        for k, v in sorted(cur.items()):
             print(f"  {k:26s} {v:10.4f}")
         return 0
     try:

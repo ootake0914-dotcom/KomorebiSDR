@@ -24,6 +24,7 @@ sys.path.insert(0, os.path.join(ROOT, "audio_ab"))
 
 from corpus import FS, load as load_corpus, norm_ja  # noqa: E402
 from metrics import evaluate  # noqa: E402
+from provenance import stamp  # noqa: E402
 from stats import bootstrap_ci, paired, verdict  # noqa: E402
 
 
@@ -141,7 +142,8 @@ def main(argv):
     print(f"scenario={scenario} mode={sc['mode']} utts={n_utts} "
           f"seeds={seeds_n} snrs={snrs}", flush=True)
     result = {"scenario": scenario, "mode": sc["mode"], "utts": n_utts,
-              "seeds": seeds_n, "speakers": list(speakers), "snrs": {}}
+              "seeds": seeds_n, "speakers": list(speakers), "snrs": {},
+              "provenance": stamp()}
     t00 = time.perf_counter()
     for snr in snrs:
         trials = []  # (utt_idx, seed, cer_off, cer_on, y_off, y_on)
