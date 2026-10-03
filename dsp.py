@@ -254,11 +254,13 @@ class SdrDspPipeline(DspBlackMagicMixin, DspAmMixin, DspNfmMixin,
         # 選局直後のファストスタート用ブロックカウンタ (set_offset_freqで0へ。
         # ゲイン自体は維持し音量跳躍を防ぎつつ、時定数のみ一時短縮する)
         self._agc_blk = 0
-        # 呼吸防止: attack後のreleaseホールド (0.4s≒7ブロック)、
-        # ±1.5dBヒステリシス不感帯 (微小変動でのジリ動を抑止)
+        # 呼吸防止: attack後のreleaseホールド (0.4s≒7ブロック)。
+        # ヒステリシス不感帯は設計目標「局間±1LU」から0.5dBへ (1.5dBでは
+        # 両局が各1.5dB手前で止まり差3LUになることをtest_lufs_agcで実測)。
+        # 0.5dB・秒オーダー時定数なら更新は0.05dB/block未満でジッパー無し。
         self._agc_hold_n = 0
         self._agc_hold_max = 7
-        self._agc_hyst_db = 1.5
+        self._agc_hyst_db = 0.5
         # R128ラウドネス推定への切替 (既定OFF。ON時はRMS推定をLUFS推定に
         # 置換。時定数・範囲・凍結条件は従来通り。ゲイン状態は共有)
         self.lufs_agc_enabled = False

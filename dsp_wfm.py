@@ -954,9 +954,15 @@ class DspWfmMixin:
             if len(audio) == 0:
                 return audio
             x = np.asarray(audio, dtype=np.float64)
+            cur = float(self.slow_agc_gain)
             rms = float(np.sqrt(np.mean(x * x)))
-            if not np.isfinite(rms) or rms < float(self._slow_agc_floor):
+            if not np.isfinite(rms):
                 return audio
+            # 凍結パスでも必ず現ゲインを適用する。未適用で素通しすると
+            # 収束 (不感帯内) 後にゲインが外れ、局間レベリングが丸ごと
+            # 無効化される (test_lufs_agcの実測で発覚)。
+            if rms < float(self._slow_agc_floor):
+                return (x * cur).astype(np.float32)
             if bool(getattr(self, "lufs_agc_enabled", False)):
                 try:
                     from audiophile_dsp import LoudnessNormalizer
@@ -966,7 +972,7 @@ class DspWfmMixin:
                     mono = x if x.ndim == 1 else np.mean(x, axis=1)
                     lufs = self._lufs_norm.push(mono)
                     if lufs is None:
-                        return audio
+                        return (x * cur).astype(np.float32)
                     raw_desired = self._lufs_norm.gain_for(lufs)
                 except Exception:
                     raw_desired = float(self.slow_agc_target) / (rms + 1e-12)
@@ -974,7 +980,6 @@ class DspWfmMixin:
                 raw_desired = float(self.slow_agc_target) / (rms + 1e-12)
             desired = float(np.clip(raw_desired,
                                     float(self.slow_agc_min), float(self.slow_agc_max)))
-            cur = float(self.slow_agc_gain)
             # ブロック長から時定数を換算 (audio_rate基準)
             try:
                 dt = len(audio) / float(self.audio_rate)
@@ -994,7 +999,7 @@ class DspWfmMixin:
             except Exception:
                 _hyst, _ddb = 1.5, 99.0
             if abs(_ddb) < _hyst:
-                return audio
+                return (x * cur).astype(np.float32)
             is_attack = bool(desired < cur)
             # ホールド: attack直後のrelease方向を一定ブロック抑止
             # (語尾・休止での持ち上げ呼吸を防止。attack自体は即時)
@@ -1007,7 +1012,7 @@ class DspWfmMixin:
                     self._agc_hold_n = _hold - 1
                 except Exception:
                     pass
-                return audio
+                return (x * cur).astype(np.float32)
             # 番組ゲート: 静かな不確定区間の持ち上げは保留する。
             # speech_probが中間 (0.3〜0.7)＝雑音/間隙らしく、かつRMSが目標の
             # 半分未満のときだけ凍結。音楽 (0寄り)・音声 (1寄り) の確信時は通す。
@@ -1018,7 +1023,7 @@ class DspWfmMixin:
                     if _eq is not None and bool(getattr(_eq, "enabled", False)):
                         _sp = float(getattr(_eq, "speech_prob", 0.5))
                     if _sp is not None and np.isfinite(_sp) and 0.3 < _sp < 0.7:
-                        return audio
+                        return (x * cur).astype(np.float32)
                 except Exception:
                     pass
             tau = float(self.slow_agc_attack) if is_attack else float(self.slow_agc_release)
