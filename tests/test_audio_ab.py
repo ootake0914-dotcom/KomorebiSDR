@@ -182,6 +182,51 @@ def test_sweep_hooks() -> bool:
     return ok
 
 
+def test_reference_metrics() -> bool:
+    from metrics import evaluate, seg_snr, shift, si_sdr, stoi_score
+    rng = np.random.default_rng(0)
+    t = np.arange(48000) / 48000.0
+    ref = (0.4 * np.sin(2 * np.pi * 440 * t)
+           + 0.2 * np.sin(2 * np.pi * 1200 * t)
+           + 0.1 * rng.standard_normal(len(t))).astype(np.float32)
+    ok1 = si_sdr(ref, ref) > 60.0 and stoi_score(ref, ref) > 0.99
+    pad = np.zeros(600, dtype=np.float32)
+    ref2 = np.concatenate([ref, pad])          # 末尾も伸ばして重なりを保つ
+    delayed = np.concatenate([pad, ref2])      # 600サンプル遅れたコピー
+    ok2 = si_sdr(ref2, delayed) > 60.0
+    noisy = (ref + 0.25 * rng.standard_normal(len(ref))).astype(np.float32)
+    ok3 = (si_sdr(ref, noisy) < 15.0
+           and seg_snr(ref, noisy) < seg_snr(ref2, delayed))
+    ev = evaluate(ref2, delayed)
+    ok4 = (set(ev) == {"si_sdr", "seg_snr", "stoi"} and ev["stoi"] > 0.98)
+    ok = bool(ok1 and ok2 and ok3 and ok4)
+    print(f"[{'OK' if ok else 'FAIL'}] reference metrics "
+          f"(clean={ok1} delay={ok2} noisy={ok3} keys={ok4})")
+    return ok
+
+
+def test_realdata_registry() -> bool:
+    import realdata
+    ok1 = ("fm_lucky60" in realdata.ITEMS
+           and all("file" in v and "mode" in v
+                   for v in realdata.ITEMS.values()))
+    avail = realdata.available()
+    ok2 = isinstance(avail, list) and set(avail) <= set(realdata.ITEMS)
+    ok3 = True
+    if "fm_lucky60" not in avail:
+        try:
+            realdata.load("fm_lucky60")
+            ok3 = False  # 無いのに読めたらおかしい
+        except FileNotFoundError:
+            ok3 = True
+    else:
+        ok3 = bool(os.path.exists(realdata.path("fm_lucky60")))
+    ok = bool(ok1 and ok2 and ok3)
+    print(f"[{'OK' if ok else 'FAIL'}] realdata registry "
+          f"(items={len(realdata.ITEMS)}, available={avail})")
+    return ok
+
+
 def test_regress_golden() -> bool:
     import regress
     ttsdir = os.path.join(os.path.dirname(os.path.dirname(
@@ -207,6 +252,8 @@ def main() -> int:
     ok &= test_am_auto_engage()
     ok &= test_fast_cache()
     ok &= test_sweep_hooks()
+    ok &= test_reference_metrics()
+    ok &= test_realdata_registry()
     ok &= test_regress_golden()
     print("OK" if ok else "FAILED")
     return 0 if ok else 1

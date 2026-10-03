@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "full": false,
+  "full": true,
   "metrics": {
     "ssb_clean_blank_changed": {
       "value": 37.0,
@@ -25,6 +25,30 @@
     "nr_ssb_delta_rms_db": {
       "value": -0.5183096016156836,
       "tol": 0.5
+    },
+    "ssb_cer_off_0db": {
+      "value": 0.2957393483709273,
+      "tol": 0.08
+    },
+    "ssb_cer_on_0db": {
+      "value": 0.29741019214703424,
+      "tol": 0.08
+    },
+    "real_fm_lucky60_hiss_db": {
+      "value": -13.91622623031098,
+      "tol": 1.0
+    },
+    "real_fm_lucky60_nr_gain_min": {
+      "value": 0.9845323703356378,
+      "tol": 0.1
+    },
+    "real_fm_nhk60_hiss_db": {
+      "value": -1.700979218420997,
+      "tol": 1.0
+    },
+    "real_fm_nhk60_nr_gain_min": {
+      "value": 0.5661923992857167,
+      "tol": 0.15
     }
   }
 }

@@ -35,6 +35,10 @@ TOLS = {
     "nr_ssb_delta_rms_db": 0.5,
     "ssb_cer_off_0db": 0.08,
     "ssb_cer_on_0db": 0.08,
+    "real_fm_lucky60_hiss_db": 1.0,
+    "real_fm_lucky60_nr_gain_min": 0.10,
+    "real_fm_nhk60_hiss_db": 1.0,
+    "real_fm_nhk60_nr_gain_min": 0.15,
 }
 
 
@@ -70,6 +74,16 @@ def _band(x, lo, hi, n=2752):
         x[k * n:(k + 1) * n] * np.hanning(n)))[sel] ** 2))
         for k in range(len(x) // n)]
     return 10 * np.log10(np.mean(vals) + 1e-24)
+
+
+def _band_floor(x, lo, hi, q=10, n=2752):
+    """q10パーセンタイル床 (過去のFM解析と同じ定義)。番組HFに鈍い。"""
+    fr = np.fft.rfftfreq(n, 1.0 / FS)
+    sel = (fr >= lo) & (fr <= hi)
+    vals = [float(np.mean(np.abs(np.fft.rfft(
+        x[k * n:(k + 1) * n] * np.hanning(n)))[sel] ** 2))
+        for k in range(len(x) // n)]
+    return 10 * np.log10(np.percentile(vals, q) + 1e-24)
 
 
 def measure(full=False):
@@ -186,6 +200,24 @@ def measure(full=False):
                 y = _decode(dd, data, BLOCK_SSB, "demodulate_ssb", ("USB",))
                 cs.append(cer(u["text"], spotter.transcribe(y, FS)))
             m[f"ssb_cer_{tag}_0db"] = float(np.mean(cs))
+    if full:
+        # 実録 (gitignore) は存在時のみ。NR抑圧量と幅推定器の下限を固定化。
+        try:
+            from realdata import available, decode_wfm
+            avail = available()
+            for name in ("fm_lucky60", "fm_nhk60"):
+                if name not in avail:
+                    continue
+                y0, _ = decode_wfm(name, False)
+                y1, info = decode_wfm(name, True, telemetry=True)
+                nn = min(len(y0), len(y1))
+                s0 = (y0[:nn, 0] - y0[:nn, 1]) * 0.5
+                s1 = (y1[:nn, 0] - y1[:nn, 1]) * 0.5
+                m[f"real_{name}_hiss_db"] = (_band_floor(s1, 8000, 12000)
+                                             - _band_floor(s0, 8000, 12000))
+                m[f"real_{name}_nr_gain_min"] = float(info["nr_gain_min"])
+        except Exception as e:
+            print(f"real metrics skipped: {e}")
     return m
 
 
@@ -215,7 +247,8 @@ def main(argv):
           f"{'tol':>6s}  status")
     for k, gv in gold["metrics"].items():
         if k not in cur:
-            print(f"{k:26s} {'-':>10s} {'-':>10s} {'-':>9s} {'-':>6s}  skipped")
+            print(f"{k:26s} {'-':>10s} {'-':>10s} {'-':>9s} {'-':>6s}  "
+                  f"skipped (--full only)")
             continue
         v = float(cur[k])
         dlt = v - float(gv["value"])

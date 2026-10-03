@@ -23,6 +23,7 @@ sys.path.insert(0, ROOT)
 sys.path.insert(0, os.path.join(ROOT, "audio_ab"))
 
 from corpus import FS, load as load_corpus, norm_ja  # noqa: E402
+from metrics import evaluate  # noqa: E402
 from stats import bootstrap_ci, paired, verdict  # noqa: E402
 
 
@@ -80,6 +81,7 @@ def main(argv):
     mos = False
     beam = 5
     use_cache = True
+    ref_metrics = True
     out = os.path.join(ROOT, "audio_ab", "out")
     i = 0
     while i < len(argv):
@@ -110,6 +112,9 @@ def main(argv):
             i += 2
         elif argv[i] == "--no-cache":
             use_cache = False
+            i += 1
+        elif argv[i] == "--no-ref":
+            ref_metrics = False
             i += 1
         elif argv[i] == "--out" and i + 1 < len(argv):
             out = argv[i + 1]
@@ -154,6 +159,12 @@ def main(argv):
                     outs[tag] = y
                     row[f"cer_{tag}"] = round(cer(utt["text"],
                                                   spotter.transcribe(y, FS)), 4)
+                if ref_metrics:
+                    for tag in ("off", "on"):
+                        try:
+                            row[f"ref_{tag}"] = evaluate(utt["x"], outs[tag], FS)
+                        except Exception as e:
+                            row[f"ref_{tag}"] = {"err": str(e)}
                 trials.append((row, outs))
             print(f"  snr={snr:g} utt={ui} done "
                   f"(off={trials[-1][0]['cer_off']} on={trials[-1][0]['cer_on']})",
@@ -163,10 +174,23 @@ def main(argv):
         ci_off = bootstrap_ci(off, seed=1)
         ci_on = bootstrap_ci(on, seed=2)
         delta = paired(off, on, seed=3, tol=0.0)
+        ref_summary = {}
+        if ref_metrics:
+            for m in ("si_sdr", "seg_snr", "stoi"):
+                ov = [t[0].get("ref_off", {}).get(m) for t in trials]
+                nv = [t[0].get("ref_on", {}).get(m) for t in trials]
+                ov = [v for v in ov if isinstance(v, (int, float))]
+                nv = [v for v in nv if isinstance(v, (int, float))]
+                if len(ov) >= 2 and len(nv) == len(ov):
+                    ref_summary[m] = {
+                        "off": bootstrap_ci(ov, seed=4),
+                        "on": bootstrap_ci(nv, seed=5),
+                        "delta": paired(ov, nv, seed=6)}
         row = {
             "n_trials": len(trials),
             "off": ci_off, "on": ci_on, "delta_on_minus_off": delta,
             "verdict": verdict(delta, min_effect=0.01),
+            "ref_metrics": ref_summary,
             "trials": [t[0] for t in trials],
         }
         if mos:
@@ -196,6 +220,12 @@ def main(argv):
               f"delta {delta['mean']:+.4f} "
               f"[{delta['lo']:+.4f},{delta['hi']:+.4f}] "
               f"p={delta['p_sign']:.3f} -> {row['verdict']}", flush=True)
+        for m, s in ref_summary.items():
+            print(f"       ref {m:8s} off {s['off']['mean']:+8.2f} "
+                  f"on {s['on']['mean']:+8.2f} "
+                  f"delta {s['delta']['mean']:+.3f} "
+                  f"[{s['delta']['lo']:+.3f},{s['delta']['hi']:+.3f}]",
+                  flush=True)
         if mos:
             print(f"       scoreq {row.get('scoreq_off')}->{row.get('scoreq_on')}"
                   f"  p835 {row.get('p835_off')}->{row.get('p835_on')}",
