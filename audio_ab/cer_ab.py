@@ -78,6 +78,8 @@ def main(argv):
     seeds_n = 2
     speakers = (3, 2, 8, 11)
     mos = False
+    beam = 5
+    use_cache = True
     out = os.path.join(ROOT, "audio_ab", "out")
     i = 0
     while i < len(argv):
@@ -103,6 +105,12 @@ def main(argv):
         elif argv[i] == "--mos":
             mos = True
             i += 1
+        elif argv[i] == "--beam" and i + 1 < len(argv):
+            beam = int(argv[i + 1])
+            i += 2
+        elif argv[i] == "--no-cache":
+            use_cache = False
+            i += 1
         elif argv[i] == "--out" and i + 1 < len(argv):
             out = argv[i + 1]
             i += 2
@@ -115,11 +123,11 @@ def main(argv):
     os.makedirs(out, exist_ok=True)
 
     from dsp import SdrDspPipeline
-    from score_noref import AsrSpotter
+    from fast import CachedAsr
 
     corpus = load_corpus(utts_n, speakers=speakers)
     n_utts = len(corpus)
-    spotter = AsrSpotter("small")
+    spotter = CachedAsr("small", beam=beam, cache=use_cache)
     scoreq = dnsmos = None
     if mos:
         from score_noref import DnsmosScorer, MosScorer
@@ -196,7 +204,7 @@ def main(argv):
     path = os.path.join(out, f"cer_stats_{scenario}.json")
     with open(path, "w", encoding="utf-8") as f:
         json.dump(result, f, ensure_ascii=False, indent=2)
-    print(f"saved {path} ({time.perf_counter() - t00:.0f}s)")
+    print(f"saved {path} ({time.perf_counter() - t00:.0f}s)  {spotter.stats()}")
     return 0
 
 

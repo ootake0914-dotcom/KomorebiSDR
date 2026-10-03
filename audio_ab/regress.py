@@ -173,9 +173,9 @@ def measure(full=False):
         (float(np.sqrt(np.mean(b0[:nn] ** 2))) + 1e-18) + 1e-18)
 
     if full:
-        from score_noref import AsrSpotter
+        from fast import CachedAsr
         from cer_ab import cer
-        spotter = AsrSpotter("small")
+        spotter = CachedAsr("small")
         utts3 = load_corpus(3)
         for tag, on in (("off", False), ("on", True)):
             cs = []

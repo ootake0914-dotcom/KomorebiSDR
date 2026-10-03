@@ -88,9 +88,9 @@ class AsrSpotter:
         from faster_whisper import WhisperModel
         self._m = WhisperModel(model, device="cpu", compute_type="int8")
 
-    def transcribe(self, x, sr, language="ja"):
+    def transcribe(self, x, sr, language="ja", beam_size=5):
         x16 = fft_resample(x, sr, 16000).astype(np.float32)
-        segs, _ = self._m.transcribe(x16, language=language, beam_size=5)
+        segs, _ = self._m.transcribe(x16, language=language, beam_size=beam_size)
         return "".join(s.text for s in segs)
 
 

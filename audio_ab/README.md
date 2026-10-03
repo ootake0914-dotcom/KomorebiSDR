@@ -18,6 +18,7 @@ python audio_ab/sweep.py --list               # スイープ軸一覧
 python audio_ab/sweep.py --scenario ssb --axis nr.floor_db=-18,-12 --snrs 5
 python audio_ab/regress.py                    # goldenドリフト検査 (約6s)
 python audio_ab/regress.py --update [--full]  # 基準更新 (--fullでCER追加)
+python audio_ab/subjective.py --xcorr         # 指標同士の相関 (主観記入後は一致率)
 python audio_ab/summary.py --csv              # 結果一覧
 python audio_ab/record_raw.py 7.100 LSB 30 --tag night   # 生IQ録音
 ```
@@ -72,6 +73,21 @@ v2は文ごとに試行を増やし、平均±CIと対の符号検定で判定�
   と比較し、ドリフトでexit 1。約6秒。`--full` でSSB CER 2指標も検査。
   run_allの二値テストでは拾えない「静かな悪化」(抑圧量が1dB変わる等) を
   検出する。goldenは `--update` で手動更新し、無断で書き換えない。
+
+## 高速化と主観突き合わせ
+
+- `fast.py` — ASR結果をデコード後音声のSHA1でディスクキャッシュ
+  (`out/asr_cache/`)。DSPコード・パラメータを変えれば音声が変わるため
+  自動で失効する。同一設定の再実行は実測27s→1s。スレッド並列はCT2が
+  1推論で4コアを使い切るため効果なし (24.9→25.6s)、beam=5→1も26→29sで
+  順位が変わるため探索にも不採用。キャッシュが本命。
+  `cer_ab`/`sweep`/`regress --full` が自動で使う (`--no-cache` で無効、
+  `--beam` で変更可。終了時にヒット率を表示)。
+- `subjective.py` — `listen_log.csv` (prefer=A/B/same) と scores.json を
+  突き合わせ、指標ごとの符号一致率・Spearmanを出す。未記入でも `--xcorr`
+  で指標同士の相関行列 (どの指標が冗長か) を出せる。現状listen_logは
+  未記入のため、AB試聴→記入後に「どの指標が耳を予測するか」が決まる。
+  (参考: 現有16項目では scoreq–SIG 0.70、hiss–STOI 1.00 (n=4) など)
 
 ## 試聴手順 (耳をやる場合)
 

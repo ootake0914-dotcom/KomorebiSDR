@@ -82,7 +82,7 @@ def parse_pair(s):
 
 def main(argv):
     from dsp import SdrDspPipeline
-    from score_noref import AsrSpotter
+    from fast import CachedAsr
     from simulate import SCENARIOS, build as build_scenario
 
     if "--list" in argv:
@@ -92,6 +92,7 @@ def main(argv):
     scenario = "ssb"
     snrs, utts_n, seeds_n = [0.0], 4, 1
     speakers = (3, 2, 8, 11)
+    beam, use_cache = 5, True
     axes = {}
     base_over = {}
     out = os.path.join(ROOT, "audio_ab", "out")
@@ -110,6 +111,12 @@ def main(argv):
         elif a == "--seeds" and i + 1 < len(argv):
             seeds_n = int(argv[i + 1])
             i += 2
+        elif a == "--beam" and i + 1 < len(argv):
+            beam = int(argv[i + 1])
+            i += 2
+        elif a == "--no-cache":
+            use_cache = False
+            i += 1
         elif a == "--speakers" and i + 1 < len(argv):
             speakers = tuple(int(x) for x in argv[i + 1].split(","))
             i += 2
@@ -149,7 +156,7 @@ def main(argv):
 
     corpus = load_corpus(utts_n, speakers=speakers)
     n_utts = len(corpus)
-    spotter = AsrSpotter("small")
+    spotter = CachedAsr("small", beam=beam, cache=use_cache)
     os.makedirs(out, exist_ok=True)
 
     trials = []
@@ -209,7 +216,7 @@ def main(argv):
     if _ORIG_BLANK[0] is not None:
         import dsp_nfm
         dsp_nfm.blank_impulses_iq = _ORIG_BLANK[0]
-    print(f"saved {path}")
+    print(f"saved {path}  {spotter.stats()}")
     return 0
 
 
