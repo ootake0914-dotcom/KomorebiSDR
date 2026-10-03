@@ -54,6 +54,8 @@ TOLS = {
     "wfm_adj_sisdr_db": 1.0,
     "wfm_aci_du_r_db": 2.0,
     "wfm_aci_above_r_db": 3.0,
+    "wfm_aci_gain_on": 0.10,
+    "wfm_aci_side_gain_db": 2.0,
 }
 
 
@@ -319,12 +321,15 @@ def measure(full=False):
     m["wfm_if_stop_106k_db"] = _if_resp_db(106000.0) - ref0
     m["wfm_if_alias_200k_db"] = _if_resp_db(200000.0) - ref0
 
-    # 7c) ACI: ±200kHz妨害時のクリーン比 (SI-SDR。高いほど妨害に強い)
+    # 7c) ACI: ±200kHz妨害時のモノラル番組の劣化 (mid SI-SDR。ガードの
+    # L-R絞りに影響されない。高いほど妨害に強い)
     from metrics import si_sdr
     wf_adj = build("wfm-adjacent", utts2, 20.0, seed=99)
     ya = _decode_stereo(_wf_pipe(False), wf_adj, BLOCK_WFM)
     nn_adj = min(len(y0), len(ya))
-    m["wfm_adj_sisdr_db"] = si_sdr(y0[:nn_adj, 0], ya[:nn_adj, 0], align=True)
+    mid_c = (y0[:nn_adj, 0] + y0[:nn_adj, 1]) * 0.5
+    mid_a = (ya[:nn_adj, 0] + ya[:nn_adj, 1]) * 0.5
+    m["wfm_adj_sisdr_db"] = si_sdr(mid_c, mid_a, align=True)
 
     # 7d) ACI検出: +200kHz・+10dBの強妨害で右側D/Uが下がる (床ガード付き)
     wf_adj10 = build("wfm-adjacent", utts2, 20.0, seed=99,
@@ -333,6 +338,30 @@ def measure(full=False):
     _decode_stereo(d_a10, wf_adj10, BLOCK_WFM)
     m["wfm_aci_du_r_db"] = float(d_a10._aci_r_db)
     m["wfm_aci_above_r_db"] = float(d_a10._aci_r_above_db)
+
+    # 7e) ACIガード効果: 定常区間の側波帯妨害/モノラル番組比 (depth 0.6 vs 0)
+    def _side_ratio(yc, ya, tail=2 * FS):
+        n = min(len(yc), len(ya))
+        t = slice(tail, n)
+        sc = (yc[:n, 0] - yc[:n, 1]) * 0.5
+        mc = (yc[:n, 0] + yc[:n, 1]) * 0.5
+        sa = (ya[:n, 0] - ya[:n, 1]) * 0.5
+        a = float(np.dot(sa[t], sc[t]) / (np.dot(sc[t], sc[t]) + 1e-18))
+        resid = sa[t] - a * sc[t]
+        return float(10.0 * np.log10(
+            (np.mean(resid ** 2) + 1e-24) / (np.mean(mc[t] ** 2) + 1e-24)))
+
+    y_clean2 = _decode_stereo(_wf_pipe(True),
+                              build("wfm", utts2, 20.0, seed=99), BLOCK_WFM)
+    d_g0 = _wf_pipe(True)
+    d_g0.aci_depth = 0.0
+    y_g0 = _decode_stereo(d_g0, wf_adj10, BLOCK_WFM)
+    d_g6 = _wf_pipe(True)
+    d_g6.aci_depth = 0.6
+    y_g6 = _decode_stereo(d_g6, wf_adj10, BLOCK_WFM)
+    m["wfm_aci_gain_on"] = float(d_g6.aci_gain)
+    m["wfm_aci_side_gain_db"] = (_side_ratio(y_clean2, y_g6)
+                                 - _side_ratio(y_clean2, y_g0))
 
     # 8) TDA位相スリップ補修: 既知スリップ注入時のクリーン基準との誤差低減
     rf = 1152000.0

@@ -1741,10 +1741,10 @@ class DspWfmMixin:
         self.multipath_gain = 1.0
         # 隣接妨害 (ACI) ガード: 左右いずれかのD/U悪化でL-R側を先に絞る
         # (38kHz副搬送波が先に汚れるため)。クリーン時は1.0でビット等価。
-        # depth=0 (既定OFF) は検出・テレメトリのみ。耳テスト後に有効化する
-        # (sweep hook: aci.depth、ABで採否を決める)。
+        # depth=0.6 は測定基盤の判定 (側波帯妨害/モノラル番組比が平均-6.3dB・
+        # 36/36勝・p<1e-4、mid SI-SDRは完全不変) に基づく。sweep hook: aci.depth。
         self.aci_gain = 1.0
-        self.aci_depth = 0.0
+        self.aci_depth = 0.6
         self._mp_var = 0.0
         self.mp_lo = 0.10
         self.mp_hi = 0.35

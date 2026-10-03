@@ -2,10 +2,10 @@
   "version": 1,
   "full": true,
   "provenance": {
-    "date": "2026-10-04T08:15:24",
+    "date": "2026-10-04T08:28:10",
     "python": "3.11.15",
     "numpy": "2.4.6",
-    "git_head": "98eb089",
+    "git_head": "5694555",
     "git_dirty": true,
     "faster_whisper": "1.2.1",
     "onnxruntime": "1.30.0",
@@ -105,7 +105,7 @@
       "tol": 3.0
     },
     "wfm_adj_sisdr_db": {
-      "value": 10.29827371348418,
+      "value": 7.823554632296533,
       "tol": 1.0
     },
     "wfm_aci_du_r_db": {
@@ -115,6 +115,14 @@
     "wfm_aci_above_r_db": {
       "value": 39.29497748902166,
       "tol": 3.0
+    },
+    "wfm_aci_gain_on": {
+      "value": 0.40003413777209196,
+      "tol": 0.1
+    },
+    "wfm_aci_side_gain_db": {
+      "value": -7.836523056030273,
+      "tol": 2.0
     }
   }
 }
