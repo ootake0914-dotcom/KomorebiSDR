@@ -932,11 +932,15 @@ class SdrDspPipeline(DspBlackMagicMixin, DspAmMixin, DspNfmMixin,
         # Hyper連続認知制御: フィルタを離散切替ではなく無段階モーフィング
         # WFM復調部では同一ブロックのスペクトルから局所SNRを取り、IF狭窄の
         # 過渡ショックだけを抑える（最終帯域＝Hyper目標のまま）。
-        if mode == "WFM" and self.cognitive_enabled:
-            self._update_cognitive_morph(
-                self._wfm_if_snr_db(spectrum_db, self.rf_rate),
-                mode="WFM",
-            )
+        if mode == "WFM":
+            _if_snr = self._wfm_if_snr_db(spectrum_db, self.rf_rate)
+            if self.cognitive_enabled:
+                self._update_cognitive_morph(_if_snr, mode="WFM")
+            else:
+                # 幅推定器の物理クロスチェック用に認知OFFでも常時更新する
+                if _if_snr is not None and np.isfinite(_if_snr):
+                    self._if_snr_db = float(_if_snr)
+                self._update_cognitive_morph()
         else:
             self._update_cognitive_morph()
 

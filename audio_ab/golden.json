@@ -2,10 +2,10 @@
   "version": 1,
   "full": true,
   "provenance": {
-    "date": "2026-10-03T18:46:15",
+    "date": "2026-10-04T05:41:45",
     "python": "3.11.15",
     "numpy": "2.4.6",
-    "git_head": "4d5f732",
+    "git_head": "7818dc9",
     "git_dirty": true,
     "faster_whisper": "1.2.1",
     "onnxruntime": "1.30.0",
@@ -21,11 +21,11 @@
       "tol": 0.8
     },
     "wfm_side_hiss_db": {
-      "value": -28.639782340415266,
+      "value": -8.323660090492552,
       "tol": 0.8
     },
     "wfm_mid_err_db": {
-      "value": -137.1936798095703,
+      "value": -136.72842407226562,
       "tol": 1.5
     },
     "am_sinr_gain_db": {
@@ -45,19 +45,19 @@
       "tol": 0.08
     },
     "real_fm_lucky60_hiss_db": {
-      "value": -13.91622623031098,
+      "value": -13.411586978339908,
       "tol": 1.0
     },
     "real_fm_lucky60_nr_gain_min": {
-      "value": 0.9845323703356378,
+      "value": 1.0,
       "tol": 0.1
     },
     "real_fm_nhk60_hiss_db": {
-      "value": -1.700979218420997,
+      "value": -0.04648856044793348,
       "tol": 1.0
     },
     "real_fm_nhk60_nr_gain_min": {
-      "value": 0.5661923992857167,
+      "value": 1.0,
       "tol": 0.15
     }
   }

@@ -565,6 +565,26 @@ class DspWfmMixin:
             floor = float(np.partition(arr, k)[k])
         else:
             floor = hf
+        # 物理SNRクロスチェック (radiko_labのオラクル実験由来): 強電界なのに
+        # 音声ドメインの床が高い場合、床はヒスでなく番組HF (ギャップの無い
+        # 連続番組) の疑いが強い。実測: 合成連続音声はIF37-47dBで床-8dB→
+        # 全モノラル化 (nr_gain 0.15)、実録LuckyはIF26dBで床-27dB (崩壊なし)。
+        # 強電界側だけ床を割り引き、幅崩壊と過剰Wienerを防ぐ (IF30dB以下の
+        # 弱電界は不変)。
+        try:
+            _snr = float(getattr(self, "_if_snr_db", 10.0))
+        except Exception:
+            _snr = 10.0
+        if np.isfinite(_snr):
+            _rel = float(np.clip(
+                (float(self._nr_snr_gate_hi) - _snr)
+                / (float(self._nr_snr_gate_hi) - float(self._nr_snr_gate_lo)),
+                0.0, 1.0))
+        else:
+            _rel = 1.0
+        if _rel < 1.0:
+            floor = float(floor) * 10.0 ** (
+                -float(self._nr_snr_penalty_db) * (1.0 - _rel) / 10.0)
         self._nr_floor_pow = floor
         ratio_db = 10.0 * np.log10((floor + 1e-12) / (mf + 1e-12))
 
@@ -1550,6 +1570,12 @@ class DspWfmMixin:
         # ブレンド量 (極端に弱い局のみモノラル化。通常はWienerが周波数別に処理)
         self._nr_lo_db = -18.0
         self._nr_hi_db = -4.0
+        # 物理SNRゲート: 強電界で音声ドメイン床が番組HF由来になるのを防ぐ
+        # (radiko_labオラクル実験: 合成連続音声IF37-47dBで全モノラル化、
+        # 実録Lucky IF26dBは崩壊なし。ゲート境界はその間)
+        self._nr_snr_gate_hi = 44.0
+        self._nr_snr_gate_lo = 32.0
+        self._nr_snr_penalty_db = 30.0
         # Wiener適用量 (これより上のノイズで段階的にサブバンド抑圧)
         # 実測: 強局(ラッキーFM 94.6)でも副搬送波ヒスは-36dBあり、旧-40/-18では
         # 適用度0.1しか立たず12-15kHzのヒスが残った。サブバンドWienerは
