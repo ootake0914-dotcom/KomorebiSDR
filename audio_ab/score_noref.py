@@ -81,6 +81,87 @@ class MosScorer:
         return self.score_array(x, sr)
 
 
+class AesScorer:
+    """Meta Audiobox-Aesthetics (PQ/CE/CU/PC)。音声・音楽・効果音の統一品質。
+
+    参照なしの制作品質 (PQ) と楽しさ (CE) が音楽/一般音の自然さを測る。
+    既存のScoreq/DNSMOS (音声中心) と相補的。CPUで数秒かかるため
+    SHA1キーのディスクキャッシュ (fast.CachedAsrと同型)。
+    モデルはHF `facebook/audiobox-aesthetics` (初回DL、gitignore外のHF cache)。
+    """
+
+    AXES = ("PQ", "CE", "CU", "PC")
+
+    def __init__(self, cache=True, cache_dir=None, max_files=20000):
+        self._p = None
+        self.cache = bool(cache)
+        self.dir = cache_dir or os.path.join(ROOT, "audio_ab", "out",
+                                             "aes_cache")
+        if self.cache:
+            os.makedirs(self.dir, exist_ok=True)
+            self._evict(int(max_files))
+
+    def _evict(self, max_files):
+        import glob as _g
+        import time as _t
+        names = sorted(_g.glob(os.path.join(self.dir, "*.json")),
+                       key=os.path.getmtime)
+        if len(names) <= max_files:
+            return
+        keep = max(1, int(max_files * 0.9))
+        for p in names[:len(names) - keep]:
+            try:
+                if _t.time() - os.path.getmtime(p) > 60:
+                    os.unlink(p)
+            except Exception:
+                pass
+
+    def _key(self, x, sr):
+        import hashlib
+        h = hashlib.sha1()
+        h.update(np.asarray(x, dtype=np.float32).tobytes())
+        h.update(str(int(sr)).encode())
+        return h.hexdigest() + ".json"
+
+    def _predict(self, x, sr):
+        if self._p is None:
+            from audiobox_aesthetics.infer import initialize_predictor
+            self._p = initialize_predictor(None)
+        import torch
+        x = np.asarray(x, dtype=np.float32).reshape(-1)
+        if x.ndim > 1:
+            x = x.mean(axis=1)
+        out = self._p.forward([{
+            "path": torch.from_numpy(x).unsqueeze(0),
+            "sample_rate": int(sr),
+        }])[0]
+        return {k: float(out[k]) for k in self.AXES}
+
+    def score_array(self, x, sr):
+        if not self.cache:
+            return self._predict(x, sr)
+        import json
+        p = os.path.join(self.dir, self._key(x, sr))
+        try:
+            with open(p, encoding="utf-8") as f:
+                d = json.load(f)
+            if all(k in d for k in self.AXES):
+                return {k: float(d[k]) for k in self.AXES}
+        except Exception:
+            pass
+        d = self._predict(x, sr)
+        try:
+            with open(p, "w", encoding="utf-8") as f:
+                json.dump(d, f)
+        except Exception:
+            pass
+        return d
+
+    def score_wav(self, path):
+        x, sr = load_wav_mono(path)
+        return self.score_array(x, sr)
+
+
 class AsrSpotter:
     """faster-whisperラッパ (16k自前変換・small/int8 CPU)。"""
 

@@ -289,6 +289,37 @@ def test_provenance_and_loudness() -> bool:
     return ok
 
 
+def test_aes_scorer() -> bool:
+    # 合成トーンではPQが逆転することがある (実測: noiseでPQ上昇)。
+    # 実音声 (TTSキャッシュ) で感度を検証する。無い場合はSKIP。
+    from score_noref import AesScorer
+    try:
+        from corpus import load as load_corpus
+        u = load_corpus(1)[0]
+        x = np.asarray(u["x"], dtype=np.float32)
+    except Exception as e:
+        print(f"[SKIP] aes scorer (corpus unavailable: {e})")
+        return True
+    try:
+        sc = AesScorer()
+        r1 = sc.score_array(x, 48000)
+    except Exception as e:
+        print(f"[SKIP] aes scorer (model unavailable: {e})")
+        return True
+    ok1 = (set(r1) == {"PQ", "CE", "CU", "PC"}
+           and all(1.0 <= float(r1[k]) <= 10.0 for k in r1))
+    r2 = sc.score_array(x, 48000)  # キャッシュヒットで同一
+    ok2 = all(abs(float(r2[k]) - float(r1[k])) < 1e-9 for k in r1)
+    nz = (x + np.random.default_rng(1).standard_normal(len(x)).astype(np.float32)
+          * float(np.sqrt(np.mean(x ** 2)))).astype(np.float32)
+    r3 = sc.score_array(nz, 48000)
+    ok3 = float(r3["PQ"]) < float(r1["PQ"]) - 1.0
+    ok = bool(ok1 and ok2 and ok3)
+    print(f"[{'OK' if ok else 'FAIL'}] aes scorer "
+          f"(keys={ok1} cache={ok2} noise<{ok3}, PQ={r1['PQ']:.2f}->{r3['PQ']:.2f})")
+    return ok
+
+
 def test_regress_golden() -> bool:
     import regress
     ttsdir = os.path.join(os.path.dirname(os.path.dirname(
@@ -317,6 +348,7 @@ def main() -> int:
     ok &= test_reference_metrics()
     ok &= test_realdata_registry()
     ok &= test_provenance_and_loudness()
+    ok &= test_aes_scorer()
     ok &= test_regress_golden()
     print("OK" if ok else "FAILED")
     return 0 if ok else 1
