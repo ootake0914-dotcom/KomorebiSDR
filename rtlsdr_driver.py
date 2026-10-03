@@ -51,6 +51,8 @@ class RtlSdrDriver:
         self.is_open = False
         self.sample_rate = 2048000
         self.center_freq = 80000000
+        # チューナーIF帯域 (0=未設定/自動)。ADC飽和対策で明示設定に使う
+        self.tuner_bandwidth = 0
         # PPM較正値 (ドングル水晶の個体誤差。HW APIがあればドングル側、
         # 無ければset_center_freq時のソフトウェア周波数オフセットで補正)
         self.ppm = 0
@@ -125,6 +127,10 @@ class RtlSdrDriver:
         self._dll.rtlsdr_cancel_async.restype = c_int
 
         # PPM周波数較正 (古いDLLに無い場合はHW経路を使わずSWフォールバック)
+        self._has_bw_api = hasattr(self._dll, "rtlsdr_set_tuner_bandwidth")
+        if self._has_bw_api:
+            self._dll.rtlsdr_set_tuner_bandwidth.argtypes = [c_void_p, c_uint32]
+            self._dll.rtlsdr_set_tuner_bandwidth.restype = c_int
         self._has_ppm_api = all(hasattr(self._dll, n) for n in
                                 ("rtlsdr_set_freq_correction", "rtlsdr_get_freq_correction"))
         if self._has_ppm_api:
@@ -198,6 +204,22 @@ class RtlSdrDriver:
         if not self.is_open:
             return self.sample_rate
         return self._dll.rtlsdr_get_sample_rate(self.dev)
+
+    def set_tuner_bandwidth(self, bw_hz: int) -> bool:
+        """チューナーIF帯域を明示設定 (Hz)。成功=True。
+
+        DLLがAPIを持つ場合のみ。帯域外の強局によるADC飽和・ゲイン低下を
+        避けるため、サンプルレートに整合した帯域を明示する (旧DLLは
+        広帯域のまま放置されることがある)。
+        """
+        self.tuner_bandwidth = int(bw_hz)
+        if not getattr(self, "_has_bw_api", False) or not self.is_open:
+            return False
+        try:
+            res = self._dll.rtlsdr_set_tuner_bandwidth(self.dev, int(bw_hz))
+            return res == 0
+        except Exception:
+            return False
 
     def compensated_freq(self, freq_hz: int) -> int:
         """SWフォールバック時の同調周波数 (HW補正中は素通し)。テスト容易性のため分離。"""
