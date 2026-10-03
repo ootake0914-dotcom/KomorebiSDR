@@ -581,8 +581,18 @@ class DspWfmMixin:
             x = float(np.clip((value_db - lo) / (hi - lo), 0.0, 1.0))
             return x * x * (3.0 - 2.0 * x)  # smoothstep
 
+        # マッピング用の超低速ヒス推定 (τ12s)。番組構成で動く速い値はゲート
+        # (s_b=ブレンド) と表示にのみ使い、Wiener適用度 (s_w) は定常値で駆動
+        # して「幅の呼吸」を防ぐ。初期化は速い値から (選局直後の立ち上がり維持)
+        if self._nr_hiss_slow is None:
+            self._nr_hiss_slow = float(self.stereo_hiss_db)
+        else:
+            a_hs = 1.0 - np.exp(-dt / 12.0)
+            self._nr_hiss_slow += a_hs * (float(self.stereo_hiss_db)
+                                          - self._nr_hiss_slow)
         s_b = amount(self.stereo_hiss_db, self._nr_lo_db, self._nr_hi_db)
-        s_w = amount(self.stereo_hiss_db, self._nr_wiener_lo_db, self._nr_wiener_hi_db)
+        s_w = amount(self._nr_hiss_slow, self._nr_wiener_lo_db,
+                     self._nr_wiener_hi_db)
         # 非対称スムージング: ノイズ増加時は速く、回復はゆっくり
         tau = 0.3 if s_b > self._nr_s else 1.5
         self._nr_s += (1.0 - np.exp(-dt / tau)) * (s_b - self._nr_s)
@@ -616,7 +626,17 @@ class DspWfmMixin:
         x_m = float(np.clip((self._nr_mono_rho - 0.15) / 0.35, 0.0, 1.0))
         self._nr_mono_w = x_m * x_m * (3.0 - 2.0 * x_m)
         # 有効値: モノラル番組ではWienerを全力(1.0)へ、S高域カットを8kHzへ寄せる
-        self._nr_sw_eff = max(self._nr_s_w, self._nr_mono_w)
+        # スルーレート制限 (非対称): 抑圧の立ち上げ (ヒス出現) は速く0.06/ブロック、
+        # 復帰 (クリーン化) は0.01/ブロックでゆっくり開く。ヒス除去の応答を
+        # 殺さず、開閉の段差・呼吸だけを丸める。
+        _sw_target = max(self._nr_s_w, self._nr_mono_w)
+        _prev = float(getattr(self, "_nr_sw_eff_prev", 0.0))
+        _delta = _sw_target - _prev
+        _step = 0.06 if _delta > 0.0 else 0.01
+        if abs(_delta) > _step:
+            _sw_target = _prev + float(np.sign(_delta)) * _step
+        self._nr_sw_eff = _sw_target
+        self._nr_sw_eff_prev = _sw_target
         self._nr_cut_eff = min(self.stereo_cut_hz, 13000.0 - 5000.0 * self._nr_mono_w)
 
     def _diff_lowpass(self, x: np.ndarray, cutoff_hz: float) -> np.ndarray:
@@ -742,10 +762,20 @@ class DspWfmMixin:
                     # Wienerの過剰抑圧（音楽性ノイズ・高域の曇り）を可聴性基準で緩和する。
                     # マスキング算出はクリーン推定 (P-N) から行う (ノイズ込み電力では
                     # ヒス自身がマスクを上げて抑圧不能になるため)。
+                    # 閾値はτ8秒で平滑化する: 瞬時値だと番組テクスチャ (9〜18秒周期)
+                    # に追従してS側抑圧量がゆっくり動き「幅の呼吸」として聞こえる
+                    # (LuckyFM 94.6の実測。9-18秒成分を約8割減衰させる)。
                     p_clean = np.maximum(
                         self._wf_p.astype(np.float64) - noise_bin, 0.0)
                     mask_thr = (p_clean @ self._wf_spread) * self._wf_mask_offset_vec
-                    gate = np.minimum(1.0, mask_thr / noise_denom).astype(np.float32)
+                    _ms = getattr(self, "_wf_mask_slow", None)
+                    if _ms is None or len(_ms) != len(mask_thr):
+                        self._wf_mask_slow = mask_thr.astype(np.float64)
+                        _ms = self._wf_mask_slow
+                    else:
+                        a_ms = 1.0 - np.exp(-(hop / float(self.audio_rate)) / 8.0)
+                        _ms += a_ms * (mask_thr - _ms)
+                    gate = np.minimum(1.0, _ms / noise_denom).astype(np.float32)
                     g_use = np.maximum(self._wf_g, gate)
                     g_use[:3] = 1.0  # DC〜低域は保護
                     g_mix = 1.0 - sw * (1.0 - g_use)
@@ -1521,6 +1551,12 @@ class DspWfmMixin:
         self._nr_mono_w = 0.0
         self._nr_mono_primed = False
         self._nr_sw_eff = 0.0             # 有効Wiener適用度 (モノラル判定反映)
+        self._nr_sw_eff_prev = 0.0        # 前ブロック値 (スルーレート制限用)
+        # マッピング専用の超低速ヒス推定 (τ12s)。ヒス推定は番組の高域/中域比
+        # なので音楽の構成でゆっくり動く (実測27秒周期±6dB)。速い値でWiener
+        # 適用度を駆動すると「幅の呼吸」になるため、適用度の計算だけ鈍らせる。
+        # 超局は初期化時に速い値から開始するため立ち上がりは従来通り。
+        self._nr_hiss_slow = None
         self._nr_cut_eff = 15000.0        # 有効S側カットオフ (モノラル判定反映)
         self._nr_hist = deque(maxlen=100)  # 差分HFパワー履歴 (下位10%をノイズフロア推定に使用)
         self._nr_mf_smooth = 0.0  # 番組パワー平滑値 (未初期化=0で初回に即時セット)

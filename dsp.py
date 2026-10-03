@@ -490,11 +490,14 @@ class SdrDspPipeline(DspBlackMagicMixin, DspAmMixin, DspNfmMixin,
         self._nr_mono_w = 0.0
         self._nr_mono_primed = False
         self._nr_sw_eff = 0.0
+        self._nr_sw_eff_prev = 0.0
+        self._nr_hiss_slow = None
         self._nr_cut_eff = 15000.0
         self._wf_p = None
         self._wf_g = None
         self._wf_xi = None
         self._wf_gamma_prev = None
+        self._wf_mask_slow = None
         self._nr_floor_pow = 0.0
         # NR遅延線もゼロ化 (set_stereo_nr単独トグル時に前状態が1ブロック混入する。
         # 長さは維持し群遅延を変えない)
