@@ -77,13 +77,14 @@ def main() -> int:
     d_native.fm_pll_enabled = False
     # EKF/位相スリップ抑制等のPython専用適応処理は
     # ネイティブ等価の対象外のため無効化 (有効だと原理的に差分が出る)
-    for _attr in ("ekf_enabled", "cognitive_enabled", "riemann_always"):
+    for _attr in ("ekf_enabled", "cognitive_enabled", "riemann_always",
+                  "sic_enabled"):
         try:
             setattr(d_native, _attr, False)
         except Exception:
             pass
     try:
-        for _obj in ("riemann_demodulator",
+        for _obj in ("riemann_demodulator", "tda_click",
                       "ultra_squelch", "cognitive_eq"):
             _o = getattr(d_native, _obj, None)
             if _o is not None and hasattr(_o, "enabled"):
@@ -99,13 +100,14 @@ def main() -> int:
     d_py.rds_enabled = False
     d_py.afc_enabled = False
     d_py.fm_pll_enabled = False
-    for _attr in ("ekf_enabled", "cognitive_enabled", "riemann_always"):
+    for _attr in ("ekf_enabled", "cognitive_enabled", "riemann_always",
+                  "sic_enabled"):
         try:
             setattr(d_py, _attr, False)
         except Exception:
             pass
     try:
-        for _obj in ("riemann_demodulator",
+        for _obj in ("riemann_demodulator", "tda_click",
                       "ultra_squelch", "cognitive_eq"):
             _o = getattr(d_py, _obj, None)
             if _o is not None and hasattr(_o, "enabled"):

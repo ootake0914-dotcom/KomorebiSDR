@@ -2,10 +2,10 @@
   "version": 1,
   "full": true,
   "provenance": {
-    "date": "2026-10-04T07:21:50",
+    "date": "2026-10-04T07:54:42",
     "python": "3.11.15",
     "numpy": "2.4.6",
-    "git_head": "2f4c257",
+    "git_head": "3109dcf",
     "git_dirty": true,
     "faster_whisper": "1.2.1",
     "onnxruntime": "1.30.0",
@@ -21,11 +21,11 @@
       "tol": 0.8
     },
     "wfm_side_hiss_db": {
-      "value": -7.844101486643822,
+      "value": -7.863848997232367,
       "tol": 0.8
     },
     "wfm_mid_err_db": {
-      "value": -136.57733154296875,
+      "value": -136.39443969726562,
       "tol": 1.5
     },
     "am_sinr_gain_db": {
@@ -45,15 +45,15 @@
       "tol": 0.08
     },
     "real_fm_lucky60_hiss_db": {
-      "value": -12.705693006751108,
+      "value": -11.58218877448887,
       "tol": 1.0
     },
     "real_fm_lucky60_nr_gain_min": {
-      "value": 0.870498082561883,
+      "value": 0.864277949994197,
       "tol": 0.1
     },
     "real_fm_nhk60_hiss_db": {
-      "value": -0.053307123284525915,
+      "value": -0.06394826412787324,
       "tol": 1.0
     },
     "real_fm_nhk60_nr_gain_min": {
@@ -61,23 +61,23 @@
       "tol": 0.15
     },
     "wfm_fr_excess_15k_db": {
-      "value": -0.12914507264276587,
+      "value": -0.01583492390117769,
       "tol": 0.8
     },
     "wfm_sep_1k_db": {
-      "value": 29.192069886164123,
+      "value": 30.606974267971147,
       "tol": 1.5
     },
     "wfm_thd_overmod_db": {
-      "value": -35.1657245673223,
+      "value": -38.34801084926945,
       "tol": 1.5
     },
     "wfm_clip_pin_frac": {
-      "value": 2.0833333333333333e-05,
+      "value": 8.333333333333333e-05,
       "tol": 0.002
     },
     "real_fm_lucky60_clip_flat_frac": {
-      "value": 4.851591609549657e-06,
+      "value": 3.0547058282349696e-06,
       "tol": 0.002
     },
     "real_fm_nhk60_clip_flat_frac": {
@@ -85,8 +85,28 @@
       "tol": 0.002
     },
     "wfm_tda_click_err_db": {
-      "value": -3.661020656961977,
+      "value": -2.7321250486876014,
       "tol": 1.5
+    },
+    "wfm_if_flat_75k_db": {
+      "value": 0.00291842425250903,
+      "tol": 0.5
+    },
+    "wfm_if_flat_94k_db": {
+      "value": -0.012548174914253458,
+      "tol": 0.5
+    },
+    "wfm_if_stop_106k_db": {
+      "value": -57.771118622179046,
+      "tol": 3.0
+    },
+    "wfm_if_alias_200k_db": {
+      "value": -75.6908078198844,
+      "tol": 3.0
+    },
+    "wfm_adj_sisdr_db": {
+      "value": 10.29827371348418,
+      "tol": 1.0
     }
   }
 }

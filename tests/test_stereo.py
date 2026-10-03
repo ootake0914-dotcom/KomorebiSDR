@@ -105,7 +105,10 @@ def main() -> int:
     print(f"[{'OK' if pilot_ok else 'FAIL'}] 19kHz pilot leak {pilot_leak:+.1f} dB (need <= -40 dB)")
     ok &= sep_ok and nr_idle and pilot_ok
 
-    noisy = make_raw(stereo=True, snr_db=12.0)
+    # 12dBでは番組トーン(1k/5k)の知覚マスキングが残ヒスを覆い、NRが意図的に
+    # 抑圧を控える (IF平坦化でL-R番組レベルが正確になりマスクが上がった)。
+    # NR機構の検証はヒスが支配的な3dBで行う。
+    noisy = make_raw(stereo=True, snr_db=3.0)
     dsp_nr, pcm_nr = decode(noisy, nr=True)
     _, pcm_off = decode(noisy, nr=False)
     hiss_nr = band_rms(pcm_nr[:, 0] - pcm_nr[:, 1], 10000.0, 14000.0)

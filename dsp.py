@@ -158,13 +158,22 @@ class SdrDspPipeline(DspBlackMagicMixin, DspAmMixin, DspNfmMixin,
         self.sic_enabled = True
         self._sic_detect_counter = 0
 
-        # IF用ローパス (±95kHz Carson標準帯域幅)
-        cutoff_if = 95000.0 / self.rf_rate
-        self.fir_if = design_fir_kaiser(num_taps=65, cutoff_norm=cutoff_if, beta=6.0)
+        # 1段目: 折り返し防止専用 (1.152M→288k)。-6dB点144kHz、通過域≈±112kHz、
+        # 阻止域≈±176kHz (65タップ)。選択度は2段目が担う。
+        self.fir_if_aa = design_fir_kaiser(num_taps=65,
+                                           cutoff_norm=144000.0 / self.rf_rate,
+                                           beta=6.0)
+        # 2段目: 288kHzの急峻なチャンネル選択度。-6dB点100kHzで通過±94kHz・
+        # 阻止±106kHz (97タップ)。±75kHz偏移を平坦に通し隣接局を落とす。
+        # 旧1段構成は±75kで-0.65dB・±106kで-13dBしかなかった (実測)。
+        self.fir_if = design_fir_kaiser(num_taps=97,
+                                        cutoff_norm=100000.0 / self.if_rate,
+                                        beta=6.5)
 
         # DX微弱局専用 IF狭帯域ローパス (±60kHz: Carson狭窄でホワイトノイズパワーを大幅低減)
-        cutoff_if_narrow = 60000.0 / self.rf_rate
-        self.fir_if_narrow = design_fir_kaiser(num_taps=65, cutoff_norm=cutoff_if_narrow, beta=6.5)
+        self.fir_if_narrow = design_fir_kaiser(num_taps=97,
+                                               cutoff_norm=60000.0 / self.if_rate,
+                                               beta=6.5)
 
 
 
@@ -199,7 +208,8 @@ class SdrDspPipeline(DspBlackMagicMixin, DspAmMixin, DspNfmMixin,
 
 
         # FIRフィルタの境界連続性保持用バッファ
-        self.history_if = np.zeros(len(self.fir_if) - 1, dtype=np.complex64)
+        self.history_if = np.zeros(len(self.fir_if_aa) - 1, dtype=np.complex64)
+        self.history_if_ch = np.zeros(len(self.fir_if) - 1, dtype=np.complex64)
         self.history_am = np.zeros(len(self.fir_am) - 1, dtype=np.complex64)
         self.history_am_narrow = np.zeros(len(self.fir_am_narrow) - 1, dtype=np.complex64)
         self.history_nfm = np.zeros(len(self.fir_nfm) - 1, dtype=np.complex64)
@@ -684,7 +694,10 @@ class SdrDspPipeline(DspBlackMagicMixin, DspAmMixin, DspNfmMixin,
             self._fir_cache.move_to_end(key)
             return taps
         if kind == "if":
-            taps = design_fir_kaiser(num_taps=65, cutoff_norm=quant / self.rf_rate, beta=6.2)
+            # 2段目 (288k) 用: 要求半帯域+6kHzを-6dB点にし通過域を確保する
+            taps = design_fir_kaiser(num_taps=97,
+                                     cutoff_norm=(quant + 6000.0) / self.if_rate,
+                                     beta=6.5)
         else:
             taps = design_fir_kaiser(num_taps=81, cutoff_norm=quant / self.audio_rate, beta=6.8)
         self._fir_cache[key] = taps
@@ -959,14 +972,18 @@ class SdrDspPipeline(DspBlackMagicMixin, DspAmMixin, DspNfmMixin,
             # SSB / CW (HF用): 複素非対称バンドパスで側波帯を選択
             iq_if = self.decimate_with_history(iq_shifted, self.fir_am_narrow, self.if_decim, "history_ssb")
         else:
-            # ワイドFM (WFM)
+            # ワイドFM (WFM): 1段目で折り返し防止 (1.152M→288k)、2段目で
+            # 急峻なチャンネル選択度 (288k・factor 1、モード/Hyperで可変)
+            iq_if = self.decimate_with_history(iq_shifted, self.fir_if_aa,
+                                               self.if_decim, "history_if")
             if self.cognitive_enabled:
                 fir_if_target = self._get_dynamic_filter("if", self.applied_if_bw_hz / 2.0)
             elif self.filter_mode == "narrow":
                 fir_if_target = self.fir_if_narrow
             else:
                 fir_if_target = self.fir_if
-            iq_if = self.decimate(iq_shifted, fir_if_target, self.if_decim)
+            iq_if = self.decimate_with_history(iq_if, fir_if_target, 1,
+                                               "history_if_ch")
 
         # デジタル自己干渉消去器 (SIC: PC直挿し時のクロック・スイッチングビート逆位相消去)
         if getattr(self, "sic_enabled", False) and getattr(self, "sic_canceller", None) is not None:

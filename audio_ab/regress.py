@@ -47,6 +47,11 @@ TOLS = {
     "real_fm_lucky60_clip_flat_frac": 0.002,
     "real_fm_nhk60_clip_flat_frac": 0.002,
     "wfm_tda_click_err_db": 1.5,
+    "wfm_if_flat_75k_db": 0.5,
+    "wfm_if_flat_94k_db": 0.5,
+    "wfm_if_stop_106k_db": 3.0,
+    "wfm_if_alias_200k_db": 3.0,
+    "wfm_adj_sisdr_db": 1.0,
 }
 
 
@@ -139,6 +144,14 @@ def _thd_plus_n(x, f, fs=FS, lo=20.0, hi=20000.0):
         else:
             res += X[i]
     return float(10.0 * np.log10(res / (fund + 1e-24) + 1e-24))
+
+
+def _fir_resp_db(h, f, fs):
+    H = np.fft.rfft(np.asarray(h, dtype=np.float64), 1 << 16)
+    fr = np.fft.rfftfreq(1 << 16, 1.0 / fs)
+    i = int(round(f / fs * (1 << 16)))
+    i = min(max(i, 0), len(H) - 1)
+    return float(20.0 * np.log10(abs(H[i]) + 1e-18))
 
 
 def _deemph_db(f, tau_us=DEEMPH_US):
@@ -282,12 +295,34 @@ def measure(full=False):
     # 復調直後 (demodulate_wfm) を直接見る
     d = _wf_front()
     raw = _wfm_tone_raw(1000.0, dev_hz=100000.0)
-    iq_if = d.decimate(d.mix_frequency(d.raw_to_iq(raw), mode="WFM"),
-                       d.fir_if, d.if_decim)
+    iq_aa = d.decimate(d.mix_frequency(d.raw_to_iq(raw), mode="WFM"),
+                       d.fir_if_aa, d.if_decim)
+    iq_if = d.decimate_with_history(iq_aa, d.fir_if, 1, "history_if_ch")
     y_pin = np.asarray(d.demodulate_wfm(iq_if))
     if y_pin.ndim == 2:
         y_pin = y_pin[:, 0]
     m["wfm_clip_pin_frac"] = _clip_flat_frac(y_pin[-FS:])
+
+    # 7b) IFチャンネル選択度 (設計応答。1段目×2段目、折り返しを含む実効値)
+    d_if = SdrDspPipeline(1152000, FS)
+
+    def _if_resp_db(f):
+        f2 = f - round(f / d_if.if_rate) * d_if.if_rate
+        return (_fir_resp_db(d_if.fir_if_aa, f, d_if.rf_rate)
+                + _fir_resp_db(d_if.fir_if, abs(f2), d_if.if_rate))
+
+    ref0 = _if_resp_db(0.0)
+    m["wfm_if_flat_75k_db"] = _if_resp_db(75000.0) - ref0
+    m["wfm_if_flat_94k_db"] = _if_resp_db(94000.0) - ref0
+    m["wfm_if_stop_106k_db"] = _if_resp_db(106000.0) - ref0
+    m["wfm_if_alias_200k_db"] = _if_resp_db(200000.0) - ref0
+
+    # 7c) ACI: ±200kHz妨害時のクリーン比 (SI-SDR。高いほど妨害に強い)
+    from metrics import si_sdr
+    wf_adj = build("wfm-adjacent", utts2, 20.0, seed=99)
+    ya = _decode_stereo(_wf_pipe(False), wf_adj, BLOCK_WFM)
+    nn_adj = min(len(y0), len(ya))
+    m["wfm_adj_sisdr_db"] = si_sdr(y0[:nn_adj, 0], ya[:nn_adj, 0], align=True)
 
     # 8) TDA位相スリップ補修: 既知スリップ注入時のクリーン基準との誤差低減
     rf = 1152000.0
