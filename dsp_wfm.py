@@ -16,6 +16,7 @@ from adaptive_dsp import (
     KalmanPilotTracker,
     HolographicAudioEnhancer,
     RiemannianTopologicalDemodulator,
+    TopologicalClickSuppressor,
     SuperSpatialBssStereoSeparator,
     RmtHankelDenoiser,
     MonoNoiseSuppressor,
@@ -304,6 +305,17 @@ class DspWfmMixin:
             self.fm_last_sample = limited[-1]
             diff = s[1:] * np.conj(s[:-1])
             demod = np.angle(diff)
+
+        # 位相スリップ (ライスクリック) 補修: 弱電界のみ。クリック検出時だけ
+        # 該当サンプルを補間値へ差し替える (クリーン・強電界ではビット等価)。
+        if (getattr(self, "tda_click", None) is not None
+                and self.tda_click.enabled
+                and float(getattr(self, "_if_snr_db", 0.0)) < self.tda_click_gate_db):
+            tda_demod, tda_mask = self.tda_click.process_with_mask(iq_if)
+            if len(tda_demod) == len(demod) and bool(np.any(tda_mask)):
+                demod = demod.copy()
+                demod[tda_mask] = tda_demod[tda_mask]
+                self.tda_clicks += int(np.count_nonzero(tda_mask))
 
         # 弱電界・モノラル時におけるEKFのシームレス・クロスフェード
         # (ステレオ時は38kHz副搬送波の広帯域通過のため広帯域差分法を維持し、
@@ -1523,6 +1535,13 @@ class DspWfmMixin:
 
         # 位相スリップ抑制型FM復調器 (特異点クリック防止)
         self.riemann_demodulator = RiemannianTopologicalDemodulator(sample_rate=self.if_rate)
+        # 位相スリップ (ライスクリック) 補修: 振幅ディップ区間の累積位相残差で
+        # 検出し、該当サンプルだけ補間へ差し替える。弱電界 (C/N推定30dB未満)
+        # のみ作動し、クリック非検出時は元の復調列とビット等価。
+        self.tda_click = TopologicalClickSuppressor(sample_rate=self.if_rate,
+                                                    max_dev_hz=75000.0)
+        self.tda_click_gate_db = 30.0
+        self.tda_clicks = 0
 
         # 独立成分分析ステレオ復調器 (BSS / FastICA によるヒス低減)
         self.bss_separator = SuperSpatialBssStereoSeparator(sample_rate=self.audio_rate)

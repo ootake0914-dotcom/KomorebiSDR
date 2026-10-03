@@ -422,6 +422,9 @@ class SdrDspPipeline(DspBlackMagicMixin, DspAmMixin, DspNfmMixin,
             pass
         if hasattr(self, "riemann_demodulator"):
             self.riemann_demodulator.reset()
+        if hasattr(self, "tda_click"):
+            self.tda_click.reset()
+            self.tda_clicks = 0
         if hasattr(self, "rmt_denoiser"):
             self.rmt_denoiser.reset()
         if hasattr(self, "mono_nr"):

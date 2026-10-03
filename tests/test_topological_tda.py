@@ -65,6 +65,37 @@ def test_synthetic_click_suppression():
     print("[OK] test_synthetic_click_suppression passed")
 
 
+def test_spread_phase_slip_suppression():
+    """288kHzで2πスリップが4サンプルに分散したケース (単発閾値では
+    取り逃がす) を区間積分の残差で検出・補修できることを検証。"""
+    fs = 288000.0
+    f_mod = 1000.0
+    dev = 50000.0
+    n = 4096
+    t = np.arange(n, dtype=np.float64) / fs
+    phase = (dev / f_mod) * (-np.cos(2.0 * np.pi * f_mod * t))
+    # 1000..1003 に 2π を4分割で加算 (各サンプル ≈ +π/2)
+    phase[1000:1004] += 2.0 * np.pi * np.arange(1, 5) / 4.0
+    phase[1004:] += 2.0 * np.pi
+    iq = np.exp(1j * phase).astype(np.complex64)
+    # 原点近傍通過 (振幅ディップ)
+    iq[999:1003] *= 0.05
+
+    raw = np.angle(iq[1:] * np.conj(iq[:-1]))
+    tda = TopologicalClickSuppressor(sample_rate=fs, max_dev_hz=75000.0)
+    seg_raw = np.max(np.abs(raw[995:1010]))
+    assert seg_raw < tda.click_thresh, (
+        f"test setup broken: single-sample detector would catch it ({seg_raw:.2f})")
+
+    out = tda.process(iq)
+    assert tda.detected_clicks >= 1, "spread phase slip not detected"
+    seg_out = float(np.max(np.abs(out[995:1010])))
+    assert seg_out <= tda.max_dtheta * 1.01, (
+        f"spread slip not suppressed: {seg_out:.2f} > {tda.max_dtheta:.2f}")
+    print(f"[*] spread slip: raw peak {seg_raw:.2f} rad -> repaired {seg_out:.2f} rad")
+    print("[OK] test_spread_phase_slip_suppression passed")
+
+
 def test_boundary_continuity_and_stability():
     """複数ブロックを連続処理した際の境界連続性と無NaN・無発散検証"""
     fs = 288000.0
@@ -88,5 +119,6 @@ if __name__ == "__main__":
     print("===== Running Topological TDA Click Suppressor Tests =====")
     test_clean_signal_transparency()
     test_synthetic_click_suppression()
+    test_spread_phase_slip_suppression()
     test_boundary_continuity_and_stability()
     print("ALL TOPOLOGICAL TDA TESTS PASSED!")

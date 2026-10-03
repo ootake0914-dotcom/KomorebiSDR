@@ -245,6 +245,14 @@ class TopologicalClickSuppressor:
         self.max_dtheta = float((2.0 * np.pi * self.max_dev) / self.fs)
         # クリック判定閾値 (正規偏移の約 1.8 倍)
         self.click_thresh = float(max(np.pi * 0.5, self.max_dtheta * 1.8))
+        # 振幅ディップ判定 (平均包絡に対する比率)
+        self.dip_frac = 0.45
+        # 区間の累積位相差分が補間軌跡から外れた量のしきい値。288kHzの
+        # オーバーサンプルでは位相スリップが数サンプルに分散し、単発閾値
+        # (click_thresh) では取り逃がすため、区間積分の残差で判定する
+        # (1回転≈2πの一部でも「ほぼ半回転」超ならスリップとみなす)。
+        self.slip_thresh_rad = float(np.pi * 0.9)
+        self.max_slip_len = 16
         self.enabled = True
         self._last_z = 0.0 + 0.0j
         self._detected_clicks = 0
@@ -259,16 +267,8 @@ class TopologicalClickSuppressor:
         """検出・補修したクリック特異点の総数"""
         return self._detected_clicks
 
-    def process(self, iq: np.ndarray) -> np.ndarray:
-        """
-        複素数IQ配列 (N,) を受け取り、トポロジカル特異点検出＆補修を行った
-        実数MPX復調信号 (N,) [rad/sample] を返す。
-        """
-        if not self.enabled or len(iq) == 0:
-            return np.zeros(len(iq), dtype=np.float32)
-
-        n = len(iq)
-
+    def _detect(self, iq: np.ndarray):
+        """(dtheta, click_mask) を返す。マスクは dtheta と同じ長さ。"""
         # 1. 境界連続IQの結合
         if abs(self._last_z) < 1e-12:
             s = np.concatenate(([iq[0]], iq))
@@ -286,23 +286,57 @@ class TopologicalClickSuppressor:
 
         # 3. トポロジカル特異点 (Winding Number W = ±1) の検出
         # 条件A: 原点近傍への最接近 (直前または直後サンプルの振幅が極小)
-        dip_mask = (env_l < 0.40 * mean_env) | (env_r < 0.40 * mean_env)
+        dip_mask = (env_l < self.dip_frac * mean_env) | (env_r < self.dip_frac * mean_env)
         # 条件B: 位相差分が急峻なインパルス (π 近傍への跳躍)
         impulse_mask = (np.abs(dtheta) > self.click_thresh)
 
         # クリック特異点マスク
         click_mask = (dip_mask & impulse_mask)
 
+        # 3b. 分散スリップ検出: ディップ区間を1サンプル膨張し、区間の位相
+        # 差分和を前後サンプルからの線形補間軌跡と比較する。位相スリップは
+        # 累積≈±2πを残すため、残差が半回転を超えた区間を補修対象にする。
+        if np.any(dip_mask):
+            d = dip_mask.copy()
+            d[1:] |= dip_mask[:-1]
+            d[:-1] |= dip_mask[1:]
+            idx = np.flatnonzero(d)
+            if len(idx):
+                brk = np.flatnonzero(np.diff(idx) > 1)
+                starts = np.concatenate(([0], brk + 1))
+                ends = np.concatenate((brk, [len(idx) - 1]))
+                m = len(dtheta)
+                for a, b in zip(starts, ends):
+                    i0, i1 = int(idx[a]), int(idx[b])
+                    if i1 - i0 + 1 > self.max_slip_len:
+                        continue
+                    left = dtheta[i0 - 1] if i0 > 0 else dtheta[min(i1 + 1, m - 1)]
+                    right = dtheta[i1 + 1] if i1 + 1 < m else left
+                    k = i1 - i0 + 1
+                    resid = (float(np.sum(dtheta[i0:i1 + 1]))
+                             - 0.5 * (float(left) + float(right)) * k)
+                    if abs(resid) > self.slip_thresh_rad:
+                        click_mask[i0:i1 + 1] = True
+        return dtheta, click_mask
+
+    def process_with_mask(self, iq: np.ndarray):
+        """補修後MPXとクリックマスク (bool, dthetaと同長) を返す。
+
+        マスクは「補修したサンプル」を示し、呼び出し側が元の復調列の
+        該当位置だけを差し替えるために使う (クリーン時はマスク全False)。
+        """
+        if not self.enabled or len(iq) == 0:
+            return (np.zeros(len(iq), dtype=np.float32),
+                    np.zeros(len(iq), dtype=bool))
+        dtheta, click_mask = self._detect(iq)
+        out = dtheta.astype(np.float32, copy=True)
         if not np.any(click_mask):
-            # 特異点なし: クリーン復調信号を高速に返す
-            return dtheta.astype(np.float32)
+            return out, click_mask
 
         # 4. 局所微分同相写像によるインパルス補修 (Diffeomorphic Inpainting via np.interp)
         valid_indices = np.where(~click_mask)[0]
         invalid_indices = np.where(click_mask)[0]
         self._detected_clicks += len(invalid_indices)
-
-        out = dtheta.astype(np.float32, copy=True)
         if len(valid_indices) > 1:
             out[invalid_indices] = np.interp(invalid_indices, valid_indices, out[valid_indices])
         else:
@@ -310,5 +344,13 @@ class TopologicalClickSuppressor:
 
         # 物理的周波数偏移内にクリップ
         np.clip(out, -self.max_dtheta, self.max_dtheta, out=out)
+        return out, click_mask
+
+    def process(self, iq: np.ndarray) -> np.ndarray:
+        """
+        複素数IQ配列 (N,) を受け取り、トポロジカル特異点検出＆補修を行った
+        実数MPX復調信号 (N,) [rad/sample] を返す。
+        """
+        out, _ = self.process_with_mask(iq)
         return out
 

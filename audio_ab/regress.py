@@ -46,6 +46,7 @@ TOLS = {
     "wfm_clip_pin_frac": 0.002,
     "real_fm_lucky60_clip_flat_frac": 0.002,
     "real_fm_nhk60_clip_flat_frac": 0.002,
+    "wfm_tda_click_err_db": 1.5,
 }
 
 
@@ -287,6 +288,51 @@ def measure(full=False):
     if y_pin.ndim == 2:
         y_pin = y_pin[:, 0]
     m["wfm_clip_pin_frac"] = _clip_flat_frac(y_pin[-FS:])
+
+    # 8) TDA位相スリップ補修: 既知スリップ注入時のクリーン基準との誤差低減
+    rf = 1152000.0
+    dur = 3.0
+    n = int(dur * rf)
+    t = np.arange(n) / rf
+    l = 0.95 * np.sin(2 * np.pi * 1000.0 * t)
+    mpx = 0.45 * (l + l) + 0.09 * np.sin(2 * np.pi * 19000.0 * t)
+    mpx = mpx / (float(np.max(np.abs(mpx))) + 1e-9)
+    ph = 2 * np.pi * 75000.0 * np.cumsum(mpx) / rf
+    # スリップはRFで16サンプル (IF 288kで4サンプル) に分散させる。RF4=IF1
+    # では2πが折り返して不可視になり、単発スリップの検証にならない。
+    spread = 16
+    centers = np.arange(int(0.2 * rf), n - int(0.1 * rf), int(0.12 * rf))[:24]
+    ph_s = ph.copy()
+    for c in centers:
+        ph_s[c:c + spread] += 2 * np.pi * np.arange(1, spread + 1) / spread
+        ph_s[c + spread:] += 2 * np.pi
+    iq_ref = 0.6 * np.exp(1j * ph)
+    iq_slip = 0.6 * np.exp(1j * ph_s)
+    for c in centers:
+        iq_slip[c - 2:c + spread + 2] *= 0.06
+    rng = np.random.default_rng(11)
+    nz = (np.sqrt(0.36 / 10 ** 0.6 / 2.0)
+          * (rng.standard_normal(n) + 1j * rng.standard_normal(n)))
+
+    def _to_raw(iq):
+        raw = np.empty(2 * len(iq), dtype=np.uint8)
+        raw[0::2] = np.clip(np.round(iq.real * 127.5 + 127.5), 0, 255)
+        raw[1::2] = np.clip(np.round(iq.imag * 127.5 + 127.5), 0, 255)
+        return raw
+
+    def _wf_tda(raw, on):
+        d = _wf_front()
+        d.tda_click.enabled = bool(on)
+        return _decode_stereo(d, raw, BLOCK_WFM)[:, 0]
+
+    y_ref = _wf_tda(_to_raw(iq_ref + nz), False)
+    y_off = _wf_tda(_to_raw(iq_slip + nz), False)
+    y_on = _wf_tda(_to_raw(iq_slip + nz), True)
+    nn = min(len(y_ref), len(y_off), len(y_on))
+    e_off = float(np.mean((y_off[:nn] - y_ref[:nn]) ** 2))
+    e_on = float(np.mean((y_on[:nn] - y_ref[:nn]) ** 2))
+    m["wfm_tda_click_err_db"] = float(
+        10.0 * np.log10(e_on / (e_off + 1e-24) + 1e-24))
 
     if full:
         from fast import CachedAsr
