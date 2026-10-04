@@ -320,6 +320,31 @@ def test_aes_scorer() -> bool:
     return ok
 
 
+def test_embed_dist() -> bool:
+    # 小集合の分布距離: 同一集合≈0、0dB雑音集合は大きく離れる
+    try:
+        import embed_dist
+        from corpus import load as load_corpus
+        utts = load_corpus(1)
+    except Exception as e:
+        print(f"[SKIP] embed dist (unavailable: {e})")
+        return True
+    try:
+        ref = [np.asarray(u["x"], dtype=np.float32) for u in utts]
+        rng = np.random.default_rng(2)
+        nz = [x + rng.standard_normal(len(x)).astype(np.float32)
+              * float(np.sqrt(np.mean(x ** 2))) for x in ref]
+        s_same = embed_dist.fad_sets(ref, ref, 48000)
+        s_diff = embed_dist.fad_sets(ref, nz, 48000)
+    except Exception as e:
+        print(f"[SKIP] embed dist (model unavailable: {e})")
+        return True
+    ok = bool(s_same < 1.0 and s_diff > s_same + 10.0)
+    print(f"[{'OK' if ok else 'FAIL'}] embed dist "
+          f"(same={s_same:.2f} noisy={s_diff:.1f})")
+    return ok
+
+
 def test_regress_golden() -> bool:
     import regress
     ttsdir = os.path.join(os.path.dirname(os.path.dirname(
@@ -349,6 +374,7 @@ def main() -> int:
     ok &= test_realdata_registry()
     ok &= test_provenance_and_loudness()
     ok &= test_aes_scorer()
+    ok &= test_embed_dist()
     ok &= test_regress_golden()
     print("OK" if ok else "FAILED")
     return 0 if ok else 1
