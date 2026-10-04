@@ -358,7 +358,10 @@ class DspWfmMixin:
             # ゲインで動き、弱局を拾おうとゲインを上げると補助が外れる逆動作
             # になる。推定値は合成chSNR+約14dB (実測): 26dBで0、20dBで1。
             _cn = float(getattr(self, "_if_snr_db", 26.0))
-            w_ekf = float(np.clip((26.0 - _cn) / 6.0, 0.0, 1.0))
+            _ehi = float(getattr(self, "ekf_cn_hi", 26.0))
+            _elo = float(getattr(self, "ekf_cn_lo", 20.0))
+            w_ekf = float(np.clip((_ehi - _cn) / max(_ehi - _elo, 1e-6),
+                                  0.0, float(getattr(self, "ekf_w_max", 1.0))))
             if w_ekf > 0.01:
                 demod_ekf = self.ekf_demod.demodulate(limited)
                 if len(demod_ekf) == len(demod):
@@ -371,7 +374,11 @@ class DspWfmMixin:
             # EKFと同じくC/N基準 (dBFS条件はゲイン依存のため廃止)。
             # 28dBで0、22dB以下で0.75上限。
             _cn = float(getattr(self, "_if_snr_db", 28.0))
-            w_riemann = float(np.clip((28.0 - _cn) / 6.0, 0.0, 0.75))
+            _rhi = float(getattr(self, "riemann_cn_hi", 28.0))
+            _rlo = float(getattr(self, "riemann_cn_lo", 22.0))
+            w_riemann = float(np.clip(
+                (_rhi - _cn) / max(_rhi - _rlo, 1e-6),
+                0.0, float(getattr(self, "riemann_w_max", 0.75))))
             if w_riemann > 0.01:
                 demod_riemann = self.riemann_demodulator.demodulate(iq_if)
                 if len(demod_riemann) == len(demod):
@@ -1574,6 +1581,11 @@ class DspWfmMixin:
 
         # 位相スリップ抑制型FM復調器 (特異点クリック防止)
         self.riemann_demodulator = RiemannianTopologicalDemodulator(sample_rate=self.if_rate)
+        # 弱電界クロスフェードのC/N窓 (既定=従来の直値28/22/上限0.75と同一)。
+        # EKFと同じく推定C/N基準。弱電界了解度チューニング用に属性化。
+        self.riemann_cn_hi = 28.0
+        self.riemann_cn_lo = 22.0
+        self.riemann_w_max = 0.75
         # 位相スリップ (ライスクリック) 補修: 振幅ディップ区間の累積位相残差で
         # 検出し、該当サンプルだけ補間へ差し替える。弱電界 (C/N推定30dB未満)
         # のみ作動し、クリック非検出時は元の復調列とビット等価。
@@ -1761,6 +1773,10 @@ class DspWfmMixin:
         # 拡張カルマンフィルタ (EKF) FM復調エンジン
         self.ekf_demod = DeepSpaceEkfDemodulator(sample_rate=self.if_rate)
         self.ekf_enabled = True
+        # EKFクロスフェードのC/N窓 (既定=従来の直値26/20/上限1.0と同一)。
+        self.ekf_cn_hi = 26.0
+        self.ekf_cn_lo = 20.0
+        self.ekf_w_max = 1.0
         self._linear_fir_audio_clean = self.fir_audio_clean.copy()
         self._linear_fir_audio_narrow = self.fir_audio_narrow.copy()
         self._linear_fir_am_audio = self.fir_am_audio.copy()

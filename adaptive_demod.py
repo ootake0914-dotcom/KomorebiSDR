@@ -253,6 +253,12 @@ class TopologicalClickSuppressor:
         # (1回転≈2πの一部でも「ほぼ半回転」超ならスリップとみなす)。
         self.slip_thresh_rad = float(np.pi * 0.9)
         self.max_slip_len = 16
+        # 密度ガード: ブロック内のマスク率がこれを超えたら補修を見送る。
+        # 強い雑音下ではディップ×大位相跳躍が乱発し (RF-3dBで約3%/block)、
+        # 長区間np.interpが相関の強い wander 人工物を作って了解度を落とす
+        # (ESTOI/CERでTDA-OFFが勝つことを確認)。孤立スリップ注入
+        # (約0.02%) には掛からない levels で、真のクリック補修は温存する。
+        self.max_repair_frac = 0.002
         self.enabled = True
         self._last_z = 0.0 + 0.0j
         self._detected_clicks = 0
@@ -332,6 +338,10 @@ class TopologicalClickSuppressor:
         out = dtheta.astype(np.float32, copy=True)
         if not np.any(click_mask):
             return out, click_mask
+        # 密度ガード: 過密マスクは雑音の誤検出とみなし補修を見送る
+        # (呼び出し側は空マスクで無 splice = TDA-OFF相当になる)。
+        if float(np.mean(click_mask)) > float(self.max_repair_frac):
+            return out, np.zeros(len(iq), dtype=bool)
 
         # 4. 局所微分同相写像によるインパルス補修 (Diffeomorphic Inpainting via np.interp)
         valid_indices = np.where(~click_mask)[0]
