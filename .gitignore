@@ -35,6 +35,8 @@ test_*.png
 assets_screenshot_test.png
 
 # Audio recordings and raw IQ captures
+# (rec/ holds broadcast audio: copyrighted, never commit)
+rec/
 *.wav
 *.raw
 *.iq
