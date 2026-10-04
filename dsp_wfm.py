@@ -177,8 +177,19 @@ class DspWfmMixin:
         if stereo_diff is not None:
             # 注: L/Rのスレッド並列化は実測で逆効果 (CPython GIL + C呼び出しが短く
             # オーバーヘッドが上回る)。逐次実行が最速。
-            left = self._post_process_wfm(mono + stereo_diff, "_l")
-            right = self._post_process_wfm(mono - stereo_diff, "_r")
+            # 単一ch NRはMid/Sideで共有するためここではスキップする (L/R独立
+            # ゲインは音像を揺らす。後段でMidのみ処理しSideは同量遅延で素通し)。
+            use_ms_nr = (getattr(self, "mono_nr", None) is not None
+                         and self.mono_nr.enabled
+                         and getattr(self, "mono_nr_enabled", True)
+                         and (self.cognitive_enabled
+                              or getattr(self, "mono_nr_always", False)))
+            left = self._post_process_wfm(mono + stereo_diff, "_l",
+                                          skip_mono_nr=use_ms_nr)
+            right = self._post_process_wfm(mono - stereo_diff, "_r",
+                                           skip_mono_nr=use_ms_nr)
+            if use_ms_nr:
+                left, right = self._mid_side_mono_nr(left, right)
 
             # BSSステレオ分離器 (FastICA。差信号中の逆相寄りヒスノイズ低減)
             if (getattr(self, "bss_separator", None) is not None
@@ -1127,8 +1138,10 @@ class DspWfmMixin:
             self._stereo_blend = max(float(floor), self._stereo_blend * _dec)
         self.stereo_blend = self._stereo_blend
 
-    def _post_process_wfm(self, audio: np.ndarray, ch: str = "") -> np.ndarray:
-        """WFM音声のチャンネル別仕上げ (ch: ''=モノ, '_l'/'_r'=ステレオ各ch)"""
+    def _post_process_wfm(self, audio: np.ndarray, ch: str = "",
+                            skip_mono_nr: bool = False) -> np.ndarray:
+        """WFM音声のチャンネル別仕上げ (ch: ''=モノ, '_l'/'_r'=ステレオ各ch)。
+        skip_mono_nr=True時は単一ch NRを後段のMid/Side処理へ委譲する。"""
         # ディエンファシス (50/75μs)
         audio = self._apply_bilinear_deemphasis(audio, ch=ch)
 
@@ -1190,13 +1203,21 @@ class DspWfmMixin:
         # 単一ch スペクトル抑圧NR (帯域内ノイズの最小統計Wiener抑圧)
         # 弱電界FMの番組帯ノイズ (ハイカットでは消せない) を低減する。
         # クリーン/定常信号ではゲイン1で透明に通過する自己ゲート方式。
-        if (getattr(self, "mono_nr", None) is not None
+        if (not skip_mono_nr
+                and getattr(self, "mono_nr", None) is not None
                 and self.mono_nr.enabled
                 and getattr(self, "mono_nr_enabled", True)
                 and (self.cognitive_enabled or getattr(self, "mono_nr_always", False))):
             audio = self.mono_nr.process(audio, ch=ch)
 
         return audio.astype(np.float32)
+
+    def _mid_side_mono_nr(self, left: np.ndarray, right: np.ndarray):
+        """ステレオ用共通ゲインNR。Midのパワーから求めた同一Wienerゲインを
+        L/R両chへ適用し、独立ゲインによる音像の揺れ・分離度低下を防ぐ。
+        抑圧量はMid基準で維持される (実測: 安定音像のバイアス+0.57→+0.00dB、
+        付加揺らぎ+0.52→+0.07dB、抑圧量維持)。"""
+        return self.mono_nr.process_stereo(left, right)
 
     def _update_stereo_pilot(self, mpx: np.ndarray):
         """19kHzパイロットPLLを更新し、ステレオブレンド係数とRDS用57kHz搬送波を生成する"""

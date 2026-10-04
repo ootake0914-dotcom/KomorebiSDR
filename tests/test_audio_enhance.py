@@ -311,6 +311,90 @@ def test_mono_noise_suppressor():
     print("[OK] mono noise suppressor")
 
 
+def test_mono_nr_stereo_common_gain():
+    print("===== test_mono_nr_stereo_common_gain =====")
+    from adaptive_audio import MonoNoiseSuppressor
+    sr = 48000.0
+    n = int(sr) * 4
+    rng = np.random.default_rng(0)
+    t = np.arange(n) / sr
+    # 安定音像 (-6dBパン) の定常倍音＋共通AM、L/R独立ノイズ (ゲート付き)
+    prog = (0.3 * np.sin(2 * np.pi * 440 * t) + 0.2 * np.sin(2 * np.pi * 660 * t)
+            + 0.15 * np.sin(2 * np.pi * 880 * t))
+    am = (0.6 + 0.4 * np.sin(2 * np.pi * 2.0 * t))
+    gate = (np.sin(2 * np.pi * 0.4 * t) > -0.2).astype(np.float64)
+    nL = rng.normal(0, 0.06, n) * gate
+    nR = rng.normal(0, 0.06, n) * gate
+    L = ((prog * am) + nL).astype(np.float32)
+    R = ((0.5 * prog * am) + nR).astype(np.float32)
+
+    def ild_series(a, b, win=4800):
+        m = len(a) // win
+        return np.array([20 * np.log10(
+            (np.sqrt(np.mean(a[k * win:(k + 1) * win] ** 2)) + 1e-12)
+            / (np.sqrt(np.mean(b[k * win:(k + 1) * win] ** 2)) + 1e-12))
+            for k in range(m)])
+
+    ri = ild_series(L, R)
+    base = slice(8, None)  # 立ち上がりを除く定常部
+    # 旧動作 (L/R独立ゲイン)
+    s1 = MonoNoiseSuppressor(sample_rate=sr)
+    oL = s1.process(L.copy(), ch="_l")
+    oR = s1.process(R.copy(), ch="_r")
+    # 新動作 (Mid基準の共通ゲイン)
+    s2 = MonoNoiseSuppressor(sample_rate=sr)
+    cL, cR = s2.process_stereo(L.copy(), R.copy())
+    ro = ild_series(oL, oR)
+    rc = ild_series(cL, cR)
+    w_old = float(ro[base].std() - ri[base].std())
+    w_new = float(rc[base].std() - ri[base].std())
+    b_old = float(ro[base].mean() - ri[base].mean())
+    b_new = float(rc[base].mean() - ri[base].mean())
+    print(f"[*] 付加揺らぎ: 独立={w_old:+.3f} dB 共通={w_new:+.3f} dB "
+          f"(期待: 共通 < 0.2)")
+    print(f"[*] ILDバイアス: 独立={b_old:+.3f} dB 共通={b_new:+.3f} dB "
+          f"(期待: 共通 ±0.2以内)")
+    assert w_new < 0.2, f"共通ゲインでも音像が揺れる: {w_new:+.3f} dB"
+    assert abs(b_new) < 0.2, f"共通ゲインで音像が偏る: {b_new:+.3f} dB"
+    assert w_new < w_old, "共通ゲインが独立より悪い"
+    # 抑圧量の維持 (Mid基準でIndependentと同等)
+    fr = np.fft.rfftfreq(1024, 1 / sr)
+    sel = (fr > 200) & (fr < 8000)
+
+    def _floor(x):
+        m = len(x) // 1024 * 1024
+        S = np.abs(np.fft.rfft(x[:m].reshape(-1, 1024)
+                               * np.hanning(1024), axis=1)) ** 2
+        return 10 * np.log10(float(np.sum(np.percentile(S, 10, axis=0)[sel]))
+                             + 1e-18)
+    s_old = _floor(oL) - _floor(L)
+    s_new = _floor(cL) - _floor(L)
+    print(f"[*] 抑圧量: 独立={s_old:+.1f} dB 共通={s_new:+.1f} dB "
+          f"(期待: 差 < 0.5)")
+    assert s_new < -0.5, f"共通ゲインで抑圧されない: {s_new:+.1f} dB"
+    assert abs(s_new - s_old) < 0.5, \
+        f"抑圧量が変わりすぎ: {s_new:+.1f} vs {s_old:+.1f} dB"
+    # ブロック分割 vs 一括の等価性 (ストリーミング格子の連続性。
+    # 2752単位=8フレーム格子に整列させること。既存テストと同一条件)
+    s3 = MonoNoiseSuppressor(sample_rate=sr)
+    step = 2752
+    bl, br = [], []
+    for i in range(0, n - step + 1, step):
+        a, b = s3.process_stereo(L[i:i + step].copy(), R[i:i + step].copy())
+        bl.append(a)
+        br.append(b)
+    bl, br = np.concatenate(bl), np.concatenate(br)
+    # 比較用に一括側も同条件で取り直す (末尾の端数は対象外)
+    s4 = MonoNoiseSuppressor(sample_rate=sr)
+    cL2, cR2 = s4.process_stereo(L.copy(), R.copy())
+    L0 = min(len(bl), len(cL2))
+    dL = float(np.max(np.abs(bl[:L0] - cL2[:L0])))
+    dR = float(np.max(np.abs(br[:L0] - cR2[:L0])))
+    print(f"[*] ブロック vs 一括 最大差分: L={dL:.2e} R={dR:.2e}")
+    assert dL < 1e-9 and dR < 1e-9, f"ストリーミング不整合: {dL:.2e}/{dR:.2e}"
+    print("[OK] mono nr stereo common gain")
+
+
 def main() -> int:
     try:
         test_freq_dependent_blend()
@@ -319,6 +403,7 @@ def main() -> int:
         test_nr_program_decoupling()
         test_pilot_flywheel()
         test_mono_noise_suppressor()
+        test_mono_nr_stereo_common_gain()
     except AssertionError as e:
         print(f"FAILED: {e}")
         return 1

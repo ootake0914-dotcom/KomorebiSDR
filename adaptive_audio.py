@@ -520,14 +520,166 @@ class MonoNoiseSuppressor:
                 "cache": np.ones(nb, dtype=np.float64),
                 "gated": False,
                 "count": 0,
-                # ノイズフレーム選択: 直近5秒のフレームエネルギーの最小値
-                "ering": np.full(self._ring_len, np.inf, dtype=np.float64),
-                "eidx": 0,
-                "nupd": 0,
-            }
+            # ノイズフレーム選択: 直近5秒のフレームエネルギーの最小値
+            "ering": np.full(self._ring_len, np.inf, dtype=np.float64),
+            "eidx": 0,
+            "nupd": 0,
+        }
+        self._link = None  # process_stereo用共有状態 (遅延初期化)
         self.enabled = True
 
+    def _new_link(self):
+        """ステレオ共通ゲイン用の状態 (推定共有・WOLAはL/R別)。"""
+        nb = self.n_fft // 2 + 1
+        nfr = self._floor_frames
+
+        def _sig():
+            return {"buf": np.zeros(self._tail_len, dtype=np.float64),
+                    "buf_pos": -self._tail_len,
+                    "stream_pos": 0,
+                    "frame_next": -self._tail_len,
+                    "out_pos": -self._tail_len,
+                    "acc": np.zeros(0, dtype=np.float64),
+                    "wsum": np.zeros(0, dtype=np.float64),
+                    "pending": np.zeros(0, dtype=np.float64)}
+
+        def _est():
+            return {"floor": np.zeros((nb, nfr), dtype=np.float32),
+                    "idx": 0,
+                    "fidx": 0,
+                    "gain": np.ones(nb, dtype=np.float64),
+                    "cache": np.ones(nb, dtype=np.float64),
+                    "gated": False,
+                    "count": 0,
+                    "ering": np.full(self._ring_len, np.inf, dtype=np.float64),
+                    "eidx": 0,
+                    "nupd": 0,
+                    "stream_pos": 0,
+                    "frame_next": -self._tail_len,
+                    "buf_pos": -self._tail_len}
+        return {"est": _est(), "m": _sig(), "l": _sig(), "r": _sig()}
+
+    def process_stereo(self, left: np.ndarray, right: np.ndarray):
+        """L/R共通ゲイン処理。Midのパワーから求めた同一Wienerゲインを
+        両chへ適用し、独立ゲインによる音像の揺れ・分離度低下を防ぐ。
+        戻り値 (left_out, right_out)。WOLA遅延・格子はprocessと同一。
+        """
+        if not self.enabled or len(left) == 0 or len(right) == 0:
+            return left, right
+        L = np.asarray(left, dtype=np.float64)
+        R = np.asarray(right, dtype=np.float64)
+        n = min(len(L), len(R))
+        L, R = L[:n], R[:n]
+        M = (L + R) * 0.5
+        if getattr(self, "_link", None) is None:
+            self._link = self._new_link()
+        lk = self._link
+        est, sm, sl, sr_ = lk["est"], lk["m"], lk["l"], lk["r"]
+        n_fft, hop = self.n_fft, self.hop
+        nb = n_fft // 2 + 1
+        win = self.win
+        sm["buf"] = np.concatenate((sm["buf"], M))
+        sl["buf"] = np.concatenate((sl["buf"], L))
+        sr_["buf"] = np.concatenate((sr_["buf"], R))
+        est["stream_pos"] += n
+        for s in (sm, sl, sr_):
+            s["stream_pos"] += n
+        hist = est["floor"]
+        cols_all = np.arange(n_fft)
+        while est["frame_next"] + n_fft <= est["stream_pos"]:
+            g0 = est["fidx"]
+            nf = 8 - (g0 % 8)
+            avail = (est["stream_pos"] - n_fft - est["frame_next"]) // hop + 1
+            if nf > avail:
+                nf = avail
+            f = est["frame_next"]
+            o = f - sm["buf_pos"]
+            base = o + np.arange(nf)[:, None] * hop + cols_all[None, :]
+            Xm = np.fft.rfft(sm["buf"][base] * win, axis=1)
+            P = Xm.real * Xm.real + Xm.imag * Xm.imag
+            e = P.sum(axis=1)
+            if f >= 0:
+                ring = est["ering"]
+                nring = len(ring)
+                ring[(est["eidx"] + np.arange(nf)) % nring] = e
+                est["eidx"] = (est["eidx"] + nf) % nring
+                sel = (e > 1e-12) & (e <= float(np.min(ring)) * self._noise_margin)
+                _flat = (np.exp(np.mean(np.log(P + 1e-18), axis=1))
+                         / (np.mean(P, axis=1) + 1e-18))
+                sel = sel & (_flat >= 0.25)
+                k = int(np.sum(sel))
+                if k:
+                    cols = (est["idx"] + np.arange(k)) % self._floor_frames
+                    hist[:, cols] = P[sel].T.astype(np.float32)
+                    est["idx"] = (est["idx"] + k) % self._floor_frames
+                    est["nupd"] += k
+            est["count"] += nf
+            if est["nupd"] > 0 and (g0 // 8) % 2 == 0:
+                valid = hist[:, :min(est["nupd"], self._floor_frames)]
+                kk = int(self.floor_pct * 0.01 * (valid.shape[1] - 1))
+                est["cache"] = np.partition(valid, kk, axis=1)[:, kk].astype(np.float64)
+                est["gated"] = float(np.sum(est["cache"])) > 0.5 * float(np.mean(valid)) * nb
+            if est["nupd"] < self._warmup_frames or est["gated"]:
+                gs = np.ones((nf, nb), dtype=np.float64)
+            else:
+                g = P / (P + self.over_sub * est["cache"][None, :] + 1e-18)
+                np.maximum(g, self.g_min, out=g)
+                prev = est["gain"]
+                gs = np.empty_like(g)
+                for j in range(nf):
+                    a = np.where(g[j] > prev, 0.5, 0.08)
+                    prev = a * g[j] + (1.0 - a) * prev
+                    gs[j] = prev
+                est["gain"] = prev
+                gs[:, 1:-1] = (gs[:, :-2] + gs[:, 1:-1] + gs[:, 2:]) / 3.0
+            # 同一ゲインをL/Rへ適用 (WOLAはch別遅延線)
+            for s, xx in ((sl, L), (sr_, R)):
+                X = np.fft.rfft(s["buf"][base] * win, axis=1)
+                y = np.fft.irfft(X * gs, n_fft, axis=1)
+                off0 = f - s["out_pos"]
+                need = off0 + (nf - 1) * hop + n_fft
+                if len(s["acc"]) < need:
+                    s["acc"] = np.concatenate((s["acc"], np.zeros(need - len(s["acc"]))))
+                    s["wsum"] = np.concatenate((s["wsum"], np.zeros(need - len(s["wsum"]))))
+                w2 = win * win
+                for j in range(nf):
+                    off = off0 + j * hop
+                    s["acc"][off:off + n_fft] += y[j] * win
+                    s["wsum"][off:off + n_fft] += w2
+            est["frame_next"] = f + nf * hop
+            est["fidx"] = g0 + nf
+            for s in (sm, sl, sr_):
+                s["frame_next"] = f + nf * hop
+        # 確定分を返却 (L/R別pending)
+        outs = []
+        for s, xx in ((sl, L), (sr_, R)):
+            avail = s["frame_next"] - s["out_pos"]
+            if avail > 0:
+                done = s["acc"][:avail] / np.maximum(s["wsum"][:avail], 1e-12)
+                s["pending"] = np.concatenate((s["pending"], done))
+                s["acc"] = s["acc"][avail:]
+                s["wsum"] = s["wsum"][avail:]
+                s["out_pos"] = s["frame_next"]
+            trim = s["frame_next"] - s["buf_pos"]
+            if trim > 0:
+                s["buf"] = s["buf"][trim:]
+                s["buf_pos"] = s["frame_next"]
+            if len(s["pending"]) >= len(xx):
+                ret = s["pending"][:len(xx)]
+                s["pending"] = s["pending"][len(xx):]
+            else:
+                ret = np.concatenate((s["pending"], np.zeros(len(xx) - len(s["pending"]))))
+                s["pending"] = np.zeros(0, dtype=np.float64)
+            outs.append(ret.astype(np.float32))
+        # Midバッファも同様に整理 (音声出力は使わない)
+        trim = sm["frame_next"] - sm["buf_pos"]
+        if trim > 0:
+            sm["buf"] = sm["buf"][trim:]
+            sm["buf_pos"] = sm["frame_next"]
+        return outs[0], outs[1]
+
     def reset(self):
+        self._link = None
         for ch in self._st:
             s = self._st[ch]
             s["buf"] = np.zeros(self._tail_len, dtype=np.float64)
