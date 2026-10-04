@@ -556,6 +556,10 @@ class SdrDspPipeline(DspBlackMagicMixin, DspAmMixin, DspNfmMixin,
             self._nr_s_w = 0.0
             self.stereo_wiener_gain = 1.0
 
+    def set_stereo_diff_gain(self, gain: float):
+        """差信号振幅校正ゲイン (既定1.06。狭帯域IFのDSB切落としを補正)"""
+        self.stereo_diff_gain = float(gain)
+
     def set_deemphasis(self, tau_us: float):
         """ディエンファシス時定数を設定 (日本/欧州=50μs, 米国/韓国=75μs)"""
         self.deemph_tau_us = float(tau_us)

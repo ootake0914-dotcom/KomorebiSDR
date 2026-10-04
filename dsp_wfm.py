@@ -160,6 +160,9 @@ class DspWfmMixin:
                     # 周波数依存ブレンド: 弱電界で高域から先にモノラル化
                     # (低域のステレオ感を残す。blend=1時は旧スカラー動作と一致)
                     stereo_diff = self._freq_dependent_blend(diff, blend)
+                    # IF切落としによる差信号振幅不足を校正 (NR推定は無倍率で観測)
+                    stereo_diff = (stereo_diff
+                                   * float(self.stereo_diff_gain)).astype(np.float32)
                     # 差信号FIRの群遅延を補償 (mono/diffの位相ズレによる分離度劣化を防止)
                     mono = self._delay_mono(mono)
                 else:
@@ -169,7 +172,8 @@ class DspWfmMixin:
                     # (出力は遅延させない。遅延させると未遅延diffと2msずれる)。
                     stereo_diff = (diff_raw
                                    * (self._stereo_blend * self.multipath_gain
-                                      * self.aci_gain)).astype(np.float32)
+                                      * self.aci_gain
+                                      * float(self.stereo_diff_gain))).astype(np.float32)
                     self._delay_mono(mono)
                     self.stereo_wiener_gain = 1.0
 
@@ -1626,6 +1630,12 @@ class DspWfmMixin:
         self._trim_prev_m = 0.0
         self._trim_primed = False
         self._trim_err_ema = 0.0
+        # 差信号振幅校正: 狭帯域IF(±50kHz)が75kHz偏移FMの外側ベッセル側波帯を
+        # 切り落とすため、38kHz DSB由来の(L-R)が(L+R)より約6%小さく復調される
+        # (実測 |D|/|M|=0.9428@75kHz偏移、1〜14kHzで平坦=スカラー誤差、位相0.2°)。
+        # 分離度30.6dBの律速要因。逆数ゲインで補正し40dB級へ (低偏移時は
+        # 過補正側だが分離度35dB以上を維持、モノラル時はdiff=0で無影響)。
+        self.stereo_diff_gain = 1.06
         # ===== ステレオノイズリダクション =====
         # 弱電界でステレオ化すると増えるヒスノイズを、(L-R)差信号の高域/中域パワー比から
         # 検出し、ノイズ量に応じて 1) サブバンドWiener抑圧 2) 可変ローパス
