@@ -56,6 +56,7 @@ TOLS = {
     "wfm_aci_above_r_db": 3.0,
     "wfm_aci_gain_on": 0.10,
     "wfm_aci_side_gain_db": 2.0,
+    "sic_offgrid_cancel_db": 3.0,
 }
 
 
@@ -276,6 +277,9 @@ def measure(full=False):
         d.slow_agc_enabled = False
         d.filter_mode = "wide"
         d.set_stereo_nr(False)
+        # SICは純音FMのベッセル側波帯を誤消去するため隔離する
+        # (SIC自体は sic_offgrid_cancel_db と単体テストで検証)。
+        d.sic_enabled = False
         if hasattr(d, "set_stereo_enabled"):
             d.set_stereo_enabled(True)
         return d
@@ -362,6 +366,33 @@ def measure(full=False):
     m["wfm_aci_gain_on"] = float(d_g6.aci_gain)
     m["wfm_aci_side_gain_db"] = (_side_ratio(y_clean2, y_g6)
                                  - _side_ratio(y_clean2, y_g0))
+
+    # 9) SIC: 格子外スプリアス (+10Hz) の検出＋消去 (放物線補間＋追従)。
+    # auto_detect→processの直結で、FFT格子量子化の回帰を検出する。
+    from adaptive_rf import DigitalSelfInterferenceCanceller
+    sic = DigitalSelfInterferenceCanceller(sample_rate=288000.0, mu=0.08)
+    f_spur = 28135.0
+    n_sic, nb_sic = 4096, 40
+    outs_sic = []
+    for b in range(nb_sic):
+        t = (b * n_sic + np.arange(n_sic, dtype=np.float64)) / 288000.0
+        iq = (0.4 * np.exp(1j * 1.2 * np.sin(2 * np.pi * 1000.0 * t))
+              + 0.6 * np.exp(
+                  1j * (2 * np.pi * f_spur * t + 0.75))).astype(np.complex64)
+        if b == 0:
+            sic.auto_detect_spurious(iq)
+        outs_sic.append(sic.process(iq))
+    y_sic = outs_sic[-1]
+    F = np.abs(np.fft.fft(y_sic * np.hanning(n_sic))) ** 2
+    fr = np.fft.fftfreq(n_sic, 1.0 / 288000.0)
+    i_sic = int(np.argmin(np.abs(fr - f_spur)))
+    tL = ((nb_sic - 1) * n_sic + np.arange(n_sic, dtype=np.float64)) / 288000.0
+    ref_sic = np.abs(np.fft.fft(
+        0.6 * np.exp(1j * (2 * np.pi * f_spur * tL + 0.75))
+        * np.hanning(n_sic))) ** 2
+    lo_s, hi_s = max(0, i_sic - 2), i_sic + 3
+    m["sic_offgrid_cancel_db"] = float(
+        10.0 * np.log10(np.sum(ref_sic[lo_s:hi_s]) / np.sum(F[lo_s:hi_s])))
 
     # 8) TDA位相スリップ補修: 既知スリップ注入時のクリーン基準との誤差低減
     rf = 1152000.0

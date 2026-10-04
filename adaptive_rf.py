@@ -296,6 +296,12 @@ class DigitalSelfInterferenceCanceller:
         self.weights = []
         # 位相累積アキュムレータ [phase1, phase2, ...]
         self.phases = []
+        # 周波数追従補正 [Hz] (基底 = f_spur + corr) と追従開始後の経過ブロック数
+        self.freq_corr = []
+        self._lock_age = []
+        self.track_gain = 0.3
+        self.track_max_corr_hz = 200.0
+        self.proj_min = 0.005
         self.cancellation_db = 0.0
 
     def set_spurious_frequencies(self, freqs_hz: list[float]):
@@ -303,14 +309,52 @@ class DigitalSelfInterferenceCanceller:
         self.spurious_freqs = [float(f) for f in freqs_hz[:self.max_tones]]
         self.weights = [0.0 + 0.0j] * len(self.spurious_freqs)
         self.phases = [0.0] * len(self.spurious_freqs)
+        self.freq_corr = [0.0] * len(self.spurious_freqs)
+        self._lock_age = [0] * len(self.spurious_freqs)
+
+    def _adopt_frequencies(self, freqs_hz: list[float]):
+        """再検出時に近い周波数 (±150Hz) の重み・位相・補正を引き継ぐ。
+
+        0.8秒ごとの再走査で重みを0に戻すと毎回0.7秒の再収束過渡が出るため、
+        同一トーンとみなせるものは状態を維持する。新規トーンのみ初期化。
+        """
+        old = list(zip(self.spurious_freqs, self.weights, self.phases,
+                       self.freq_corr, self._lock_age))
+        new_f, new_w, new_p, new_c, new_a = [], [], [], [], []
+        for f in freqs_hz[:self.max_tones]:
+            best = None
+            for (of, ow, op, oc, oa) in old:
+                if abs(f - of) < 150.0 and (best is None
+                                            or abs(f - of) < abs(f - best[0])):
+                    best = (of, ow, op, oc, oa)
+            if best is not None:
+                # 旧推定周波数を維持し、追従補正が引き続き有効になるようにする
+                new_f.append(best[0])
+                new_w.append(best[1])
+                new_p.append(best[2])
+                new_c.append(best[3])
+                new_a.append(best[4])
+            else:
+                new_f.append(float(f))
+                new_w.append(0.0 + 0.0j)
+                new_p.append(0.0)
+                new_c.append(0.0)
+                new_a.append(0)
+        self.spurious_freqs = new_f
+        self.weights = new_w
+        self.phases = new_p
+        self.freq_corr = new_c
+        self._lock_age = new_a
 
     def auto_detect_spurious(self, iq_samples: np.ndarray, n_fft: int = 1024,
-                             prominence_db: float = 12.0, dc_guard_hz: float = 8000.0,
-                             passband_hz: float = 95000.0):
+                              prominence_db: float = 12.0, dc_guard_hz: float = 8000.0,
+                              passband_hz: float = 95000.0, exclude_bands=None):
         """
         FFT スペクトルから周囲ノイズフロアより急峻に突出している固定スプリアス周波数を自動同定。
         - dc_guard_hz: 所望信号キャリア・主変調帯域 (0Hz近傍のAM搬送波やFM側波帯) を保護する除外帯域 (Hz)。
         - passband_hz: IFフィルタ通過帯域 (Hz)。阻止域の過小パワーによるメディアン歪みを防止。
+        - exclude_bands: [(中心Hz, 半幅Hz), ...] の除外帯域 (WFMのパイロット±19kHz・
+          副搬送波±38kHz等。検出精度が上がるとパイロットを消してステレオが落ちるため必須)。
         - 延長ケーブル使用等でスプリアスが消失した場合は自動で周波数リストを空にし、
           即座にバイパス（計算コストゼロ・歪みなし）へ移行。
         """
@@ -342,16 +386,41 @@ class DigitalSelfInterferenceCanceller:
 
         detected_candidates = []
         span = 6  # Hanning窓のメインローブ外側 (±3〜6ビン) を走査
+        bin_hz = float(self.fs) / float(n_fft)
         for idx in peak_indices:
-            f = float(freqs[idx])
-            # 所望信号主帯域保護: DC近傍 (±dc_guard_hz) は除外
-            if abs(f) < dc_guard_hz:
-                continue
             # 局所極大値の確認 (左右1ビン以上)
             left = (idx - 1) % n_fft
             right = (idx + 1) % n_fft
             if fft_db[idx] <= fft_db[left] or fft_db[idx] <= fft_db[right]:
                 continue
+            # 放物線補間 (対数パワー): FFT格子 (±140Hz@1024/288k) の量子化を
+            # 補正する。格子点に±10Hzずれるだけで消去量がゼロになるため必須。
+            # fftfreqはDC/Nyquist以外で単調増加なので、±0.5ビンに丸める。
+            y1 = float(fft_db[idx])
+            y0 = float(fft_db[left])
+            y2 = float(fft_db[right])
+            f_bin = float(freqs[idx])
+            f_step = float(freqs[right] - freqs[left]) / 2.0
+            if (1 <= idx <= n_fft - 2 and abs(f_step - bin_hz) < 0.5 * bin_hz
+                    and (y0 - 2.0 * y1 + y2) < -1e-9):
+                delta = 0.5 * (y0 - y2) / (y0 - 2.0 * y1 + y2)
+                delta = max(-0.5, min(0.5, delta))
+                f = f_bin + delta * bin_hz
+            else:
+                f = f_bin
+            # 所望信号主帯域保護: DC近傍 (±dc_guard_hz) は除外
+            if abs(f) < dc_guard_hz:
+                continue
+            # 除外帯域 (パイロット等): ±中心・±負側の両方を弾く
+            if exclude_bands:
+                skip = False
+                for (c0, hw) in exclude_bands:
+                    if (abs(f - float(c0)) < float(hw)
+                            or abs(f + float(c0)) < float(hw)):
+                        skip = True
+                        break
+                if skip:
+                    continue
 
             # 局所針状性 (Local Prominence):
             # 狭帯域・CW状スプリアスはHanning窓の減衰により左右3〜6ビンで急落する。
@@ -371,15 +440,17 @@ class DigitalSelfInterferenceCanceller:
             # 突出度 (フロア比) が最も強力なスプリアスから優先して上位 max_tones 件を登録
             detected_candidates.sort(key=lambda x: x[1], reverse=True)
             chosen_freqs = [item[0] for item in detected_candidates[:self.max_tones]]
-            self.set_spurious_frequencies(chosen_freqs)
+            self._adopt_frequencies(chosen_freqs)
         else:
             # スプリアスが存在しない場合は空にしてバイパス
-            self.set_spurious_frequencies([])
+            self._adopt_frequencies([])
 
     def reset(self):
         """内部状態リセット"""
         self.weights = [0.0 + 0.0j] * len(self.spurious_freqs)
         self.phases = [0.0] * len(self.spurious_freqs)
+        self.freq_corr = [0.0] * len(self.spurious_freqs)
+        self._lock_age = [0] * len(self.spurious_freqs)
         self.cancellation_db = 0.0
 
     def process(self, iq_samples: np.ndarray) -> np.ndarray:
@@ -397,12 +468,13 @@ class DigitalSelfInterferenceCanceller:
         p_orig = float(np.mean(np.abs(iq_samples) ** 2)) + 1e-12
 
         for i, f_spur in enumerate(self.spurious_freqs):
-            # 1. 複素直交基底ベクトルの生成 (位相連続性維持)
+            # 1. 複素直交基底ベクトルの生成 (位相連続性維持。追従補正込み)
+            f_eff = float(f_spur) + float(self.freq_corr[i])
             phase_init = self.phases[i]
-            phase_vec = phase_init + 2.0 * np.pi * f_spur * t
+            phase_vec = phase_init + 2.0 * np.pi * f_eff * t
             basis = np.exp(1j * phase_vec).astype(np.complex64)
             # 次回ブロック用位相更新 (2pi ラップ)
-            self.phases[i] = float((phase_init + 2.0 * np.pi * f_spur * (n / self.fs)) % (2.0 * np.pi))
+            self.phases[i] = float((phase_init + 2.0 * np.pi * f_eff * (n / self.fs)) % (2.0 * np.pi))
 
             # 2. 干渉成分の推定: i_hat = w * basis
             w = self.weights[i]
@@ -414,6 +486,22 @@ class DigitalSelfInterferenceCanceller:
             # 4. NLMS 適応重み更新: w <- w + mu * <e * conj(basis)>
             corr = np.mean(e * np.conj(basis))
             w_new = w + self.mu * corr
+
+            # 5. 周波数追従: 重みのブロック間位相回転から基底周波数誤差を
+            # 推定する (検出の格子量子化・ドリフト吸収)。振幅が育ってから
+            # 開始し、トーン不在時は補正を0へ戻す (再捕捉の妨げ防止)。
+            age = int(self._lock_age[i]) if i < len(self._lock_age) else 0
+            self._lock_age[i] = age + 1
+            if abs(corr) > self.proj_min:
+                if age >= 3 and abs(w) > 1e-9:
+                    dphi = np.angle(complex(w_new) * np.conj(complex(w)))
+                    df_est = float(dphi) / (2.0 * np.pi * (n / self.fs))
+                    c = float(self.freq_corr[i]) + self.track_gain * df_est
+                    c = max(-self.track_max_corr_hz,
+                            min(self.track_max_corr_hz, c))
+                    self.freq_corr[i] = c
+            else:
+                self.freq_corr[i] = float(self.freq_corr[i]) * 0.9
             self.weights[i] = complex(w_new)
 
             out = e

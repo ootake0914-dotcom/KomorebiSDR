@@ -1041,8 +1041,18 @@ class SdrDspPipeline(DspBlackMagicMixin, DspAmMixin, DspNfmMixin,
         if getattr(self, "sic_enabled", False) and getattr(self, "sic_canceller", None) is not None:
             self._sic_detect_counter += 1
             # 選局直後、および約0.8秒ごと (約20ブロック) にスプリアス突出ピークを自動走査
+            # 突出度40dB: 純音FMのベッセル側波帯は最大31dBに達するため、
+            # それ以下は番組とみなし消さない (分離度・トリム保護)。真のPC
+            # スプリアス (CW線) は100dB級で十分検出できる。
             if self._sic_detect_counter % 20 == 1:
-                self.sic_canceller.auto_detect_spurious(iq_if, n_fft=1024, prominence_db=12.0)
+                # WFMではパイロット±19kHzとその高調波 (±38/57/76kHz、無音時の
+                # FMベッセル側波帯) を検出対象から外す。精度向上後にこれらを
+                # 消すとステレオが落ちるため。トーン枠の浪費防止にもなる。
+                _excl = [(19000.0, 1500.0), (38000.0, 1500.0),
+                         (57000.0, 1500.0), (76000.0, 1500.0)] \
+                    if mode == "WFM" else None
+                self.sic_canceller.auto_detect_spurious(
+                    iq_if, n_fft=1024, prominence_db=40.0, exclude_bands=_excl)
             iq_if = self.sic_canceller.process(iq_if)
 
         if mode == "NFM":

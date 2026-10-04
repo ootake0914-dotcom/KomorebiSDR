@@ -2,10 +2,10 @@
   "version": 1,
   "full": true,
   "provenance": {
-    "date": "2026-10-04T08:28:10",
+    "date": "2026-10-04T12:14:49",
     "python": "3.11.15",
-    "numpy": "2.4.6",
-    "git_head": "5694555",
+    "numpy": "1.26.4",
+    "git_head": "60d6d49",
     "git_dirty": true,
     "faster_whisper": "1.2.1",
     "onnxruntime": "1.30.0",
@@ -17,19 +17,19 @@
       "tol": 120.0
     },
     "ssb_click_resid_db": {
-      "value": -9.24384190589551,
+      "value": -9.243842274534181,
       "tol": 0.8
     },
     "wfm_side_hiss_db": {
-      "value": -7.863848997232367,
+      "value": -7.863828830626304,
       "tol": 0.8
     },
     "wfm_mid_err_db": {
-      "value": -136.39443969726562,
+      "value": -136.45953288624563,
       "tol": 1.5
     },
     "am_sinr_gain_db": {
-      "value": 0.43751725858222523,
+      "value": 0.437517264631072,
       "tol": 1.0
     },
     "nr_ssb_delta_rms_db": {
@@ -61,15 +61,15 @@
       "tol": 0.15
     },
     "wfm_fr_excess_15k_db": {
-      "value": -0.01583492390117769,
+      "value": -0.015515966837760686,
       "tol": 0.8
     },
     "wfm_sep_1k_db": {
-      "value": 30.606974267971147,
+      "value": 30.604099418369376,
       "tol": 1.5
     },
     "wfm_thd_overmod_db": {
-      "value": -38.34801084926945,
+      "value": -38.35416664096485,
       "tol": 1.5
     },
     "wfm_clip_pin_frac": {
@@ -85,44 +85,48 @@
       "tol": 0.002
     },
     "wfm_tda_click_err_db": {
-      "value": -2.7321250486876014,
+      "value": -2.867776990436464,
       "tol": 1.5
     },
     "wfm_if_flat_75k_db": {
-      "value": 0.00291842425250903,
+      "value": 0.002918424252508066,
       "tol": 0.5
     },
     "wfm_if_flat_94k_db": {
-      "value": -0.012548174914253458,
+      "value": -0.012548174914254424,
       "tol": 0.5
     },
     "wfm_if_stop_106k_db": {
-      "value": -57.771118622179046,
+      "value": -57.77111862217919,
       "tol": 3.0
     },
     "wfm_if_alias_200k_db": {
-      "value": -75.6908078198844,
+      "value": -75.69080781987907,
       "tol": 3.0
     },
     "wfm_adj_sisdr_db": {
-      "value": 7.823554632296533,
+      "value": 7.823555008815744,
       "tol": 1.0
     },
     "wfm_aci_du_r_db": {
-      "value": -16.345053875271475,
+      "value": -16.3450536894602,
       "tol": 2.0
     },
     "wfm_aci_above_r_db": {
-      "value": 39.29497748902166,
+      "value": 39.29497691884907,
       "tol": 3.0
     },
     "wfm_aci_gain_on": {
-      "value": 0.40003413777209196,
+      "value": 0.40003413777195956,
       "tol": 0.1
     },
     "wfm_aci_side_gain_db": {
-      "value": -7.836523056030273,
+      "value": -7.836714417266203,
       "tol": 2.0
+    },
+    "sic_offgrid_cancel_db": {
+      "value": 26.901478874116332,
+      "tol": 3.0
     }
   }
 }

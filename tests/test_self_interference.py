@@ -152,10 +152,97 @@ def test_pipeline_sic_integration():
     print("[OK] test_pipeline_sic_integration passed")
 
 
+def _offgrid_trial(f_spur, nblk=40, n=4096, redetect_at=()):
+    """格子外スプリアスの検出＋消去量を測る共通部。"""
+    fs = 288000.0
+    sic = DigitalSelfInterferenceCanceller(sample_rate=fs, mu=0.08)
+    outs = []
+    for b in range(nblk):
+        t = (b * n + np.arange(n, dtype=np.float64)) / fs
+        iq = (0.4 * np.exp(1j * 1.2 * np.sin(2 * np.pi * 1000.0 * t))
+              + 0.6 * np.exp(1j * (2 * np.pi * f_spur * t + 0.75))).astype(np.complex64)
+        if b == 0 or b in redetect_at:
+            sic.auto_detect_spurious(iq)
+        outs.append(sic.process(iq))
+    y = outs[-1]
+    F = np.abs(np.fft.fft(y * np.hanning(n))) ** 2
+    fr = np.fft.fftfreq(n, 1.0 / fs)
+    i = int(np.argmin(np.abs(fr - f_spur)))
+    tL = ((nblk - 1) * n + np.arange(n, dtype=np.float64)) / fs
+    ref = np.abs(np.fft.fft(
+        0.6 * np.exp(1j * (2 * np.pi * f_spur * tL + 0.75))
+        * np.hanning(n))) ** 2
+    lo, hi = max(0, i - 2), i + 3
+    cancel = float(10.0 * np.log10(np.sum(ref[lo:hi]) / np.sum(F[lo:hi])))
+    return sic, cancel
+
+
+def test_offgrid_spurious_cancellation():
+    """FFT格子から外れたスプリアス (+10Hz・半ビン) も消去できること。
+    旧実装は格子量子化で消去量≈0dBだった (放物線補間＋追従で修復)。"""
+    for f_spur in (28125.0, 28135.0, 28265.0):
+        sic, cancel = _offgrid_trial(f_spur)
+        print(f"[*] spur={f_spur:.0f}Hz detected={sic.spurious_freqs} "
+              f"cancel={cancel:.1f} dB")
+        assert abs(sic.spurious_freqs[0] - f_spur) < 140.0, \
+            f"freq estimate off: {sic.spurious_freqs[0]} vs {f_spur}"
+        assert cancel >= 15.0, \
+            f"off-grid cancellation too weak: {cancel:.1f} dB @ {f_spur}Hz"
+    print("[OK] test_offgrid_spurious_cancellation passed")
+
+
+def test_redetect_weight_carryover():
+    """0.8秒ごとの再検出で重みが維持され、消去が崩壊しないこと。
+    旧実装は毎回0リセットで再収束過渡 (6.5dBまで低下) だった。"""
+    sic0, c0 = _offgrid_trial(28125.0)
+    sic1, c1 = _offgrid_trial(28125.0, redetect_at=(10, 20, 30))
+    print(f"[*] no-redetect={c0:.1f} dB, with-redetect={c1:.1f} dB, "
+          f"weights={sic1.weights}")
+    assert abs(sic1.weights[0]) > 0.1, "weights were reset on re-detection"
+    assert c1 >= 15.0, f"cancellation collapsed after re-detection: {c1:.1f} dB"
+    print("[OK] test_redetect_weight_carryover passed")
+
+
+def test_pilot_exclusion():
+    """WFM無音＋パイロットのみのFMで、パイロット由来線 (±19/38/57/76kHzの
+    ベッセル側波帯) をPCノイズと誤検出しないこと。除外なしでは検出される
+    (テスト妥当性) が、除外ありでは弾かれ、真のスプリアスは検出される。"""
+    fs = 288000.0
+    n = int(0.5 * fs)
+    t = np.arange(n, dtype=np.float64) / fs
+    mpx = 0.09 * np.sin(2 * np.pi * 19000.0 * t)
+    ph = 2 * np.pi * 75000.0 * np.cumsum(mpx) / fs
+    iq = (0.6 * np.exp(1j * ph)).astype(np.complex64)
+    excl = [(19000.0, 1500.0), (38000.0, 1500.0),
+            (57000.0, 1500.0), (76000.0, 1500.0)]
+    s0 = DigitalSelfInterferenceCanceller(sample_rate=fs)
+    s0.auto_detect_spurious(iq)
+    assert any(abs(abs(f) - 19000.0) < 1500.0 or abs(abs(f) - 38000.0) < 1500.0
+               for f in s0.spurious_freqs), \
+        f"test setup broken: pilot not detected without exclusion {s0.spurious_freqs}"
+    s1 = DigitalSelfInterferenceCanceller(sample_rate=fs)
+    s1.auto_detect_spurious(iq, exclude_bands=excl)
+    bad = [f for f in s1.spurious_freqs
+           if any(abs(abs(f) - c) < hw for (c, hw) in excl)]
+    assert not bad, f"pilot falsely detected with exclusion: {s1.spurious_freqs}"
+    spur = 0.4 * np.exp(1j * 2 * np.pi * 25000.0 * t)
+    s2 = DigitalSelfInterferenceCanceller(sample_rate=fs)
+    s2.auto_detect_spurious((0.6 * np.exp(1j * ph) + spur).astype(np.complex64),
+                            exclude_bands=excl)
+    assert any(abs(f - 25000.0) < 1500.0 for f in s2.spurious_freqs), \
+        f"real spur missed with exclusion: {s2.spurious_freqs}"
+    print(f"[*] no-excl={s0.spurious_freqs} excl={s1.spurious_freqs} "
+          f"spur+excl={s2.spurious_freqs}")
+    print("[OK] test_pilot_exclusion passed")
+
+
 if __name__ == "__main__":
     print("===== Running Digital SIC Tests =====")
     test_single_spurious_cancellation()
     test_auto_detect_spurious()
     test_clean_signal_transparency()
     test_pipeline_sic_integration()
+    test_offgrid_spurious_cancellation()
+    test_redetect_weight_carryover()
+    test_pilot_exclusion()
     print("ALL DIGITAL SIC TESTS PASSED!")
