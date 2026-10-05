@@ -309,8 +309,19 @@ class DspWfmMixin:
             # CMA等化 (ハードリミット前。リミット後は包絡線一定で誤差が出ない)。
             # 信号存在ゲート: lock必須＋ノイズ床veto (S-meterだけでの作動は
             # 深フェードでblendを下げるため廃止。ゲート側と条件を一致させる)。
-            iq_if = self._apply_cma(iq_if)
-            self.cma_active = True
+            # C/Nクロスフェード: 比較的クリーンな条件では等化人工物が
+            # 逆効果のため、重み0では等化自体を呼ばず素通し (適応も凍結)。
+            _cn = float(getattr(self, "_if_snr_db", 25.0))
+            _chi = float(getattr(self, "cma_cn_hi", 30.0))
+            _clo = float(getattr(self, "cma_cn_lo", 25.0))
+            w_cma = float(np.clip((_chi - _cn) / max(_chi - _clo, 1e-6),
+                                  0.0, float(getattr(self, "cma_w_max", 1.0))))
+            if w_cma > 0.01:
+                iq_eq = self._apply_cma(iq_if)
+                iq_if = ((1.0 - w_cma) * iq_if + w_cma * iq_eq)
+                self.cma_active = True
+            else:
+                self.cma_active = False
         else:
             self.cma_active = False
 
@@ -1812,3 +1823,10 @@ class DspWfmMixin:
         self._cma_w[2 * (self._cma_taps // 2)] = 1.0  # 中央タップ=デルタ初期化
         self._cma_hist = np.zeros(self._cma_taps - 1, dtype=np.complex64)
         self.cma_active = False
+        # CMAクロスフェードのC/N窓 (EKF/Riemannと同型)。
+        # 強歪み (低CN) では等化が効くが、比較的クリーンなマルチパスでは
+        # 等化人工物が逆に了解度を落とす (ESTOIで+0.09/-0.03を確認)。
+        # CNで重み付けし、効く条件でのみ混ぜる。
+        self.cma_cn_hi = 28.0
+        self.cma_cn_lo = 23.0
+        self.cma_w_max = 1.0
