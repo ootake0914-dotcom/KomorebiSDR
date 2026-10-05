@@ -1082,8 +1082,13 @@ class SdrApp:
         print("[*] Receiver running. Use the GUI window to control.")
 
         # GUIループ (メインスレッド)
+        # フレーム pacing (20fps): render 1回約34msが無制限に回るとGILを
+        # 占有し、弱電界 (Python側DSP増) の復調ワーカーが starve して
+        # raw_queue overflow→音飛びになる。描画を間引いてDSPへ譲る。
+        self._gui_frame_dt = 1.0 / 20.0
         try:
             while self.gui.running:
+                t_frame = time.perf_counter()
                 self.gui.handle_events()
 
                 with self.spectrum_lock:
@@ -1091,6 +1096,10 @@ class SdrApp:
                     audio_copy = self.latest_audio.copy()
 
                 self.gui.render(spec_copy, audio_copy)
+                dt = time.perf_counter() - t_frame
+                rest = self._gui_frame_dt - dt
+                if rest > 0.0:
+                    time.sleep(rest)
 
         except KeyboardInterrupt:
             pass
