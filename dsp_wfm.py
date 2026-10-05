@@ -820,6 +820,18 @@ class DspWfmMixin:
                 # (alphaを8フレーム分に換算)。
                 a_ms8 = 1.0 - float(np.exp(
                     -(8.0 * hop / float(self.audio_rate)) / 8.0))
+                # 高速化: ループ不変のgetattr/len判定・定数を外へ hoist。
+                # _xi/_gp/_ggはフレーム更新値をローカルで回し、最後に書戻す
+                # (ループ中の再取得と同値。数値演算の順序は不変)。
+                _xi = getattr(self, "_wf_xi", None)
+                _gp = getattr(self, "_wf_gamma_prev", None)
+                _gg = getattr(self, "_wf_g", None)
+                _nb = len(noise_bin)
+                if _xi is None or _gp is None or len(_xi) != _nb or len(_gp) != _nb:
+                    _xi = _gp = None
+                if _gg is not None and len(_gg) != _nb:
+                    _gg = None
+                _gmin = float(self._nr_gmin)
                 for j in range(nframes):
                     power = powers[j]
                     self._wf_p = 0.5 * power + 0.5 * self._wf_p
@@ -828,33 +840,25 @@ class DspWfmMixin:
                     # ビン毎のゲインチラつき＝ミュージカルノイズを抑える。
                     gamma = power / (noise_bin + 1e-12)
                     xi_inst = np.maximum(gamma - 1.0, 0.0)
-                    try:
-                        _xi = getattr(self, "_wf_xi", None)
-                        _gp = getattr(self, "_wf_gamma_prev", None)
-                        _gg = getattr(self, "_wf_g", None)
-                    except Exception:
-                        _xi, _gp, _gg = None, None, None
-                    if (_xi is None or _gp is None or len(_xi) != len(gamma)
-                            or len(_gp) != len(gamma)):
+                    if _xi is None or _gp is None:
                         xi = xi_inst.astype(np.float32)
                     else:
-                        if _gg is None or len(_gg) != len(gamma):
+                        if _gg is None:
                             _g2 = np.ones_like(gamma, dtype=np.float32)
                         else:
-                            _g2 = (np.asarray(_gg, dtype=np.float32) ** 2)
-                        xi = (0.85 * _g2 * np.asarray(_gp, dtype=np.float32)
-                              + 0.15 * xi_inst).astype(np.float32)
+                            _g2 = _gg * _gg
+                        xi = (0.85 * _g2 * _gp + 0.15 * xi_inst).astype(np.float32)
                         xi = np.maximum(xi, 0.0)
-                    self._wf_xi = xi
-                    self._wf_gamma_prev = gamma.astype(np.float32)
+                    _xi = xi
+                    _gp = gamma.astype(np.float32)
                     g_w = np.maximum(xi / (1.0 + xi + 1e-12),
-                                     self._nr_gmin).astype(np.float32)
+                                     _gmin).astype(np.float32)
                     g_w[:3] = 1.0  # DC〜低域は保護
-                    if self._wf_g is None or len(self._wf_g) != len(g_w):
-                        self._wf_g = g_w
+                    if _gg is None:
+                        _gg = g_w
                     else:
-                        a = np.where(g_w < self._wf_g, 0.7, 0.1)
-                        self._wf_g = self._wf_g + a * (g_w - self._wf_g)
+                        a = np.where(g_w < _gg, 0.7, 0.1)
+                        _gg = _gg + a * (g_w - _gg)
                     # 知覚マスキングフロア: 番組にマスクされるノイズは抑圧不要 (g→1)。
                     # Wienerの過剰抑圧（音楽性ノイズ・高域の曇り）を可聴性基準で緩和する。
                     # マスキング算出はクリーン推定 (P-N) から行う (ノイズ込み電力では
@@ -877,10 +881,13 @@ class DspWfmMixin:
                             _ms += a_ms8 * (mask_thr - _ms)
                         self._wf_mask_cnt = _cnt
                     gate = np.minimum(1.0, _ms / noise_denom).astype(np.float32)
-                    g_use = np.maximum(self._wf_g, gate)
+                    g_use = np.maximum(_gg, gate)
                     g_use[:3] = 1.0  # DC〜低域は保護
                     g_mix = 1.0 - sw * (1.0 - g_use)
                     gmix[j] = g_mix
+                self._wf_xi = _xi
+                self._wf_gamma_prev = _gp
+                self._wf_g = _gg
                 self.stereo_wiener_gain = float(np.mean(gmix[-1]))
 
             # バッチirfft＋同順序OLA加算

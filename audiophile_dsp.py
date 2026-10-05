@@ -11,6 +11,11 @@ Audiophile High-End DSP Modules for KomorebiSDR Radio.
 
 import numpy as np
 
+try:
+    from scipy.signal import lfilter as _lfilter
+except Exception:
+    _lfilter = None
+
 
 class TpdfDitherNoiseShaper:
     """
@@ -229,17 +234,30 @@ class ActiveDcServo:
     def _servo_channel(self, ch: np.ndarray, is_right: bool) -> np.ndarray:
         n = len(ch)
         ch_clean = np.nan_to_num(ch, nan=0.0, posinf=1.0, neginf=-1.0)
-        out = np.empty(n, dtype=np.float32)
         dc = self.dc_r if is_right else self.dc_l
         if not np.isfinite(dc):
             dc = 0.0
         alpha = self.alpha
 
         # 積分負帰還ループ: y[n] = x[n] - dc,  dc += alpha * y[n]
-        for i in range(n):
-            y = ch_clean[i] - dc
-            dc += alpha * y
-            out[i] = y
+        # ベクトル化: dc[n] = (1-a)*dc[n-1] + a*x[n] の1次IIRなので
+        # lfilterで等価計算 (逐次ループ2752回≒1.7ms/chを排除)。
+        if _lfilter is not None and n > 0:
+            xc = np.asarray(ch_clean, dtype=np.float64)
+            dc_arr, zf = _lfilter([alpha], [1.0, -(1.0 - alpha)], xc,
+                                  zi=[float(dc)])
+            prev = np.empty(n, dtype=np.float64)
+            prev[0] = float(dc)
+            if n > 1:
+                prev[1:] = dc_arr[:-1]
+            out = (xc - prev).astype(np.float32)
+            dc = float(zf[0])
+        else:
+            out = np.empty(n, dtype=np.float32)
+            for i in range(n):
+                y = ch_clean[i] - dc
+                dc += alpha * y
+                out[i] = y
 
         if is_right:
             self.dc_r = dc
