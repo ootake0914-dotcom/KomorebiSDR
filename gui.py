@@ -9,6 +9,7 @@ import pygame
 import time
 from collections import OrderedDict
 
+from auto_tuner import match_station_name
 from i18n import t
 
 
@@ -273,14 +274,16 @@ class SdrGui:
         self.spec_rect = pygame.Rect(14, 142, 800, 200)
         self.wf_rect = pygame.Rect(14, 348, 800, 312)  # 下部カード廃止で縦に拡大
         # wave/gainパネルは廃止 (ダミーrectも持たない)。
-        self.tele_rect = pygame.Rect(826, 142, 280, 96)
-        self.tune_rect = pygame.Rect(826, 246, 280, 414)  # 下部まで延長 (カード廃止分)
+        self.tele_rect = pygame.Rect(826, 142, 280, 118)
+        self.tune_rect = pygame.Rect(826, 268, 280, 392)  # tele拡大分だけ下げ、底辺660は維持
         # preset_rectは廃止 (ステーションカード削除)。プリセットデータはconfig側で維持。
         self.status_rect = pygame.Rect(14, 674, 1092, 32)
         # お気に入り☆は飾りのみだったため廃止 (保存・一覧なしの嘘UI)。
         # 音量スライダー廃止 (システム音量に一本化。死にコントロール除去)。
 
-        self.wf_surface = pygame.Surface((self.wf_rect.width, self.wf_rect.height))
+        # ウォーターフォール面は枠内側 (4pxインセット) サイズで作る。
+        # 枠と同寸で+4オフセットblitすると右・下端が4pxはみ出す。
+        self.wf_surface = pygame.Surface((self.wf_rect.width - 8, self.wf_rect.height - 8))
         self.wf_surface.fill((0, 0, 0))
 
         # パラメータコールバック
@@ -306,10 +309,7 @@ class SdrGui:
         self.current_rssi = -50.0
         self.is_stereo = False
         self.stereo_status = "MONO"
-        self.stereo_enabled = True  # 常時True固定 (自動ブレンドに一本化)
-        # NRは常時ON固定 (ボタン削除・木漏れ日整理)。nr_enabled属性は廃止。
         # 描画用の事前確保バッファ (毎フレームの確保を排除)
-        self._wave_xs = None
         self._spec_px = None
         self._wf_x_src = None
         self._wf_lo = None
@@ -349,6 +349,17 @@ class SdrGui:
         # UIボタンのリスト
         self.buttons = []
         self._init_controls()
+
+        # 毎フレーム再計算の排除用キャッシュ
+        self._spec_map_n = -1      # スペクトラム補間マップの構築元長
+        self._spec_map_pw = -1     # 描画点数
+        self._shade_cache = {}     # 中心帯域シェード (幅px -> Surface)
+        self._dim_cache = None     # 局リスト用ディム (サイズ一致で再利用)
+        self._dim_size = (0, 0)
+        self._cursor_last = None   # カーソル形状 (変化時のみset_cursor)
+        self._legacy_wheel = pygame.version.vernum[0] < 2
+        self._render_ema_ms = 0.0  # 描画実働のEMA (適応fps用)
+        self._fps_cap = 30         # 通常30 / 高負荷時15へ自動低下
 
     # ================================================================
     # 事前描画 (ガラスパネル / 背景 / 静的ベイク)
@@ -421,8 +432,8 @@ class SdrGui:
         baked.blit(cached_text(self.font_tiny, "BAND SELECTOR", C_MUTED), (self.info_rect.x + 18, self.info_rect.y + 8))
         baked.blit(cached_text(self.font_tiny, "ONE-TOUCH DISCOVERY", C_MUTED), (self.tune_rect.x + 14, self.tune_rect.y + 8))
         baked.blit(cached_text(self.font_title, t("status"), C_MUTED), (self.tele_rect.x + 14, self.tele_rect.y + 8))
-        lbl_wf = cached_text(self.font_tiny, t("waterfall"), (110, 128, 150))
-        baked.blit(lbl_wf, (self.wf_rect.x + 12, self.wf_rect.y + 6))
+        # ウォーターフォール見出しはベイクしない (毎フレーム画像に塗り潰される
+        # ため。_draw_waterfall 側でblit後に描く)
 
         self.baked_bg = baked
 
@@ -493,40 +504,52 @@ class SdrGui:
                                   bg_color=(236, 236, 248), radius=16)
         btns.extend([self.btn_band_fm, self.btn_band_am, self.btn_band_sw])
 
-        # ---- 2. ONE-TOUCH DISCOVERY (tune_rect 内にスキャン・シーク・モード配置) ----
         # ---- 2. ONE-TOUCH DISCOVERY (tune_rectいっぱいに均等配置。空洞を作らない) ----
+        # float均等割: 整数切り捨てだと端数が底に溜まるため、gapを小数で
+        # 配り底空白を1gap分に抑える。Rect化はint(round())で丸める。
         tx, tw = self.tune_rect.x + 14, self.tune_rect.width - 28
-        y = self.tune_rect.y + 28
-        bottom = self.tune_rect.bottom - 12
-        # 固定行高の合計を差し引いた残りを均等gapに分配する
+        y = float(self.tune_rect.y + 28)
+        bottom = float(self.tune_rect.bottom - 12)
+        # 固定行高の合計を差し引いた残りを均等gapに分配する。
+        # BFO行はSSB/CW表示時のみ計上する (WFM受信中に60px級の空白が
+        # 底に残るのを防ぐ。モード切替時は _set_mode から再レイアウトする)
+        show_bfo = self.mode in ("USB", "LSB", "CW")
         row_h = {"scan": 44, "seek": 34, "list": 30, "mode": 28, "bfo": 26}
-        fixed = row_h["scan"] + row_h["seek"] + row_h["list"] + 2 * row_h["mode"] + 4 + row_h["bfo"]
-        gap = max(6, (bottom - y - fixed) // 5)
+        fixed = row_h["scan"] + row_h["seek"] + row_h["list"] + 2 * row_h["mode"] + 4
+        if show_bfo:
+            fixed += row_h["bfo"]
+        # gap数: BFO表示時は行間4+末尾1=5、非表示時は行間3+末尾1=4。
+        # 非表示で5のままにすると末尾に2gap分溜まる。
+        ngap = 5 if show_bfo else 4
+        gap = max(6.0, (bottom - y - fixed) / float(ngap))
+
+        def _ry(v):
+            return int(round(v))
         half = (tw - 8) // 2
         # FM/短波/ハムスキャンを3並列配置 (いずれも常時到達可能)
         scan_w = (tw - 2 * 6) // 3
-        self.btn_scan_band = Button((tx, y, scan_w, row_h["scan"]), t("scan_button"), self._request_scan,
+        self.btn_scan_band = Button((tx, _ry(y), scan_w, row_h["scan"]), t("scan_button"), self._request_scan,
                                     bg_color=(196, 238, 226), active_color=C_ACCENT, radius=8)
-        self.btn_scan_sw = Button((tx + scan_w + 6, y, scan_w, row_h["scan"]), t("scan_sw_button"),
+        self.btn_scan_sw = Button((tx + scan_w + 6, _ry(y), scan_w, row_h["scan"]), t("scan_sw_button"),
                                   self._request_sw_scan,
                                   bg_color=(208, 230, 250), active_color=C_ACCENT, radius=8)
-        self.btn_scan_ham = Button((tx + 2 * (scan_w + 6), y, scan_w, row_h["scan"]), t("ham_button"),
+        self.btn_scan_ham = Button((tx + 2 * (scan_w + 6), _ry(y), scan_w, row_h["scan"]), t("ham_button"),
                                    self._request_ham_scan,
                                    bg_color=(232, 226, 248), active_color=C_ACCENT, radius=8)
         btns.extend([self.btn_scan_band, self.btn_scan_sw, self.btn_scan_ham])
         y += row_h["scan"] + gap
 
         # シークボタン (Prev / Next)
-        self.btn_seek_prev = Button((tx, y, half, row_h["seek"]), t("seek_prev"), lambda: self._seek(-1),
+        self.btn_seek_prev = Button((tx, _ry(y), half, row_h["seek"]), t("seek_prev"), lambda: self._seek(-1),
                                     bg_color=(226, 235, 248), active_color=C_BTN_ACTIVE2, radius=8)
-        self.btn_seek_next = Button((tx + half + 8, y, half, row_h["seek"]), t("seek_next"), lambda: self._seek(1),
+        self.btn_seek_next = Button((tx + half + 8, _ry(y), half, row_h["seek"]), t("seek_next"), lambda: self._seek(1),
                                     bg_color=(226, 235, 248), active_color=C_BTN_ACTIVE2, radius=8)
         btns.extend([self.btn_seek_prev, self.btn_seek_next])
         y += row_h["seek"] + gap
 
         # 検出局プルダウンボタン
         n_st = len(self.detected_stations)
-        self.btn_station_list = Button((tx, y, tw, row_h["list"]), t("station_list_btn", n=n_st),
+        self.btn_station_list = Button((tx, _ry(y), tw, row_h["list"]), t("station_list_btn", n=n_st),
                                        self._toggle_station_list,
                                        bg_color=(210, 240, 232), active_color=C_ACCENT, radius=6)
         btns.append(self.btn_station_list)
@@ -542,19 +565,21 @@ class SdrGui:
             [("USB", (228, 238, 252)), ("LSB", (228, 238, 252)), ("CW", (228, 238, 252))]
         ]
         for r_idx, row in enumerate(mode_rows):
-            cur_my = y + r_idx * (mh + 4)
+            cur_my = _ry(y + r_idx * (mh + 4))
             for c_idx, (m_name, m_col) in enumerate(row):
                 b = Button((tx + c_idx * (mw + m_gap), cur_my, mw, mh), m_name,
                            (lambda m=m_name: self._set_mode(m)), bg_color=m_col, radius=6)
                 mode_buttons[m_name] = b
                 btns.append(b)
         self.mode_buttons = mode_buttons
-        y += 2 * mh + 4 + gap
+        y += 2 * mh + 4
+        if show_bfo:
+            y += gap
 
         # BFO微調整 (SSB・CW時に表示)
-        self.btn_bfo_down = Button((tx, y, half, row_h["bfo"]), "BFO -",
+        self.btn_bfo_down = Button((tx, _ry(y), half, row_h["bfo"]), "BFO -",
                                    lambda: self._step_bfo(-50), bg_color=(240, 243, 248), radius=4)
-        self.btn_bfo_up = Button((tx + half + 8, y, half, row_h["bfo"]), "BFO +",
+        self.btn_bfo_up = Button((tx + half + 8, _ry(y), half, row_h["bfo"]), "BFO +",
                                  lambda: self._step_bfo(50), bg_color=(240, 243, 248), radius=4)
         btns.extend([self.btn_bfo_down, self.btn_bfo_up])
         # 下部ステーションカードは廃止 (検出局プルダウンに一本化)。
@@ -580,8 +605,12 @@ class SdrGui:
             self.on_freq_change(self.center_freq)
 
     def _set_mode(self, mode):
+        prev_bfo = self.mode in ("USB", "LSB", "CW")
         self.mode = mode
         self._sync_bfo_visibility()
+        # BFO行の有無で行高が変わるため再レイアウトする (底空白の防止)
+        if (self.mode in ("USB", "LSB", "CW")) != prev_bfo:
+            self._init_controls()
         if self.on_mode_change:
             self.on_mode_change(self.mode)
 
@@ -595,12 +624,9 @@ class SdrGui:
 
     def _tune(self, freq, mode):
         self.center_freq = freq
-        self.mode = mode
-        self._sync_bfo_visibility()
         if self.on_freq_change:
             self.on_freq_change(self.center_freq)
-        if self.on_mode_change:
-            self.on_mode_change(self.mode)
+        self._set_mode(mode)
 
     def _seek(self, direction):
         if self.on_seek_change:
@@ -807,9 +833,12 @@ class SdrGui:
         if not self.station_list_open or not self.detected_stations:
             return
         panel, rows, total = self._station_list_layout()
-        dim = pygame.Surface((self.width, self.height), pygame.SRCALPHA)
-        dim.fill((10, 16, 28, 90))
-        self.screen.blit(dim, (0, 0))
+        # 全画面ディムはサイズ一致で使い回す (毎フレーム確保の排除)
+        if self._dim_cache is None or self._dim_size != (self.width, self.height):
+            self._dim_cache = pygame.Surface((self.width, self.height), pygame.SRCALPHA)
+            self._dim_cache.fill((10, 16, 28, 90))
+            self._dim_size = (self.width, self.height)
+        self.screen.blit(self._dim_cache, (0, 0))
         pygame.draw.rect(self.screen, (248, 250, 253), panel, border_radius=12)
         pygame.draw.rect(self.screen, (90, 110, 140), panel, width=2, border_radius=12)
         title = cached_text(self.font_med, f"検出局 ({total})  — クリックで選局",
@@ -884,7 +913,7 @@ class SdrGui:
             # マウスホイールによる周波数同調 (桁単位ホイール同調)
             # pygame2はMOUSEWHEELを出すため、MOUSEBUTTONDOWN(4/5)は旧SDLの
             # フォールバック限定 (両対応だと1ノッチで二重に動く)
-            use_legacy_wheel = pygame.version.vernum[0] < 2
+            use_legacy_wheel = self._legacy_wheel
             wheel_delta = 0
             if event.type == pygame.MOUSEWHEEL:
                 wheel_delta = event.y
@@ -961,7 +990,6 @@ class SdrGui:
                                 continue
                         if best_pk is not None:
                             try:
-                                from auto_tuner import match_station_name
                                 pk_name = match_station_name(int(best_pk.get("freq_hz", 0)))
                             except Exception:
                                 pk_name = ""
@@ -983,7 +1011,8 @@ class SdrGui:
                 if btn.visible:
                     btn.handle_event(event)
 
-        # カーソル形状の更新 (ボタンホバー中または周波数桁ホバー中は指先ハンドカーソル)
+        # カーソル形状の更新 (変化時のみset_cursor。毎フレーム呼ぶと無駄)。
+        # ついでにget_posも1回に集約する。
         mx, my = pygame.mouse.get_pos()
         is_hover_btn = any(btn.visible and btn.rect.collidepoint(mx, my) for btn in self.buttons)
         is_hover_digit = (self.hovered_freq_digit is not None)
@@ -994,14 +1023,12 @@ class SdrGui:
             self.hover_freq_hz = self._spec_x_to_freq(mx)
         else:
             self.hover_freq_hz = None
-        if is_hover_btn or is_hover_digit or self.hover_freq_hz is not None:
+        want_hand = bool(is_hover_btn or is_hover_digit or self.hover_freq_hz is not None)
+        if want_hand != self._cursor_last:
+            self._cursor_last = want_hand
             try:
-                pygame.mouse.set_cursor(pygame.SYSTEM_CURSOR_HAND)
-            except Exception:
-                pass
-        else:
-            try:
-                pygame.mouse.set_cursor(pygame.SYSTEM_CURSOR_ARROW)
+                pygame.mouse.set_cursor(pygame.SYSTEM_CURSOR_HAND if want_hand
+                                        else pygame.SYSTEM_CURSOR_ARROW)
             except Exception:
                 pass
 
@@ -1011,7 +1038,7 @@ class SdrGui:
     # ================================================================
     def update_waterfall(self, spectrum_db: np.ndarray):
         """ウォーターフォールにライン追加 (スクロール描画)"""
-        wf_w = self.wf_rect.width
+        wf_w = self.wf_surface.get_width()
         self.wf_surface.scroll(0, 2)
 
         try:
@@ -1194,7 +1221,6 @@ class SdrGui:
                     break
             if not ticker_text:
                 try:
-                    from auto_tuner import match_station_name
                     cand = match_station_name(self.center_freq)
                     if cand != "Unknown FM Station":
                         ticker_text = cand
@@ -1248,8 +1274,8 @@ class SdrGui:
                     self.freq_digit_hitboxes.append((ch_rect, step_hz))
                     if self.hovered_freq_digit == step_hz:
                         pygame.draw.line(self.screen, C_ACCENT,
-                                         (cur_x + 1, base_y + ch_surf.get_height() - 4),
-                                         (cur_x + ch_w - 2, base_y + ch_surf.get_height() - 4), 3)
+                                         (cur_x + 1, base_y + ch_surf.get_height() - 6),
+                                         (cur_x + ch_w - 2, base_y + ch_surf.get_height() - 6), 3)
 
             cur_x += ch_w
 
@@ -1304,7 +1330,7 @@ class SdrGui:
 
 
     def _draw_spectrum(self, spectrum_db):
-        self._draw_panel("spec", self.spec_rect)
+        # パネル自体はbaked_bgに焼き済みのため再blitしない (内容だけ描く)
         r = self.spec_rect
 
         for i in range(1, 5):
@@ -1320,12 +1346,18 @@ class SdrGui:
         if len(spectrum_db) > 1:
             pw = min(420, max(64, r.width))
             db_min, db_max = -80.0, -10.0
+            # 補間マップは固定 (n=1024/pw固定) のため初回のみ構築する
+            n = len(spectrum_db)
+            if (self._spec_map_n != n or self._spec_map_pw != pw
+                    or self._spec_px is None or len(self._spec_px) != pw):
+                self._spec_map_n = n
+                self._spec_map_pw = pw
+                self._spec_xs = np.linspace(0, n - 1, pw)
+                self._spec_idx = np.arange(n)
+                self._spec_px = np.linspace(r.x + 4, r.right - 4, pw)
             norm = np.clip((spectrum_db - db_min) / (db_max - db_min), 0.0, 1.0)
             norm = np.nan_to_num(norm, nan=0.0, posinf=1.0, neginf=0.0)
-            xs = np.linspace(0, len(norm) - 1, pw)
-            ys = np.interp(xs, np.arange(len(norm)), norm)
-            if self._spec_px is None or len(self._spec_px) != pw:
-                self._spec_px = np.linspace(r.x + 4, r.right - 4, pw)
+            ys = np.interp(self._spec_xs, self._spec_idx, norm)
             px = self._spec_px
             py = r.bottom - 10 - ys * (r.height - 34)
             pts = np.stack((px, py), axis=1).tolist()
@@ -1335,12 +1367,19 @@ class SdrGui:
             pygame.draw.lines(self.screen, (0, 230, 190), False, pts, 2)
 
         # センター同調マーカー + 帯域ハイライト
+        # (シェードは同サイズを使い回す。モードで幅が変わる分だけ辞書保持)
         cx = r.centerx
         bw_hz = 200000 if self.mode == "WFM" else 16000 if self.mode == "NFM" else 12000
         sr = self.sample_rate if self.sample_rate > 0 else 1152000
         bw_px = max(2, int((bw_hz / sr) * r.width))
-        shade = pygame.Surface((bw_px, r.height - 12), pygame.SRCALPHA)
-        shade.fill((226, 190, 110, 26))
+        shade = self._shade_cache.get(bw_px)
+        if shade is None or shade.get_height() != r.height - 12:
+            shade = pygame.Surface((bw_px, r.height - 12), pygame.SRCALPHA)
+            shade.fill((226, 190, 110, 26))
+            # サイズ違いの溜め込みを防ぐ (モードは6種→最大6枚)
+            if len(self._shade_cache) > 8:
+                self._shade_cache.clear()
+            self._shade_cache[bw_px] = shade
         self.screen.blit(shade, (cx - bw_px // 2, r.y + 6))
         pygame.draw.line(self.screen, C_GOLD, (cx, r.y + 4), (cx, r.bottom - 4), 2)
 
@@ -1404,17 +1443,16 @@ class SdrGui:
         self.screen.blit(l2, (r.right - 80, r.bottom - 18))
 
     def _draw_waterfall(self, spectrum_db):
-        self._draw_panel("wf", self.wf_rect)
+        # パネル自体はbaked_bgに焼き済みのため再blitしない (内容だけ描く)
         self.update_waterfall(spectrum_db)
         r = self.wf_rect
         if self.wf_surface:
             self.screen.blit(self.wf_surface, (r.x + 4, r.y + 4))
+        # 見出しは画像の後に描く (先に描くと毎フレーム塗り潰されて消える)
+        lbl_wf = cached_text(self.font_tiny, t("waterfall"), (110, 128, 150))
+        self.screen.blit(lbl_wf, (r.x + 12, r.y + 6))
         cx = r.centerx
         pygame.draw.line(self.screen, C_GOLD, (cx, r.y + 4), (cx, r.bottom - 4), 1)
-
-    def _draw_waveform(self, audio_pcm):
-        # 波形パネルはレイアウトから削除済み (0サイズ)。ゴミ描画防止のため何もしない。
-        return
 
     def _draw_telemetry(self):
         # 初心者にもわかる電波クオリティ判定バッジ (どんなアンテナでも状況把握)
@@ -1438,13 +1476,15 @@ class SdrGui:
 
         parts = [p.strip() for p in self.telemetry_text.split("|") if p.strip()]
 
-        # 2列×3行の精密ダッシュボード・ミニバッジ形式で整然と表示
-        bw, bh = 122, 20
+        # 2列×4行の精密ダッシュボード・ミニバッジ形式で整然と表示
+        # (旧6枠では7つ目のRF異常タグが捨てられていた。異常時ほど消える
+        # バグのため8枠へ拡張。tele_rectも118pxへ拡大済み)
+        bw, bh = 120, 18
         gap_x = 8
-        for i, part in enumerate(parts[:6]):
-            col, row = i // 3, i % 3
+        for i, part in enumerate(parts[:8]):
+            col, row = i // 4, i % 4
             bx = self.tele_rect.x + 14 + col * (bw + gap_x)
-            by = self.tele_rect.y + 30 + row * 22
+            by = self.tele_rect.y + 30 + row * 21
             pygame.draw.rect(self.screen, (234, 240, 248), (bx, by, bw, bh), border_radius=4)
             pygame.draw.rect(self.screen, (214, 224, 238), (bx, by, bw, bh), width=1, border_radius=4)
             surf = cached_text(self.font_tiny, part, C_TEXT)
@@ -1471,7 +1511,10 @@ class SdrGui:
                 btn.draw(self.screen, self.font_small)
 
     def render(self, spectrum_db, audio_pcm=None):
-        """1フレームの描画処理 (静的シーン事前ベイクで高速化)"""
+        """1フレームの描画処理 (静的シーン事前ベイクで高速化)。
+        高負荷時はfps上限を30→15へ自動低下させ、DSPワーカーの
+        GIL/CPUを保護する (ヒステリシス付き)。"""
+        t0 = time.perf_counter()
         if self.baked_bg is not None:
             self.screen.blit(self.baked_bg, (0, 0))
         else:
@@ -1480,7 +1523,6 @@ class SdrGui:
         self._draw_header()
         self._draw_spectrum(spectrum_db)
         self._draw_waterfall(spectrum_db)
-        self._draw_waveform(audio_pcm)
         self._draw_telemetry()
         if hasattr(self, "btn_station_list"):
             self.btn_station_list.text = t("station_list_btn", n=len(self.detected_stations))
@@ -1488,7 +1530,13 @@ class SdrGui:
         self._draw_station_list()
 
         pygame.display.flip()
-        self.clock.tick(30)
+        busy_ms = (time.perf_counter() - t0) * 1000.0
+        self._render_ema_ms += 0.1 * (busy_ms - self._render_ema_ms)
+        if self._fps_cap == 30 and self._render_ema_ms > 14.0:
+            self._fps_cap = 15
+        elif self._fps_cap == 15 and self._render_ema_ms < 8.0:
+            self._fps_cap = 30
+        self.clock.tick(self._fps_cap)
 
     def close(self):
         pygame.quit()
