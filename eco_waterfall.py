@@ -73,13 +73,14 @@ class BaseEntity:
 class Plant(BaseEntity):
     """局の柱に咲く。size 0..1 (SNRが日光)。"""
 
-    __slots__ = ("size", "target", "age")
+    __slots__ = ("size", "target", "age", "unseen")
 
     def __init__(self, x, y):
         super().__init__(x, y)
         self.size = 0.1
         self.target = 0.5
         self.age = 0.0
+        self.unseen = 0.0
 
 
 class Garbage(BaseEntity):
@@ -217,13 +218,13 @@ class EcoSystem:
         env = env or {}
         dt = _clamp(float(env.get("dt", 1.0 / 30.0)), 0.001, 0.25)
         self._t += dt
-        # 本家 tick 換算 (30fps想定)。負荷時15fpsでは半速になるが、
-        # 生態系の時間感覚が鈍るだけで破綻しない。
-        steps = 1
+        # 適応fpsで15fpsに落ちてもテンポを保つ (2stepまで)。
+        # 本家 tick 駆動の等価を維持し、3step以上は重いので頭打ち。
+        steps = 2 if dt > 0.05 else 1
         cols = env.get("plants") or []
         clipped = bool(env.get("clipped", False))
         for _ in range(steps):
-            self._step(cols, clipped, dt)
+            self._step(cols, clipped, dt / steps)
 
     def _step(self, cols, clipped, dt):
         for e in self.herbs + self.carns + self.apexs + self.decomps + self.spores:
@@ -314,7 +315,9 @@ class EcoSystem:
         seen = set()
         for x, snr in cols[:MAX_PLANTS]:
             try:
-                key = int(round(float(x) / 4.0))
+                # ピーク位置は±数pxふらつくため粗い量子化にする。
+                # 細かすぎると別株扱いで明滅する。
+                key = int(round(float(x) / 16.0))
             except (TypeError, ValueError):
                 continue
             seen.add(key)
@@ -327,10 +330,13 @@ class EcoSystem:
                 self.plants[key] = pl
             else:
                 pl.x += (_clamp(float(x), 6.0, self.width - 6.0) - pl.x) * min(1.0, dt * 2.0)
+                pl.unseen = 0.0
             try:
-                pl.target = _clamp((float(snr) - 4.0) / 24.0, 0.05, 1.0)
+                tgt = _clamp((float(snr) - 4.0) / 24.0, 0.05, 1.0)
             except (TypeError, ValueError):
-                pl.target = 0.2
+                tgt = 0.2
+            # 目標も平滑化する (番組の緩急で明滅させない)
+            pl.target += (tgt - pl.target) * min(1.0, dt * 3.0)
         for key in list(self.plants.keys()):
             pl = self.plants[key]
             # 食べ尽くされた株は除去する (柱が見えていれば再発芽する。本家同様)
@@ -339,10 +345,13 @@ class EcoSystem:
                 continue
             pl.age += dt
             if key not in seen:
-                pl.target = 0.0
-            rate = 0.25 if pl.target > pl.size else 0.6
+                # 見失っても2秒は枯らさない (フェージング・検出揺らぎの猶予)
+                pl.unseen += dt
+                if pl.unseen > 2.0:
+                    pl.target = 0.0
+            rate = 0.25 if pl.target > pl.size else 0.3
             pl.size += _clamp(pl.target - pl.size, -rate * dt, rate * dt)
-            if pl.size <= 0.01 and key not in seen:
+            if pl.size <= 0.01 and pl.target <= 0.0:
                 del self.plants[key]
 
     def _update_decomps(self, dt):
@@ -629,6 +638,11 @@ class EcoSystem:
         tr = getattr(e, "trail", None)
         if tr is None:
             return
+        # ワープ (胞子の端回り込み) では線を引かない (本家と同様に履歴破棄)
+        if tr:
+            lx, ly = tr[-1]
+            if (e.x - lx) ** 2 + (e.y - ly) ** 2 > 1600.0:
+                del tr[:]
         tr.append((e.x, e.y))
         if len(tr) > cap:
             del tr[0]
@@ -647,28 +661,25 @@ class EcoSystem:
     def _vet_t(self, age):
         return _clamp((age - 10.0) / 20.0, 0.0, 1.0)
 
-    def _flash_col(self, e, col):
-        fl = self.flash.get(id(e), 0.0)
-        if fl > 0.0:
-            return self._lerp(col, (255, 255, 255), min(1.0, fl))
-        return col
-
-    def _glow_dot(self, glow, x, y, r, col, alpha=70):
-        """加算グロー層への発光 (本家のglow_layerと同義)。"""
+    def _glow_dot(self, glow, x, y, r, col, alpha=40):
+        """加算グロー層への発光 (本家のglow_layerと同義)。
+        重なり飽和で白飛びするため、半径・濃度は控えめにする。"""
         try:
-            gfx.filled_circle(glow, x, y, int(r * 2.2),
+            gfx.filled_circle(glow, x, y, int(r * 1.7),
                               (col[0], col[1], col[2], alpha))
         except Exception:
             pass
 
     def _body(self, screen, glow, ex, ey, ox, oy, r, col, vx=0.0, vy=0.0,
-              fur=0, seed=0.0):
+              fur=0, seed=0.0, fl=0.0):
         x, y = ox + int(ex), oy + int(ey)
         lx, ly = int(ex), int(ey)
+        # グローは素の色で (フラッシュで白ハローにしない。本家と同一)
         self._glow_dot(glow, lx, ly, r, col)
+        if fl > 0.0:
+            col = self._lerp(col, (255, 255, 255), min(1.0, fl))
         try:
             gfx.filled_circle(screen, x, y, r, col)
-            gfx.aacircle(screen, x, y, r, col)
         except Exception:
             pygame.draw.circle(screen, col, (x, y), r)
         # 毛並み (放射ストランド＋揺らぎ。物理シェーダではなく
@@ -760,7 +771,7 @@ class EcoSystem:
         glow.fill((0, 0, 0, 0))
         idx = 0
         for pl in self.plants.values():
-            # 回転花弁＋脈動 (本家のdraw_plants風)。葉は2方向×2枚。
+            # 放射状の花 (中心で交差させない。芯＋5弁＋脈動で花に見せる)
             pulse = (math.sin(self._t * 2.0 + idx) + 1.0) / 2.0
             idx += 1
             r = 3.0 + pulse * 1.5 + 2.5 * pl.size
@@ -768,19 +779,16 @@ class EcoSystem:
             lx, ly = int(pl.x), int(pl.y)
             leaf = (120, 255, 160) if pl.age >= VETERAN_AGE else (150, 255, 150)
             self._glow_dot(glow, lx, ly, r, leaf, alpha=60)
-            rot = self._t * 0.9 + idx * 1.7
-            L = r * 1.1
-            for k in range(2):
-                ang = rot + k * math.pi / 2
-                dx, dy = math.cos(ang) * L, math.sin(ang) * L
-                pygame.draw.line(screen, leaf,
-                                 (int(cx - dx), int(cy - dy)),
-                                 (int(cx + dx), int(cy + dy)), 2)
-            try:
-                gfx.filled_circle(screen, cx, cy, 2, (255, 255, 255))
-                gfx.aacircle(screen, cx, cy, 2, (255, 255, 255))
-            except Exception:
-                pygame.draw.circle(screen, (255, 255, 255), (cx, cy), 2)
+            rot = self._t * 0.9 + idx * 2.4
+            for k in range(5):
+                ang = rot + k * (2.0 * math.pi / 5.0)
+                L0 = 3.0
+                L1 = L0 + r * (0.9 + 0.3 * math.sin(self._t * 3.0 + k * 2.1 + idx))
+                x0, y0 = int(cx + math.cos(ang) * L0), int(cy + math.sin(ang) * L0)
+                x1, y1 = int(cx + math.cos(ang) * L1), int(cy + math.sin(ang) * L1)
+                pygame.draw.line(screen, leaf, (x0, y0), (x1, y1), 1)
+                pygame.draw.circle(screen, leaf, (x1, y1), 1)
+            pygame.draw.circle(screen, (235, 255, 235), (cx, cy), 2)
         for gb in self.garbages:
             # 死骸は小さめ・暗めの× (背景に溶かし、主役にしない)
             x, y = ox + int(gb.x), oy + int(gb.y)
@@ -802,35 +810,36 @@ class EcoSystem:
                                  self._vet_t(h.age))
             else:
                 col = (0, 255, 255)
-            col = self._flash_col(h, col)
+            fl = self.flash.get(id(h), 0.0)
             self._draw_trail(screen, ox, oy, h, col, 3)
             self._body(screen, glow, h.x, h.y, ox, oy, 3, col,
-                       h.vx, h.vy, fur=16, seed=float(id(h) % 1024))
+                       h.vx, h.vy, fur=16, seed=float(id(h) % 1024), fl=fl)
         for c in self.carns:
             if c.age >= VETERAN_AGE:
                 col = self._lerp((255, 50, 150), (255, 0, 0),
                                  self._vet_t(c.age))
             else:
                 col = (255, 50, 150)
-            col = self._flash_col(c, col)
+            fl = self.flash.get(id(c), 0.0)
             self._draw_trail(screen, ox, oy, c, col, 4)
             self._body(screen, glow, c.x, c.y, ox, oy, 4, col,
-                       c.vx, c.vy, fur=18, seed=float(id(c) % 1024))
+                       c.vx, c.vy, fur=18, seed=float(id(c) % 1024), fl=fl)
         for a in self.apexs:
             if a.age >= VETERAN_AGE:
                 col = self._lerp((255, 215, 0), (255, 255, 200),
                                  self._vet_t(a.age))
             else:
                 col = (255, 215, 0)
-            col = self._flash_col(a, col)
+            fl = self.flash.get(id(a), 0.0)
             self._draw_trail(screen, ox, oy, a, col, 5)
             self._body(screen, glow, a.x, a.y, ox, oy, 5, col,
-                       a.vx, a.vy, fur=22, seed=float(id(a) % 1024))
+                       a.vx, a.vy, fur=22, seed=float(id(a) % 1024), fl=fl)
         for d in self.decomps:
-            col = self._flash_col(d, (150, 255, 50))
+            col = (150, 255, 50)
+            fl = self.flash.get(id(d), 0.0)
             self._draw_trail(screen, ox, oy, d, col, 2)
             self._body(screen, glow, d.x, d.y, ox, oy, 2, col,
-                       d.vx, d.vy, fur=10, seed=float(id(d) % 1024))
+                       d.vx, d.vy, fur=10, seed=float(id(d) % 1024), fl=fl)
         for p in self.particles:
             a = _clamp(p[4], 0.0, 1.0)
             try:

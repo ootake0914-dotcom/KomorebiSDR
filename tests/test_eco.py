@@ -63,6 +63,23 @@ def test_bounds_and_wither():
     print("[OK] entities in bounds; plants wither without stations")
 
 
+def test_plant_flicker_free():
+    """ピーク位置が±6pxふらついても株が明滅しない (粗量子化＋猶予＋平滑)"""
+    import random as _random
+    rng = _random.Random(99)
+    eco = EcoSystem(400, 300, seed=99)
+    eco.enabled = True
+    for _ in range(300):
+        cols = [(100.0 + 80.0 * i + rng.uniform(-6.0, 6.0),
+                 18.0 + rng.uniform(-3.0, 3.0)) for i in range(5)]
+        eco.update({"plants": cols, "clipped": False, "dt": 1.0 / 30.0})
+    # 株数が安定し、どれも育っていること (明滅していたら枯死・再発芽でsizeが小さい)
+    assert len(eco.plants) >= 4, len(eco.plants)
+    small = sum(1 for pl in eco.plants.values() if pl.size < 0.15)
+    assert small == 0, f"{small} sprouts flickering"
+    print(f"[OK] plants stable under jitter ({len(eco.plants)} plants)")
+
+
 def test_infection_and_predation():
     eco = EcoSystem(400, 300, seed=23)
     eco.enabled = True
@@ -123,13 +140,18 @@ def test_draw_budget():
     for _ in range(10):
         _env(eco, peaks=True)
         eco.draw(surf, 0, 0)
-    t0 = time.perf_counter()
-    reps = 60
-    for _ in range(reps):
-        _env(eco, peaks=True)
-        eco.draw(surf, 0, 0)
-    ms = (time.perf_counter() - t0) / reps * 1000.0
-    print(f"[*] eco update+draw {ms:.3f} ms/frame")
+    # スイート同時負荷のスパイクに引っ張られないよう3バッチ中央値で判定
+    mss = []
+    for _ in range(3):
+        t0 = time.perf_counter()
+        reps = 20
+        for _ in range(reps):
+            _env(eco, peaks=True)
+            eco.draw(surf, 0, 0)
+        mss.append((time.perf_counter() - t0) / reps * 1000.0)
+    ms = sorted(mss)[1]
+    print(f"[*] eco update+draw {ms:.3f} ms/frame (median of {mss[0]:.3f}, "
+          f"{mss[1]:.3f}, {mss[2]:.3f})")
     assert ms < 2.0, f"eco too slow: {ms:.2f} ms"
     eco.enabled = False
     before = (len(eco.herbs), eco._t)
@@ -142,6 +164,7 @@ def main() -> int:
     try:
         test_population_caps()
         test_bounds_and_wither()
+        test_plant_flicker_free()
         test_infection_and_predation()
         test_decomposer_cycle()
         test_draw_budget()
