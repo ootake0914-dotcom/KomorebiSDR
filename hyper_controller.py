@@ -120,7 +120,9 @@ class HyperController:
         self.last_verify_time = 0.0
 
         # --- 連続DSPパラメータ ---
-        self.target_cutoff_hz = 8500.0
+        # 初期値はwide開放。dsp側と一致させ、起動直後の強電界でも
+        # こもりなく再生する (弱電界は下のマップが速やかに狭窄へ寄せる)。
+        self.target_cutoff_hz = 15000.0
         self.target_hf_gain = 1.0
         self.target_if_bw_hz = 190000.0
         self.filter_override = None  # None / "wide" / "clean" / "narrow"
@@ -700,15 +702,18 @@ class HyperController:
         # DX狭帯域を維持しつつcutoffのみ上書き済みである旨を統計側で扱う
         # (hf/ifはoverrideプリセットへ連動させ、表示=wideでも音がDXのままにならない)
 
-        # 不感帯±300Hz＋スルーレート4000Hz/s (自動時のみ。手動overrideは即時)。
-        # 制御由来の微小振動を目標段で二重に殺し、選局過渡は数秒で完了させる。
+        # 不感帯±300Hz＋スルーレート (自動時のみ。手動overrideは即時)。
+        # 通常4000Hz/sで番組由来の微小振動を殺し、選局等の大きな帯域
+        # 跳躍 (|delta|>3000Hz) のみ8000Hz/sの速 lane で追従させる。
+        # 小ギャップの呼吸安定性は不変のまま、選局過渡だけ約半分に短縮する。
         if self.filter_override is None:
             prev = float(self.target_cutoff_hz)
             delta = cutoff - prev
             if abs(delta) < 300.0:
                 cutoff = prev
             else:
-                step = 4000.0 * dt
+                rate = 8000.0 if abs(delta) > 3000.0 else 4000.0
+                step = rate * dt
                 cutoff = prev + float(np.clip(delta, -step, step))
 
         self.target_cutoff_hz = cutoff

@@ -693,9 +693,21 @@ class DspWfmMixin:
         self.stereo_cut_hz = self._nr_cut_max_hz * (
             (self._nr_cut_min_hz / self._nr_cut_max_hz) ** self._nr_s
         )
-        # 固定高域ブレンド: 副搬送波ヒス対策で常時上限を適用 (適応側がそれ以上
-        # 絞る場合はそちらを優先)
-        self.stereo_cut_hz = min(self.stereo_cut_hz, self._nr_cut_fixed_hz)
+        # 固定高域ブレンドの適応化: クリーン時は天井を15kHzへ開放し、
+        # エア帯域 (13-15kHz) のステレオ感を保つ。超低速ヒス推定 (τ12s)
+        # が-36dB以下で全開、-26dB以上で従来13kHz、中間は線形。
+        # (実測: 合成clean -78dB / noisy3dB -15dB。速い値ではなく鈍い値で
+        # 駆動し、番組構成での天井の呼吸を防ぐ)
+        try:
+            _h = self._nr_hiss_slow
+            if _h is None or not float(_h) == float(_h):
+                _h = self.stereo_hiss_db
+            _h = float(_h)
+        except Exception:
+            _h = float(self.stereo_hiss_db)
+        _fix_w = float(np.clip((-26.0 - _h) / 10.0, 0.0, 1.0))
+        _fix = 13000.0 + 2000.0 * _fix_w
+        self.stereo_cut_hz = min(self.stereo_cut_hz, _fix)
         # モノラル番組判定: 実際のステレオミックスでは M=(L+R)/2 と S=(L-R)/2 は
         # 直交するため、M-S相関は「番組でないS成分」(分離漏れクロストーク+ノイズ)
         # の割合を示す。相関が高ければS側を積極抑圧しても番組を損なわない
@@ -728,7 +740,9 @@ class DspWfmMixin:
             _sw_target = _prev + float(np.sign(_delta)) * _step
         self._nr_sw_eff = _sw_target
         self._nr_sw_eff_prev = _sw_target
-        self._nr_cut_eff = min(self.stereo_cut_hz, 13000.0 - 5000.0 * self._nr_mono_w)
+        # 有効S側カット: ステレオ番組では15kHzまで開放、モノラル番組
+        # (mono_w=1) では従来通り8kHzへ寄せる (端点保存の線形写像)。
+        self._nr_cut_eff = min(self.stereo_cut_hz, 15000.0 - 7000.0 * self._nr_mono_w)
 
     def _diff_lowpass(self, x: np.ndarray, cutoff_hz: float) -> np.ndarray:
         """差信号用の可変ローパス。同一長の線形位相FIRを2本クロスフェードし、
@@ -1677,10 +1691,9 @@ class DspWfmMixin:
         self.stereo_hiss_db = -60.0       # (L-R)ヒス指標 (初期値=クリーン, NR不発動)
         self._nr_cut_max_hz = 15000.0
         self._nr_cut_min_hz = 5000.0
-        # 固定高域ブレンド上限: FMステレオ副搬送波(38kHz DSB)の三角雑音は
-        # 高域ほど大きく、強局でも12-15kHzで番組と同程度まで残る (実測: ラッキーFM
-        # 94.6MHz 強電界で S高域ノイズが番組-5dB)。ヒス指標に依らず常時S側を
-        # 13kHzで緩く減衰させる (カーラジオ標準の高域ブレンド。低域のステレオ感は不変)。
+        # 高域ブレンド上限の noisy 端アンカー: ヒス大時は従来通り
+        # 13kHzで抑える (カーラジオ標準の高域ブレンド)。クリーン時は
+        # _update_stereo_nr 側の適応式で15kHzまで開放する。
         self._nr_cut_fixed_hz = 13000.0
         # ブレンド量 (極端に弱い局のみモノラル化。通常はWienerが周波数別に処理)
         self._nr_lo_db = -18.0

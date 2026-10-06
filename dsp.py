@@ -195,8 +195,11 @@ class SdrDspPipeline(DspBlackMagicMixin, DspAmMixin, DspNfmMixin,
 
         # ===== Hyper連続認知制御パラメータ (Cascadeの離散切替を無段階モーフィングへ) =====
         self.cognitive_enabled = False
-        self.target_cutoff_hz = 8500.0
-        self.applied_cutoff_hz = 8500.0
+        # 初期値はwide開放 (15000Hz)。強電界は即Hi-Fi、弱電界は制御が
+        # 速やかに狭窄へ寄せる。旧8500Hz初期値では強電界でも選局後
+        # 約2秒こもったままだった (target+applied両段の立上がり)。
+        self.target_cutoff_hz = 15000.0
+        self.applied_cutoff_hz = 15000.0
         self.target_if_bw_hz = 190000.0
         self.applied_if_bw_hz = 190000.0
         self.target_hf_gain = 1.0
@@ -1166,8 +1169,15 @@ class SdrDspPipeline(DspBlackMagicMixin, DspAmMixin, DspNfmMixin,
                     pass
             audio_clean = self.cognitive_eq.process(audio_clean)
 
+        # ===== オーディオ最終段 =====
+        # 位相回転の少ないDCサーボ (AGCより前段。DC込みRMSでAGCが
+        # 最大+4dB誤推定するのを防ぐ。20Hz〜20kHzの位相は不変)
+        if getattr(self, "dc_servo", None) is not None and self.dc_servo.enabled:
+            audio_clean = self.dc_servo.process(audio_clean)
+
         # 局間音量レベリング用スローAGC (選局時の音量差を吸収。L/R連動で音像保存。
-        # DCサーボ・ディザの前に置き、最終量子化に整形済みレベルが載るようにする)
+        # DC除去後の正味RMSで推定し、ディザの前に置いて最終量子化に整形済み
+        # レベルが載るようにする)
         if self.slow_agc_enabled:
             audio_clean = self._slow_agc_level(audio_clean)
 
@@ -1179,11 +1189,6 @@ class SdrDspPipeline(DspBlackMagicMixin, DspAmMixin, DspNfmMixin,
         # 遅延・位相に影響なし。
         if mode == "AM":
             audio_clean = (np.asarray(audio_clean, dtype=np.float32) * 1.68).astype(np.float32)
-
-        # ===== オーディオ最終段 =====
-        # 位相回転の少ないDCサーボ (20Hz〜20kHzの位相変化を抑えつつ直流オフセットを除去)
-        if getattr(self, "dc_servo", None) is not None and self.dc_servo.enabled:
-            audio_clean = self.dc_servo.process(audio_clean)
 
         # TPDFディザー & 音響心理ノイズシェーピング (微小信号の量子化高調波歪みを抑制)
         if getattr(self, "dither", None) is not None and self.dither.enabled:

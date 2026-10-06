@@ -570,6 +570,24 @@ class AudioOutput:
             except queue.Empty:
                 break
 
+    def flush(self):
+        """選局時の旧局残音破棄。キュー滞留 (通常5〜10ch≒300〜600ms) と
+        端数 remainder を捨て、再プレロールで新局から再生する。
+        ストリーム・音量・リミッタ状態は維持し、復帰時フェードインで
+        段差クリックを防ぐ (アンダーラン経路と同一)。"""
+        try:
+            while True:
+                self.audio_queue.get_nowait()
+        except queue.Empty:
+            pass
+        try:
+            self.remainder = np.empty((0, 2), dtype=np.float32)
+        except Exception:
+            pass
+        self.is_prerolled = False
+        self.preroll_threshold = 3
+        self._needs_fade_in = True
+
     def _lookahead_limit(self, arr: np.ndarray) -> np.ndarray:
         """1.5ms先読みブリックウォールリミッタ (put_audio=ワーカースレッド側)。
         未来ピークからゲインを決めるためアタック歪みが出ない。リリース40ms。

@@ -412,6 +412,12 @@ class SdrApp:
 
         # ノイズ推定履歴をリセット (選局先の電界強度へ素早く追従)
         self.dsp.reset_stereo_nr()
+        # オーディオ滞留の旧局残音を破棄 (通常300〜600ms分。新局頭の
+        # 前局被りを消し、再プレロール約170msの無音から新局を開始する)
+        try:
+            self.audio.flush()
+        except Exception:
+            pass
         if _bfo_keep is not None:
             try:
                 self.dsp.bfo_offset_hz = float(

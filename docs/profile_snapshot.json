@@ -1,157 +1,79 @@
 {
-  "AM bm=off": {
-    "p50": 6.2,
-    "p95": 6.9,
-    "p99": 7.13,
+  "WFM bm=off": {
+    "p50": 17.99,
+    "p95": 27.93,
+    "p99": 29.54,
     "top": [
       [
-        "demod/am",
-        1.748
+        "demod/wfm",
+        12.721
+      ],
+      [
+        "pair/wiener",
+        3.5
       ],
       [
         "chan/decim_hist",
-        1.402
+        2.9
+      ],
+      [
+        "pair/mpx_canceller",
+        1.444
+      ],
+      [
+        "wfm/stereo_pair",
+        1.226
+      ],
+      [
+        "demod/pilot_pll",
+        0.735
       ],
       [
         "front/raw_to_iq",
-        0.64
+        0.518
       ],
       [
-        "post/cog_an",
-        0.229
-      ],
-      [
-        "front/spectrum",
-        0.176
-      ],
-      [
-        "post/cog_eq",
-        0.113
-      ],
-      [
-        "front/mix",
-        0.004
-      ],
-      [
-        "wfm/cog_morph",
-        0.003
+        "post/bss",
+        0.426
       ]
     ]
   },
-  "AM bm=ALL": {
-    "p50": 6.58,
-    "p95": 8.6,
-    "p99": 8.67,
+  "WFM bm=ALL": {
+    "p50": 20.85,
+    "p95": 29.52,
+    "p99": 32.31,
     "top": [
       [
-        "demod/am",
-        1.651
+        "demod/wfm",
+        18.98
+      ],
+      [
+        "pair/wiener",
+        3.353
       ],
       [
         "chan/decim_hist",
-        1.258
+        2.858
+      ],
+      [
+        "bm/rmt_mono",
+        1.577
+      ],
+      [
+        "pair/mpx_canceller",
+        1.553
+      ],
+      [
+        "wfm/stereo_pair",
+        1.271
+      ],
+      [
+        "demod/pilot_pll",
+        0.803
       ],
       [
         "bm/notch_mono",
-        0.751
-      ],
-      [
-        "front/raw_to_iq",
-        0.597
-      ],
-      [
-        "post/cog_an",
-        0.219
-      ],
-      [
-        "front/spectrum",
-        0.178
-      ],
-      [
-        "post/cog_eq",
-        0.104
-      ],
-      [
-        "front/mix",
-        0.003
-      ]
-    ]
-  },
-  "USB bm=off": {
-    "p50": 6.08,
-    "p95": 8.26,
-    "p99": 8.35,
-    "top": [
-      [
-        "chan/decim_hist",
-        2.263
-      ],
-      [
-        "demod/ssb",
-        0.838
-      ],
-      [
-        "front/raw_to_iq",
-        0.659
-      ],
-      [
-        "post/cog_an",
-        0.253
-      ],
-      [
-        "front/spectrum",
-        0.213
-      ],
-      [
-        "post/cog_eq",
-        0.118
-      ],
-      [
-        "front/mix",
-        0.004
-      ],
-      [
-        "wfm/cog_morph",
-        0.002
-      ]
-    ]
-  },
-  "USB bm=ALL": {
-    "p50": 6.57,
-    "p95": 8.73,
-    "p99": 10.61,
-    "top": [
-      [
-        "chan/decim_hist",
-        2.279
-      ],
-      [
-        "demod/ssb",
-        0.977
-      ],
-      [
-        "front/raw_to_iq",
-        0.71
-      ],
-      [
-        "post/cog_an",
-        0.26
-      ],
-      [
-        "front/spectrum",
-        0.204
-      ],
-      [
-        "post/cog_eq",
-        0.12
-      ],
-      [
-        "front/mix",
-        0.004
-      ],
-      [
-        "wfm/cog_morph",
-        0.002
+        0.795
       ]
     ]
   }
