@@ -8,6 +8,7 @@ Audio Output Module using sounddevice - Hi-Fi Edition.
 
 import threading
 import time
+import ctypes
 import queue
 import sys
 import numpy as np
@@ -593,7 +594,37 @@ class AudioOutput:
         未来ピークからゲインを決めるためアタック歪みが出ない。リリース40ms。
         チャンク跨ぎは遅延線＋エンベロープ持越しで連続性を保つ。
         高速化: ピークが閾値以下 (通常時) は無処理で即復帰 (~20us)。
-        ホット時のみ窓max＋リリース平滑を実行する。"""
+        ホット時のみ窓max＋リリース平滑を実行する。
+        ネイティブCコア (sdr_lookahead_limiter) があれば使用し、GILを解放する
+        (ホット時のPythonループ約4msを排除)。不在・失敗時はPython版へ
+        フォールバック (数値等価)。"""
+        n = len(arr)
+        if n == 0:
+            return arr
+        try:
+            import dsp_native as _dn
+            if (_dn._NATIVE is not None and _dn.NATIVE_LOOKAHEAD
+                    and getattr(arr, "ndim", 2) == 2
+                    and arr.shape[1] == 2):
+                a = np.ascontiguousarray(arr, dtype=np.float32)
+                dly = np.ascontiguousarray(self._lim_delay, dtype=np.float32)
+                if dly.shape == (self._lim_delay_n, 2):
+                    out = np.empty_like(a)
+                    env = np.array([float(self._lim_env)], dtype=np.float64)
+                    _dn._NATIVE.sdr_lookahead_limiter(
+                        _dn._fptr(a.ravel()), _dn._fptr(out.ravel()), int(n),
+                        _dn._fptr(dly.ravel()), int(self._lim_delay_n),
+                        float(self._lim_thr), float(self._lim_rel),
+                        env.ctypes.data_as(ctypes.POINTER(ctypes.c_double)))
+                    self._lim_delay = dly
+                    self._lim_env = float(env[0])
+                    return out
+        except Exception:
+            pass
+        return self._lookahead_limit_py(arr)
+
+    def _lookahead_limit_py(self, arr: np.ndarray) -> np.ndarray:
+        """純Pythonフォールバック (従来実装そのまま。DLL不在時用)"""
         n = len(arr)
         if n == 0:
             return arr
@@ -614,7 +645,9 @@ class AudioOutput:
         rel = self._lim_rel
         for i in range(n):
             p = peak[i]
-            if p > e:
+            # 等号もアタック側: 同一スパイクが窓maxに留まる平坦区間で
+            # 厳密>だとリリースに落ちてbrickwallを最大+0.04超過する。
+            if p >= e:
                 e = p
             else:
                 e *= rel

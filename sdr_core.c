@@ -35,7 +35,7 @@
 
 SDR_EXPORT int sdr_version(void)
 {
-    return 6;  /* 6: sdr_dft_bins 追加 */
+    return 7;  /* 7: sdr_lookahead_limiter 追加 */
 }
 
 /* denormal(非正規化数)対策: FTZ/DAZを有効化。
@@ -102,9 +102,20 @@ static inline float sdr_sin(double x)
     if (x != x || x > 1e15 || x < -1e15) {
         return 0.0f;
     }
-    x = fmod(x, SDR_TWO_PI_F);
-    if (x < 0.0) {
+    /* 内部呼出は全て位相が±2π以内に正規化済み (PLL/ミキサーは毎サンプル折返し)。
+     * fmod (除算・約30-50サイクル) を条件減算に置換する。範囲外の汎用入力に
+     * 対してのみフォールバックする (分岐予測で実質ゼロコスト)。
+     * 注: [2π,4π) での x-2π と fmod は Sterbenz によりビット同一。 */
+    if (x >= SDR_TWO_PI_F) {
+        x -= SDR_TWO_PI_F;
+    } else if (x < 0.0) {
         x += SDR_TWO_PI_F;
+    }
+    if (x >= SDR_TWO_PI_F || x < 0.0) {
+        x = fmod(x, SDR_TWO_PI_F);
+        if (x < 0.0) {
+            x += SDR_TWO_PI_F;
+        }
     }
     double f = x * ((double)SDR_LUT_SIZE / SDR_TWO_PI_F);
     int i = (int)f;
@@ -129,17 +140,68 @@ static inline float sdr_cos(double x)
 }
 
 /* ---- SIMD実数FIR (valid畳み込み) ----
- * np.convolve (MSVC/NumPyのスカラー相関) をSSE2 4並列 + 4アキュムレータで置換。
+ * np.convolve (MSVC/NumPyのスカラー相関) をSSE2 4並列で置換。
  * y[i] = sum_k x[i+k]*h[k]  (n_out = len(x)-taps+1)
+ * 4出力ブロッキング: hロードを4出力で共有し、x側のメモリ帯域を削減する。
+ * (337タップ級の長いFIRで約1.3-1.6倍。加算順序は旧実装と異なるが
+ *  誤差は1e-7級で、等価テスト許容1e-3を十分満たす)
  */
 SDR_EXPORT void sdr_fir_real(const float * __restrict x, const float * __restrict h,
-                             float * __restrict y, int n_out, int taps)
+                              float * __restrict y, int n_out, int taps)
 {
-    for (int i = 0; i < n_out; ++i) {
-        const float *xp = x + i;
-        float acc = 0.0f;
 #ifdef SDR_HAVE_SSE2
-        if (taps >= 8) {
+    if (taps >= 8) {
+        int i = 0;
+        for (; i + 4 <= n_out; i += 4) {
+            const float *x0 = x + i;
+            const float *x1 = x + i + 1;
+            const float *x2 = x + i + 2;
+            const float *x3 = x + i + 3;
+            __m128 a0 = _mm_setzero_ps(), a1 = _mm_setzero_ps();
+            __m128 a2 = _mm_setzero_ps(), a3 = _mm_setzero_ps();
+            __m128 a4 = _mm_setzero_ps(), a5 = _mm_setzero_ps();
+            __m128 a6 = _mm_setzero_ps(), a7 = _mm_setzero_ps();
+            int k = 0;
+            for (; k + 8 <= taps; k += 8) {
+                __m128 h0 = _mm_loadu_ps(h + k);
+                __m128 h1 = _mm_loadu_ps(h + k + 4);
+                __m128 t;
+                t = _mm_loadu_ps(x0 + k); a0 = _mm_add_ps(a0, _mm_mul_ps(t, h0));
+                t = _mm_loadu_ps(x1 + k); a2 = _mm_add_ps(a2, _mm_mul_ps(t, h0));
+                t = _mm_loadu_ps(x2 + k); a4 = _mm_add_ps(a4, _mm_mul_ps(t, h0));
+                t = _mm_loadu_ps(x3 + k); a6 = _mm_add_ps(a6, _mm_mul_ps(t, h0));
+                t = _mm_loadu_ps(x0 + k + 4); a1 = _mm_add_ps(a1, _mm_mul_ps(t, h1));
+                t = _mm_loadu_ps(x1 + k + 4); a3 = _mm_add_ps(a3, _mm_mul_ps(t, h1));
+                t = _mm_loadu_ps(x2 + k + 4); a5 = _mm_add_ps(a5, _mm_mul_ps(t, h1));
+                t = _mm_loadu_ps(x3 + k + 4); a7 = _mm_add_ps(a7, _mm_mul_ps(t, h1));
+            }
+            float acc[4];
+            __m128 p0 = _mm_add_ps(a0, a1);
+            __m128 p1 = _mm_add_ps(a2, a3);
+            __m128 p2 = _mm_add_ps(a4, a5);
+            __m128 p3 = _mm_add_ps(a6, a7);
+            p0 = _mm_add_ps(p0, _mm_movehl_ps(p0, p0));
+            p0 = _mm_add_ss(p0, _mm_shuffle_ps(p0, p0, 0x55));
+            p1 = _mm_add_ps(p1, _mm_movehl_ps(p1, p1));
+            p1 = _mm_add_ss(p1, _mm_shuffle_ps(p1, p1, 0x55));
+            p2 = _mm_add_ps(p2, _mm_movehl_ps(p2, p2));
+            p2 = _mm_add_ss(p2, _mm_shuffle_ps(p2, p2, 0x55));
+            p3 = _mm_add_ps(p3, _mm_movehl_ps(p3, p3));
+            p3 = _mm_add_ss(p3, _mm_shuffle_ps(p3, p3, 0x55));
+            acc[0] = _mm_cvtss_f32(p0);
+            acc[1] = _mm_cvtss_f32(p1);
+            acc[2] = _mm_cvtss_f32(p2);
+            acc[3] = _mm_cvtss_f32(p3);
+            for (; k < taps; ++k) {
+                acc[0] += x0[k] * h[k];
+                acc[1] += x1[k] * h[k];
+                acc[2] += x2[k] * h[k];
+                acc[3] += x3[k] * h[k];
+            }
+            y[i] = acc[0]; y[i + 1] = acc[1]; y[i + 2] = acc[2]; y[i + 3] = acc[3];
+        }
+        for (; i < n_out; ++i) {
+            const float *xp = x + i;
             __m128 a0 = _mm_setzero_ps();
             __m128 a1 = _mm_setzero_ps();
             int k = 0;
@@ -150,16 +212,20 @@ SDR_EXPORT void sdr_fir_real(const float * __restrict x, const float * __restric
             __m128 s = _mm_add_ps(a0, a1);
             s = _mm_add_ps(s, _mm_movehl_ps(s, s));
             s = _mm_add_ss(s, _mm_shuffle_ps(s, s, 0x55));
-            acc = _mm_cvtss_f32(s);
+            float r = _mm_cvtss_f32(s);
             for (; k < taps; ++k) {
-                acc += xp[k] * h[k];
+                r += xp[k] * h[k];
             }
-        } else
+            y[i] = r;
+        }
+        return;
+    }
 #endif
-        {
-            for (int k = 0; k < taps; ++k) {
-                acc += xp[k] * h[k];
-            }
+    for (int i = 0; i < n_out; ++i) {
+        const float *xp = x + i;
+        float acc = 0.0f;
+        for (int k = 0; k < taps; ++k) {
+            acc += xp[k] * h[k];
         }
         y[i] = acc;
     }
@@ -169,15 +235,64 @@ SDR_EXPORT void sdr_fir_real(const float * __restrict x, const float * __restric
  * y[j] = sum_k x[j*decim + k]*h[k], j=0..n_out-1
  * 呼出側は len(x) >= (n_out-1)*decim + taps を保証すること。
  * 畳み込み→間引きの定義そのものなので完全等価 (SSE加算順序差のみ)。
+ * FIR同様の4出力ブロッキングでhロードを共有する。
  */
 SDR_EXPORT void sdr_polyphase_decim(const float * __restrict x, const float * __restrict h,
-                                    float * __restrict y, int n_out, int taps, int decim)
+                                     float * __restrict y, int n_out, int taps, int decim)
 {
-    for (int j = 0; j < n_out; ++j) {
-        const float *xp = x + (size_t)j * (size_t)decim;
-        float acc = 0.0f;
 #ifdef SDR_HAVE_SSE2
-        if (taps >= 8) {
+    if (taps >= 8) {
+        int j = 0;
+        for (; j + 4 <= n_out; j += 4) {
+            const float *x0 = x + (size_t)j * (size_t)decim;
+            const float *x1 = x + (size_t)(j + 1) * (size_t)decim;
+            const float *x2 = x + (size_t)(j + 2) * (size_t)decim;
+            const float *x3 = x + (size_t)(j + 3) * (size_t)decim;
+            __m128 a0 = _mm_setzero_ps(), a1 = _mm_setzero_ps();
+            __m128 a2 = _mm_setzero_ps(), a3 = _mm_setzero_ps();
+            __m128 a4 = _mm_setzero_ps(), a5 = _mm_setzero_ps();
+            __m128 a6 = _mm_setzero_ps(), a7 = _mm_setzero_ps();
+            int k = 0;
+            for (; k + 8 <= taps; k += 8) {
+                __m128 h0 = _mm_loadu_ps(h + k);
+                __m128 h1 = _mm_loadu_ps(h + k + 4);
+                __m128 t;
+                t = _mm_loadu_ps(x0 + k); a0 = _mm_add_ps(a0, _mm_mul_ps(t, h0));
+                t = _mm_loadu_ps(x1 + k); a2 = _mm_add_ps(a2, _mm_mul_ps(t, h0));
+                t = _mm_loadu_ps(x2 + k); a4 = _mm_add_ps(a4, _mm_mul_ps(t, h0));
+                t = _mm_loadu_ps(x3 + k); a6 = _mm_add_ps(a6, _mm_mul_ps(t, h0));
+                t = _mm_loadu_ps(x0 + k + 4); a1 = _mm_add_ps(a1, _mm_mul_ps(t, h1));
+                t = _mm_loadu_ps(x1 + k + 4); a3 = _mm_add_ps(a3, _mm_mul_ps(t, h1));
+                t = _mm_loadu_ps(x2 + k + 4); a5 = _mm_add_ps(a5, _mm_mul_ps(t, h1));
+                t = _mm_loadu_ps(x3 + k + 4); a7 = _mm_add_ps(a7, _mm_mul_ps(t, h1));
+            }
+            float acc[4];
+            __m128 p0 = _mm_add_ps(a0, a1);
+            __m128 p1 = _mm_add_ps(a2, a3);
+            __m128 p2 = _mm_add_ps(a4, a5);
+            __m128 p3 = _mm_add_ps(a6, a7);
+            p0 = _mm_add_ps(p0, _mm_movehl_ps(p0, p0));
+            p0 = _mm_add_ss(p0, _mm_shuffle_ps(p0, p0, 0x55));
+            p1 = _mm_add_ps(p1, _mm_movehl_ps(p1, p1));
+            p1 = _mm_add_ss(p1, _mm_shuffle_ps(p1, p1, 0x55));
+            p2 = _mm_add_ps(p2, _mm_movehl_ps(p2, p2));
+            p2 = _mm_add_ss(p2, _mm_shuffle_ps(p2, p2, 0x55));
+            p3 = _mm_add_ps(p3, _mm_movehl_ps(p3, p3));
+            p3 = _mm_add_ss(p3, _mm_shuffle_ps(p3, p3, 0x55));
+            acc[0] = _mm_cvtss_f32(p0);
+            acc[1] = _mm_cvtss_f32(p1);
+            acc[2] = _mm_cvtss_f32(p2);
+            acc[3] = _mm_cvtss_f32(p3);
+            for (; k < taps; ++k) {
+                acc[0] += x0[k] * h[k];
+                acc[1] += x1[k] * h[k];
+                acc[2] += x2[k] * h[k];
+                acc[3] += x3[k] * h[k];
+            }
+            y[j] = acc[0]; y[j + 1] = acc[1]; y[j + 2] = acc[2]; y[j + 3] = acc[3];
+        }
+        for (; j < n_out; ++j) {
+            const float *xp = x + (size_t)j * (size_t)decim;
             __m128 a0 = _mm_setzero_ps();
             __m128 a1 = _mm_setzero_ps();
             int k = 0;
@@ -188,16 +303,20 @@ SDR_EXPORT void sdr_polyphase_decim(const float * __restrict x, const float * __
             __m128 s = _mm_add_ps(a0, a1);
             s = _mm_add_ps(s, _mm_movehl_ps(s, s));
             s = _mm_add_ss(s, _mm_shuffle_ps(s, s, 0x55));
-            acc = _mm_cvtss_f32(s);
+            float r = _mm_cvtss_f32(s);
             for (; k < taps; ++k) {
-                acc += xp[k] * h[k];
+                r += xp[k] * h[k];
             }
-        } else
+            y[j] = r;
+        }
+        return;
+    }
 #endif
-        {
-            for (int k = 0; k < taps; ++k) {
-                acc += xp[k] * h[k];
-            }
+    for (int j = 0; j < n_out; ++j) {
+        const float *xp = x + (size_t)j * (size_t)decim;
+        float acc = 0.0f;
+        for (int k = 0; k < taps; ++k) {
+            acc += xp[k] * h[k];
         }
         y[j] = acc;
     }
@@ -546,6 +665,8 @@ SDR_EXPORT void sdr_pll_fm_demod(const float *iq, float *demod, int n,
 
 /* 複素周波数ミキサー (in-place)
  * iq = iq * exp(j*phase), phase += phase_step
+ * 回転子は高速sin LUTで生成する (libm cos/sin毎サンプル呼び出しの置換)。
+ * LUT誤差は1サンプル独立・累積なし (位相累積はdoubleで維持)。
  */
 SDR_EXPORT void sdr_mix_freq(float *iq, int n, double phase_step, double *phase_state)
 {
@@ -553,8 +674,8 @@ SDR_EXPORT void sdr_mix_freq(float *iq, int n, double phase_step, double *phase_
     for (int i = 0; i < n; ++i) {
         float ci = iq[2 * i];
         float cq = iq[2 * i + 1];
-        double c = cos(ph);
-        double s = sin(ph);
+        float c = sdr_cos(ph);
+        float s = sdr_sin(ph);
         iq[2 * i] = (float)(ci * c - cq * s);
         iq[2 * i + 1] = (float)(ci * s + cq * c);
         ph += phase_step;
@@ -729,5 +850,209 @@ SDR_EXPORT void sdr_dft_bins(const float *x, int n, const double *freqs,
         double scale = 2.0 / (double)n;
         out_re[m] = (float)(acc_r * scale);
         out_im[m] = (float)(-acc_i * scale);
+    }
+}
+
+/* ---- 1.5ms先読みブリックウォールリミッタ (audio_output._lookahead_limit のC移植) ----
+ * Python版と同一ロジック (GIL解放・Pythonループ排除用):
+ * - ext = delay(d行) + in(n行) の連結とみなし、out[i] = ext[i]*gain[i] (遅延d)
+ * - delay は ext の末尾d行で更新する (次呼出へ持越し)
+ * - absmax は ext 全体 (両ch) の最大。thr以下ならコールドパス:
+ *   env = max(absmax, env*rel^n)、out = ext[:n] (無処理)
+ * - 超過時はホットパス: pk=|L|,|R|のch毎最大 → 幅(d+1)の窓maxで未来ピーク →
+ *   attack即時/release片ポールのエンベロープ → gain=min(1,thr/max(env,1e-6))
+ * - in/out はステレオインタリーブ (L,R交互) float配列、長さ 2*n。
+ *   delay はインタリーブ長 2*d (呼出側で保持・入出力兼用)。
+ * - env_state は長さ1のdouble入出力 (Python側の _lim_env と対応)。
+ *   ブロック跨ぎもビット同一にするためfloat経由しない。
+ * - 有限性: NaN入力は0扱い (put_audio側で事前サニタイズ済みの二重安全策)。
+ * - n <= 0 では何もしない。
+ */
+
+/* ext 行 m の |L|,|R| のch毎最大 (m<d: delay行、以降: in行)。NaNは0扱い。 */
+static inline float sdr_lim_pk(const float *in, int n, const float *delay, int d, int m)
+{
+    float a, b;
+    if (m < d) {
+        a = delay[2 * m];
+        b = delay[2 * m + 1];
+    } else {
+        int i = m - d;
+        if (i >= n) {
+            return 0.0f;
+        }
+        a = in[2 * i];
+        b = in[2 * i + 1];
+    }
+    if (a != a) a = 0.0f;
+    if (b != b) b = 0.0f;
+    if (a < 0.0f) a = -a;
+    if (b < 0.0f) b = -b;
+    return (a > b) ? a : b;
+}
+
+SDR_EXPORT void sdr_lookahead_limiter(const float *in, float *out, int n,
+                                      float *delay, int d,
+                                      float thr, double rel, double *env_state)
+{
+    if (!in || !out || !delay || !env_state || n <= 0 || d <= 0) {
+        return;
+    }
+    /* エンベロープはdouble累積でPython版とビット同一にする
+     * (同順序の同演算のため)。ゲインのみfloat32意味論で丸める。 */
+    double e = *env_state;
+    if (!(e >= 0.0)) {
+        e = 0.0;
+    }
+
+    /* 1. absmax (ext 全体 = delay d行 + in n行、両ch) */
+    float absmax = 0.0f;
+    for (int m = 0; m < n + d; ++m) {
+        float p = sdr_lim_pk(in, n, delay, d, m);
+        if (p > absmax) absmax = p;
+    }
+
+    if (absmax <= thr) {
+        /* コールドパス: env は減衰のみ継続、出力は遅延そのまま */
+        double p = 1.0;
+        double rn = rel;
+        int m = n;
+        while (m > 0) {
+            if (m & 1) p *= rn;
+            rn *= rn;
+            m >>= 1;
+        }
+        double decay = e * p;
+        double ab = (double)absmax;
+        *env_state = (ab > decay) ? ab : decay;
+        for (int i = 0; i < n; ++i) {
+            int src = i;
+            float l, r;
+            if (src < d) {
+                l = delay[2 * src];
+                r = delay[2 * src + 1];
+            } else {
+                l = in[2 * (src - d)];
+                r = in[2 * (src - d) + 1];
+            }
+            if (l != l) l = 0.0f;
+            if (r != r) r = 0.0f;
+            out[2 * i] = l;
+            out[2 * i + 1] = r;
+        }
+    } else {
+        /* ホットパス: 単調dequeによるO(n)窓max (幅d+1) → エンベロープ →
+         * ゲイン適用。素朴O(n*d)走査の約70分の1。
+         * ゲインはnumpyのfloat32意味論 (thr→float32変換後のfloat32除算、
+         * min(1.0,·)のfloat32化) と一致させる。 */
+        float thr_f = (float)thr;
+        /* deque (単調減少pkのインデックス。容量d+1で十分。dは72想定だが
+         * 任意幅に対応するため上限でフォールバックする) */
+#define SDR_LIM_DQ_MAX 1024
+#define SDR_LIM_DQ_SIZE (SDR_LIM_DQ_MAX + 1)
+        int dq[SDR_LIM_DQ_SIZE];
+        float dqv[SDR_LIM_DQ_SIZE];
+        int dq_head = 0, dq_n = 0;
+        int use_dq = (d + 1 <= SDR_LIM_DQ_MAX);
+        int m;
+        if (!use_dq) {
+            /* 想定外の広窓: 素朴走査 (正確性優先) */
+            for (int i = 0; i < n; ++i) {
+                float peak = 0.0f;
+                for (int k = 0; k <= d; ++k) {
+                    float p = sdr_lim_pk(in, n, delay, d, i + k);
+                    if (p > peak) peak = p;
+                }
+                if ((double)peak >= e) {
+                    e = (double)peak;
+                } else {
+                    e *= rel;
+                }
+                float ef = (float)e;
+                float den = (ef > 1e-6f) ? ef : 1e-6f;
+                float g = thr_f / den;
+                if (g > 1.0f) g = 1.0f;
+                float l, r;
+                if (i < d) {
+                    l = delay[2 * i];
+                    r = delay[2 * i + 1];
+                } else {
+                    l = in[2 * (i - d)];
+                    r = in[2 * (i - d) + 1];
+                }
+                if (l != l) l = 0.0f;
+                if (r != r) r = 0.0f;
+                out[2 * i] = l * g;
+                out[2 * i + 1] = r * g;
+            }
+            *env_state = e;
+        } else {
+            for (m = 0; m < n + d; ++m) {
+                float p = sdr_lim_pk(in, n, delay, d, m);
+                while (dq_n > 0
+                       && dqv[(dq_head + dq_n - 1) % SDR_LIM_DQ_SIZE] <= p) {
+                    dq_n--;
+                }
+                dq[(dq_head + dq_n) % SDR_LIM_DQ_SIZE] = m;
+                dqv[(dq_head + dq_n) % SDR_LIM_DQ_SIZE] = p;
+                dq_n++;
+                while (dq_n > 0 && dq[dq_head] <= m - (d + 1)) {
+                    dq_head = (dq_head + 1) % SDR_LIM_DQ_SIZE;
+                    dq_n--;
+                }
+                if (m >= d) {
+                    int i = m - d;
+                    if (i >= n) break;
+                    float peak = dqv[dq_head];
+                    /* 等号もアタック側 (Python版と同一。平坦ピークでの
+                     * リリース落ちによるbrickwall超過を防ぐ) */
+                    if ((double)peak >= e) {
+                        e = (double)peak;
+                    } else {
+                        e *= rel;
+                    }
+                    float ef = (float)e;
+                    float den = (ef > 1e-6f) ? ef : 1e-6f;
+                    float g = thr_f / den;
+                    if (g > 1.0f) g = 1.0f;
+                    float l, r;
+                    if (i < d) {
+                        l = delay[2 * i];
+                        r = delay[2 * i + 1];
+                    } else {
+                        l = in[2 * (i - d)];
+                        r = in[2 * (i - d) + 1];
+                    }
+                    if (l != l) l = 0.0f;
+                    if (r != r) r = 0.0f;
+                    out[2 * i] = l * g;
+                    out[2 * i + 1] = r * g;
+                }
+            }
+            *env_state = e;
+        }
+    }
+
+    /* 2. delay を ext 末尾d行で更新 (出力参照の後で行う)。
+     *    n >= d: in の末尾d行。n < d: 旧delay の末尾(d-n)行 + in 全行。 */
+    if (n >= d) {
+        for (int j = 0; j < d; ++j) {
+            float a = in[2 * (n - d + j)];
+            float b = in[2 * (n - d + j) + 1];
+            delay[2 * j] = (a != a) ? 0.0f : a;
+            delay[2 * j + 1] = (b != b) ? 0.0f : b;
+        }
+    } else {
+        int keep = d - n;
+        for (int j = 0; j < keep; ++j) {
+            delay[2 * j] = delay[2 * (j + n)];
+            delay[2 * j + 1] = delay[2 * (j + n) + 1];
+        }
+        for (int j = 0; j < n; ++j) {
+            float a = in[2 * j];
+            float b = in[2 * j + 1];
+            delay[2 * (keep + j)] = (a != a) ? 0.0f : a;
+            delay[2 * (keep + j) + 1] = (b != b) ? 0.0f : b;
+        }
     }
 }

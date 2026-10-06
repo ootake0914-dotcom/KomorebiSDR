@@ -1,79 +1,79 @@
 {
   "WFM bm=off": {
-    "p50": 17.99,
-    "p95": 27.93,
-    "p99": 29.54,
+    "p50": 19.23,
+    "p95": 32.34,
+    "p99": 35.58,
     "top": [
       [
         "demod/wfm",
-        12.721
+        13.364
       ],
       [
         "pair/wiener",
-        3.5
+        3.989
       ],
       [
         "chan/decim_hist",
-        2.9
+        2.514
       ],
       [
         "pair/mpx_canceller",
-        1.444
+        1.868
       ],
       [
         "wfm/stereo_pair",
-        1.226
+        1.385
       ],
       [
         "demod/pilot_pll",
-        0.735
+        0.824
       ],
       [
         "front/raw_to_iq",
-        0.518
+        0.595
       ],
       [
         "post/bss",
-        0.426
+        0.51
       ]
     ]
   },
   "WFM bm=ALL": {
-    "p50": 20.85,
-    "p95": 29.52,
-    "p99": 32.31,
+    "p50": 21.63,
+    "p95": 29.92,
+    "p99": 32.75,
     "top": [
       [
         "demod/wfm",
-        18.98
+        19.863
       ],
       [
         "pair/wiener",
-        3.353
+        3.733
       ],
       [
         "chan/decim_hist",
-        2.858
-      ],
-      [
-        "bm/rmt_mono",
-        1.577
+        2.266
       ],
       [
         "pair/mpx_canceller",
-        1.553
+        1.641
+      ],
+      [
+        "bm/rmt_mono",
+        1.48
       ],
       [
         "wfm/stereo_pair",
-        1.271
-      ],
-      [
-        "demod/pilot_pll",
-        0.803
+        1.216
       ],
       [
         "bm/notch_mono",
-        0.795
+        0.849
+      ],
+      [
+        "demod/pilot_pll",
+        0.77
       ]
     ]
   }

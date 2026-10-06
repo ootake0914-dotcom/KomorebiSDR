@@ -7,6 +7,7 @@ Native C core boundary (extracted from dsp.py).
 公開シンボル:
 - _load_native_core(), _NATIVE, NATIVE_CORE_ENABLED
 - NATIVE_AM_SYNC / NATIVE_PLL3 / NATIVE_FIR / NATIVE_POLY / NATIVE_PLLFM / NATIVE_CMA
+- NATIVE_DFTBINS / NATIVE_LOOKAHEAD
 - enable_fast_fpu(), _fptr()
 """
 
@@ -45,7 +46,7 @@ def _load_native_core():
                                        ctypes.POINTER(ctypes.c_double), ctypes.c_double, pf, pf, pf]
         lib.sdr_stereo_pll.restype = None
         # 追加関数は無くてもネイティブコア全体を無効化しない (旧DLLとの後方互換)
-        global NATIVE_AM_SYNC, NATIVE_PLL3, NATIVE_FIR, NATIVE_POLY, NATIVE_PLLFM, NATIVE_CMA
+        global NATIVE_AM_SYNC, NATIVE_PLL3, NATIVE_FIR, NATIVE_POLY, NATIVE_PLLFM, NATIVE_CMA, NATIVE_LOOKAHEAD
         if hasattr(lib, "sdr_stereo_pll3"):
             lib.sdr_stereo_pll3.argtypes = [pf, ctypes.c_int, ctypes.POINTER(ctypes.c_double),
                                             ctypes.c_double, ctypes.c_double, ctypes.c_double,
@@ -88,6 +89,13 @@ def _load_native_core():
                                          ctypes.c_double, ctypes.c_int, pf, pf]
             lib.sdr_dft_bins.restype = None
             NATIVE_DFTBINS = True
+        if hasattr(lib, "sdr_lookahead_limiter"):
+            lib.sdr_lookahead_limiter.argtypes = [
+                pf, pf, ctypes.c_int, pf, ctypes.c_int,
+                f, ctypes.c_double, ctypes.POINTER(ctypes.c_double),
+            ]
+            lib.sdr_lookahead_limiter.restype = None
+            NATIVE_LOOKAHEAD = True
         if hasattr(lib, "sdr_fast_fpu"):
             try:
                 lib.sdr_fast_fpu()  # FTZ/DAZ有効化 (denormalジッタ対策)
@@ -107,6 +115,7 @@ NATIVE_POLY = False
 NATIVE_PLLFM = False
 NATIVE_CMA = False
 NATIVE_DFTBINS = False
+NATIVE_LOOKAHEAD = False
 _NATIVE = _load_native_core()
 NATIVE_CORE_ENABLED = _NATIVE is not None
 
