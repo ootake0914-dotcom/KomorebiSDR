@@ -24,6 +24,7 @@ from adaptive_dsp import (
 from dsp_filters import (
     design_fir_kaiser,
     design_fir_highpass,
+    design_inverse_sinc,
     _deemph_sections,
 )
 from dsp_native import (
@@ -469,6 +470,13 @@ class DspWfmMixin:
         # 日本規格の最大周波数偏移(±75kHz)でも振幅0.95以内に収め、過変調時のソフトリミッターポンピング歪みを抑制
         demod_scaled = demod * 0.58
 
+        # 3b. 差分検波アパーチャ逆補正 (M/D共通前段。mono/差/RDSすべて
+        # 同一遅延で通るため分離度の時間整合は不変)
+        if getattr(self, "inv_sinc_enabled", False) and len(demod_scaled) > 0:
+            demod_scaled = self.decimate_with_history(
+                np.asarray(demod_scaled, dtype=np.float32),
+                self.fir_inv_sinc, 1, "history_inv_sinc")
+
         # 4. モノラル (L+R) を48kHzへデシメーション
         #    (19kHzパイロット・38kHz副搬送波はアンチエイリアスLPFで除去)
         #    ※同一 history を2回呼ぶと mono だけ履歴が二重送りになり、差信号との
@@ -708,11 +716,14 @@ class DspWfmMixin:
         _fix_w = float(np.clip((-26.0 - _h) / 10.0, 0.0, 1.0))
         _fix = 13000.0 + 2000.0 * _fix_w
         self.stereo_cut_hz = min(self.stereo_cut_hz, _fix)
-        # モノラル番組判定: 実際のステレオミックスでは M=(L+R)/2 と S=(L-R)/2 は
-        # 直交するため、M-S相関は「番組でないS成分」(分離漏れクロストーク+ノイズ)
-        # の割合を示す。相関が高ければS側を積極抑圧しても番組を損なわない
-        # (実測: ラッキーFM 94.6 の番組はモノラルで相関+0.63、S/M -24dB)。
-        # 真のステレオ番組 (相関≈0) では従来の控えめ設定を維持する。
+        # モノラル番組判定: M-S相関だけでは判定できない。
+        # Cov(M,S)=(Var(L)-Var(R))/4 の恒等式により、相関ρは左右レベル差
+        # (パン振り) でも上がる。6dBパン振りの正当ステレオでρ=+0.60、
+        # 逆に真モノラル＋独立ノイズではρ≈0になることを実測で確認。
+        # 相関は「SがM漏れ由来か」の必要条件にすぎないため、S/Mエネルギー比
+        # を併用する: 真モノラル漏れはS/M≪1 (実録-24dB)、パン振り番組は
+        # S/M≈0dB。Sが大きく相関する=実番組として抑圧しない。
+        # (ヒス下の静かなモノラルはWiener側 (_nr_s_w) が担う)
         mo = np.asarray(mono, dtype=np.float64)
         di = np.asarray(diff, dtype=np.float64)
         if len(mo) == len(di) and len(mo) > 0:
@@ -720,14 +731,24 @@ class DspWfmMixin:
             di = di - float(di.mean())
             den = float(np.sqrt(np.mean(mo * mo) * np.mean(di * di))) + 1e-12
             rho = float(np.mean(mo * di)) / den
+            mm_pow = float(np.mean(mo * mo)) + 1e-12
+            sm_pow = float(np.mean(di * di)) + 1e-12
+            ratio_db = 10.0 * float(np.log10(sm_pow / mm_pow))
             if not self._nr_mono_primed:
                 self._nr_mono_primed = True
                 self._nr_mono_rho = rho
+                self._nr_sm_db = ratio_db
             else:
                 a_r = 1.0 - np.exp(-dt / 2.0)
                 self._nr_mono_rho += a_r * (rho - self._nr_mono_rho)
+                self._nr_sm_db += a_r * (ratio_db - self._nr_sm_db)
         x_m = float(np.clip((self._nr_mono_rho - 0.15) / 0.35, 0.0, 1.0))
-        self._nr_mono_w = x_m * x_m * (3.0 - 2.0 * x_m)
+        x_m = x_m * x_m * (3.0 - 2.0 * x_m)
+        # S/Mゲート: -18dB以下で全開、-6dB以上で閉 (中間はsmoothstep)。
+        # 無音時はS/M≈0dB側へ倒れ抑圧しない (安全側)。
+        _gx = float(np.clip((-6.0 - float(self._nr_sm_db)) / 12.0, 0.0, 1.0))
+        _gate = _gx * _gx * (3.0 - 2.0 * _gx)
+        self._nr_mono_w = x_m * _gate
         # 有効値: モノラル番組ではWienerを全力(1.0)へ、S高域カットを8kHzへ寄せる
         # スルーレート制限 (非対称): 抑圧の立ち上げ (ヒス出現) は速く0.06/ブロック、
         # 復帰 (クリーン化) は0.01/ブロックでゆっくり開く。ヒス除去の応答を
@@ -1494,6 +1515,11 @@ class DspWfmMixin:
         # -6dB点が15kHzで、48kHz段と重なると15kHzで-12dBだった (実測)。
         cutoff_if_audio = 17000.0 / self.if_rate
         self.fir_if_audio = design_fir_kaiser(num_taps=337, cutoff_norm=cutoff_if_audio, beta=7.3)
+        # FM差分検波のアパーチャ逆補正 (5tap線形位相・群遅延2spl)。
+        # M/D両経路の共通前段に掛けるため時間整合は不変。A/B用フラグ付き。
+        self.fir_inv_sinc = design_inverse_sinc(num_taps=5, fs=float(self.if_rate))
+        self.history_inv_sinc = np.zeros(len(self.fir_inv_sinc) - 1, dtype=np.float32)
+        self.inv_sinc_enabled = True
 
         # 48kHzオーディオ段のアンチエイリアス・ハイカットフィルタ (48kHzレート)
         # 15kHz: 音楽用Hi-Fiワイド (BS.450準拠。強電界でフル帯域開放用。81タップ。
@@ -1676,10 +1702,13 @@ class DspWfmMixin:
         self._trim_err_ema = 0.0
         # 差信号振幅校正: 狭帯域IF(±50kHz)が75kHz偏移FMの外側ベッセル側波帯を
         # 切り落とすため、38kHz DSB由来の(L-R)が(L+R)より約6%小さく復調される
-        # (実測 |D|/|M|=0.9428@75kHz偏移、1〜14kHzで平坦=スカラー誤差、位相0.2°)。
-        # 分離度30.6dBの律速要因。逆数ゲインで補正し40dB級へ (低偏移時は
-        # 過補正側だが分離度35dB以上を維持、モノラル時はdiff=0で無影響)。
-        self.stereo_diff_gain = 1.06
+        # 差信号振幅校正: 旧1.06はアパーチャ損失込みの実測値
+        # (|D|/|M|=0.9428@75kHz偏移) だった。アパーチャ分は逆sinc FIRで
+        # 周波数特性ごと補正したため、残差 (ベッセル切落とし) のみを補正
+        # する 1.03 へ再校正した (L単音75kHz偏移で55.6dB=旧55.9dBと等価、
+        # 2トーン75kHzで-40.0dB・30kHzで-30.3dB。内容依存の最適値は
+        # 1.02〜1.03に分布し、どちらも可聴限界 (-30dB) を十分上回る)。
+        self.stereo_diff_gain = 1.03
         # ===== ステレオノイズリダクション =====
         # 弱電界でステレオ化すると増えるヒスノイズを、(L-R)差信号の高域/中域パワー比から
         # 検出し、ノイズ量に応じて 1) サブバンドWiener抑圧 2) 可変ローパス
@@ -1714,11 +1743,12 @@ class DspWfmMixin:
         self._nr_primed = False
         self._nr_s_w = 0.0                # 平滑化されたWiener適用度 (0=off, 1=full)
         self._nr_s = 0.0                  # 平滑化されたノイズ度 (0=クリーン, 1=ノイズ)
-        # モノラル番組検出 (M-S相関): 真のステレオでは直交するため、相関が高い=
-        # S成分が分離漏れ+ノイズ。モノラル番組ではS側を積極抑圧してヒスを消す
+        # モノラル番組検出 (M-S相関＋S/M比ゲート)。相関だけではパン振りと
+        # 区別できないため、S/M≪1 (漏れ支配) のときのみ全権を与える。
         self._nr_mono_rho = 0.0
         self._nr_mono_w = 0.0
         self._nr_mono_primed = False
+        self._nr_sm_db = -30.0            # S/Mエネルギー比の平滑値 (dB)
         self._nr_sw_eff = 0.0             # 有効Wiener適用度 (モノラル判定反映)
         self._nr_sw_eff_prev = 0.0        # 前ブロック値 (スルーレート制限用)
         # マッピング専用の超低速ヒス推定 (τ12s)。ヒス推定は番組の高域/中域比

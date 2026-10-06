@@ -70,6 +70,7 @@ from dsp_filters import (
     design_fir_kaiser,
     design_fir_highpass,
     design_fir_lowpass,
+    design_inverse_sinc,
     suppress_click_transients,
     blank_impulses_iq,
     _deemph_sections,
@@ -513,6 +514,7 @@ class SdrDspPipeline(DspBlackMagicMixin, DspAmMixin, DspNfmMixin,
         self._nr_mono_rho = 0.0
         self._nr_mono_w = 0.0
         self._nr_mono_primed = False
+        self._nr_sm_db = -30.0
         self._nr_sw_eff = 0.0
         self._nr_sw_eff_prev = 0.0
         self._nr_hiss_slow = None
@@ -560,7 +562,7 @@ class SdrDspPipeline(DspBlackMagicMixin, DspAmMixin, DspNfmMixin,
             self.stereo_wiener_gain = 1.0
 
     def set_stereo_diff_gain(self, gain: float):
-        """差信号振幅校正ゲイン (既定1.06。狭帯域IFのDSB切落としを補正)"""
+        """差信号振幅校正ゲイン (既定1.03。逆sinc後の残差=ベッセル切落としを補正)"""
         self.stereo_diff_gain = float(gain)
 
     def set_deemphasis(self, tau_us: float):

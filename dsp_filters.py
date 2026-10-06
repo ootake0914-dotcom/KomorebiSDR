@@ -32,6 +32,39 @@ def design_fir_highpass(num_taps: int, cutoff_norm: float, beta: float = 6.5) ->
 design_fir_lowpass = design_fir_kaiser
 
 
+def design_inverse_sinc(num_taps: int = 5, fs: float = 288000.0,
+                        fmax: float = 60000.0) -> np.ndarray:
+    """FM差分検波のアパーチャ損失 sinc(f/fs) の逆補正FIR。
+
+    位相差分復調 dθ[n]=arg(x[n]·x*[n-1]) は理想微分器に対し
+    H(f)=sin(πf/fs)/(πf/fs) の振幅傾斜を持つ。IF=288kHzでは
+    15kHzで-0.04dB、38kHz副搬送波帯(23〜53kHz)で-0.09〜-0.49dB。
+    差信号(L-R)が単調に小さくなる傾きは高域の分離度を劣化させる。
+
+    対称 (線形位相) 短FIRで逆特性 x/sin(x) に最小二乗フィットする。
+    DCゲインは厳密に1 (c+2Σ=1を代入消去)。位相は動かさないため
+    ステレオの時間整合に影響しない。群遅延=(taps-1)/2 (5tapで2spl)。
+    """
+    if num_taps % 2 == 0:
+        num_taps += 1
+    m = (num_taps - 1) // 2
+    f = np.linspace(0.0, fmax, 400)
+    x = np.pi * f / fs
+    with np.errstate(divide="ignore", invalid="ignore"):
+        target = np.where(x > 1e-9, x / np.sin(x), 1.0)
+    # H(f) = c + 2*Σ bk*cos(2πk f/fs)、c = 1-2Σbk を代入して
+    # 残差 [1 + 2*Σ bk*(cos-1) - target] を最小化する
+    w = 2.0 * np.pi * f / fs
+    A = np.stack([2.0 * (np.cos(k * w) - 1.0) for k in range(1, m + 1)], axis=1)
+    b = target - 1.0
+    coef, *_ = np.linalg.lstsq(A, b, rcond=None)
+    h = np.zeros(num_taps, dtype=np.float64)
+    h[m] = 1.0 - 2.0 * float(np.sum(coef))
+    for k in range(1, m + 1):
+        h[m - k] = h[m + k] = float(coef[k - 1])
+    return h.astype(np.float32)
+
+
 def suppress_click_transients(audio: np.ndarray, threshold: float = 0.48) -> np.ndarray:
     """
     チューナーのゲイン切替やUSB過渡応答による単発インパルスノイズ（クリック・プチ音）を
