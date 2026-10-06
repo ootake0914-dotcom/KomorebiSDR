@@ -259,6 +259,7 @@ DEFAULT_CONFIG = {
     "volume": 0.7,
     "stereo": True,           # FMステレオ復調
     "stereo_nr": True,        # ステレオノイズリダクション (弱電界ヒス対策)
+    "eco": False,             # ウォーターフォール生態系 (隠しスイッチで起動。既定OFF)
     "presets_fm": [],         # [{"name": str, "freq_hz": int}, ...]
     "presets_am": [],
     "presets_region": None,   # プリセットを生成した地域 (地域変更で無効化)
@@ -431,7 +432,7 @@ def load_config() -> dict:
                         continue
                     if isinstance(v, (int, float)):
                         cfg[k] = max(0.0, min(1.0, float(v)))
-                elif k in ("stereo", "stereo_nr"):
+                elif k in ("stereo", "stereo_nr", "eco"):
                     if isinstance(v, bool):
                         cfg[k] = v
                 elif k in ("country", "language", "presets_region"):

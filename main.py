@@ -86,6 +86,11 @@ class SdrApp:
         self.audio.set_volume(float(self.config.get("volume", 0.7)))
         # GUI (音量は起動時config固定＋システム音量。GUI側に音量概念なし)
         self.gui = SdrGui()
+        # ウォーターフォール生態系の有効/無効 (既定OFF。HI-FIバッジ隠しスイッチで切替)
+        try:
+            self.gui.eco.enabled = bool(self.config.get("eco", False))
+        except Exception:
+            pass
         # 地域表示・スキャン帯域・プリセット
         self.gui.set_region(self.profile["label"], self.profile["fm_start"], self.profile["fm_end"])
         self.gui.scan_status_text = t("idle")
@@ -937,6 +942,11 @@ class SdrApp:
                 self.gui.is_stereo = bool(getattr(self.dsp, "is_stereo", False))
                 self.gui.stereo_status = getattr(self.dsp, "stereo_status", "MONO")
                 self.gui.s_units = float(getattr(self.dsp, "s_units", 0.0))
+                # 生態系へ過大入力 (胞子の餌) を通知
+                try:
+                    self.gui.eco_clip = bool(getattr(self.dsp, "adc_clipped", False))
+                except Exception:
+                    pass
 
                 # RDS PS名・RadioText(楽曲名/番組名)が取れたらGUIへ反映
                 if self.mode == "WFM":

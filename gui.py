@@ -10,6 +10,7 @@ import time
 from collections import OrderedDict
 
 from auto_tuner import match_station_name
+from eco_waterfall import EcoSystem
 from i18n import t
 
 
@@ -286,6 +287,12 @@ class SdrGui:
         self.wf_surface = pygame.Surface((self.wf_rect.width - 8, self.wf_rect.height - 8))
         self.wf_surface.fill((0, 0, 0))
 
+        # ウォーターフォール生態系 (電波の海の人工生物。設定で無効化可)
+        self.eco = EcoSystem(self.wf_surface.get_width(),
+                             self.wf_surface.get_height())
+        self.eco_clip = False
+        self._eco_t = 0.0
+
         # パラメータコールバック
         self.on_freq_change = None
         self.on_mode_change = None
@@ -340,6 +347,7 @@ class SdrGui:
         self.hovered_freq_digit = None  # マウスホバー中の周波数桁 (1e6, 1e5, 1e4 等)
         self.freq_digit_hitboxes = []   # 周波数の各桁当たり判定 [(rect, step_hz), ...]
         self.baked_bg = None            # 全ガラスパネル合成済みの背景Surface
+        self._eco_hitbox = None         # HI-FIバッジ隠しスイッチの当たり判定
 
         # 静的パネルの事前描画 (ガラス表現 & シーンベイク)
         self._prerender_background()
@@ -949,6 +957,19 @@ class SdrGui:
                     # モーダル消費時は下層ボタン/同調へ素通りさせない
                     self._station_list_click(mx, my)
                     continue
+                # 隠しスイッチ (HI-FIバッジ): 生態系ON/OFF
+                try:
+                    _ehb = self._eco_hitbox
+                except AttributeError:
+                    _ehb = None
+                if _ehb is not None and _ehb.collidepoint(mx, my):
+                    try:
+                        self.eco.enabled = not self.eco.enabled
+                        self.scan_status_text = ("生態系 ON" if self.eco.enabled
+                                                 else "生態系 OFF")
+                    except Exception:
+                        pass
+                    continue
                 elif self.spec_rect.collidepoint(mx, my) or self.wf_rect.collidepoint(mx, my):
                     clicked_freq = self._spec_x_to_freq(mx)
 
@@ -1292,9 +1313,14 @@ class SdrGui:
                 self._draw_chip(status, badge_x + w1 + 10, base_y + 14, st_col)
 
         # 下段の音量スライダーは廃止 (システム音量に一本化)。HI-FI表示のみ残す。
-        # オーディオ品質バッジ (HI-FI)
+        # オーディオ品質バッジ (HI-FI)。隠しスイッチ兼用: クリックで
+        # ウォーターフォール生態系のON/OFFを切り替える (真面目SDRのため
+        # 既定OFF・ボタン装飾なしのイースターエッグ)。
         hi_fi = cached_text(self.font_tiny, "HI-FI AUDIO", (0, 150, 125))
-        self.screen.blit(hi_fi, (self.hero_rect.x + 18, self.hero_rect.y + 102))
+        hi_fi_pos = (self.hero_rect.x + 18, self.hero_rect.y + 102)
+        self.screen.blit(hi_fi, hi_fi_pos)
+        self._eco_hitbox = pygame.Rect(hi_fi_pos[0] - 4, hi_fi_pos[1] - 3,
+                                       hi_fi.get_width() + 8, hi_fi.get_height() + 6)
 
         # ============================================================
         # 2. BAND SELECTOR (info_rect: 558, 14, 548, 116)
@@ -1451,8 +1477,58 @@ class SdrGui:
         # 見出しは画像の後に描く (先に描くと毎フレーム塗り潰されて消える)
         lbl_wf = cached_text(self.font_tiny, t("waterfall"), (110, 128, 150))
         self.screen.blit(lbl_wf, (r.x + 12, r.y + 6))
+        # 生態系 (信号の柱に咲き、泳ぐ。ラベル・金線の下に描く)
+        self._draw_eco()
         cx = r.centerx
         pygame.draw.line(self.screen, C_GOLD, (cx, r.y + 4), (cx, r.bottom - 4), 1)
+
+    def _draw_eco(self):
+        """電波の海の人工生物。liveピーク・検出局の柱が餌場になる。"""
+        try:
+            eco = self.eco
+        except AttributeError:
+            return
+        if eco is None or not eco.enabled:
+            return
+        r = self.wf_rect
+        sw, sh = self.wf_surface.get_width(), self.wf_surface.get_height()
+        if eco.width != sw or eco.height != sh:
+            eco.resize(sw, sh)
+        cols = []
+        try:
+            f_min = self.center_freq - self.sample_rate / 2
+            f_max = self.center_freq + self.sample_rate / 2
+            span = f_max - f_min
+            if span > 0:
+                for pk in list(self.live_peaks[:8]):
+                    try:
+                        pf = float(pk.get("freq_hz", 0.0))
+                        if f_min <= pf <= f_max:
+                            x = (self._spec_freq_to_x(pf) - (r.x + 4)) * sw / max(1, r.width - 8)
+                            cols.append((x, float(pk.get("snr_db", 6.0))))
+                    except (TypeError, ValueError):
+                        continue
+                for st in list(self.detected_stations):
+                    try:
+                        fh = st.get("freq_hz")
+                        if fh is None:
+                            continue
+                        fh = float(fh)
+                        if f_min <= fh <= f_max:
+                            x = (self._spec_freq_to_x(fh) - (r.x + 4)) * sw / max(1, r.width - 8)
+                            cols.append((x, float(st.get("snr_db", 8.0))))
+                    except (TypeError, ValueError):
+                        continue
+        except Exception:
+            cols = []
+        now = time.monotonic()
+        dt = now - self._eco_t if self._eco_t > 0.0 else 1.0 / 30.0
+        self._eco_t = now
+        try:
+            eco.update({"plants": cols, "clipped": bool(self.eco_clip), "dt": dt})
+            eco.draw(self.screen, r.x + 4, r.y + 4)
+        except Exception:
+            pass
 
     def _draw_telemetry(self):
         # 初心者にもわかる電波クオリティ判定バッジ (どんなアンテナでも状況把握)

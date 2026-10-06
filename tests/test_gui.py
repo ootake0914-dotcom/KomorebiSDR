@@ -167,6 +167,31 @@ def test_header_vertical_separation():
     gui.close()
 
 
+def test_eco_hidden_switch():
+    """HI-FIバッジ隠しスイッチで生態系がON/OFFすること (既定OFFのまま)"""
+    gui = SdrGui()
+    assert gui.eco.enabled is False, "eco must default to OFF (serious SDR)"
+    dummy_spec = np.zeros(1024, dtype=np.float32)
+    gui.render(dummy_spec)
+    assert gui._eco_hitbox is not None
+    cx, cy = gui._eco_hitbox.center
+    assert gui.eco.enabled is False
+    pygame.event.post(pygame.event.Event(pygame.MOUSEBUTTONDOWN,
+                                         {"pos": (cx, cy), "button": 1}))
+    pygame.event.post(pygame.event.Event(pygame.MOUSEBUTTONUP,
+                                         {"pos": (cx, cy), "button": 1}))
+    gui.handle_events()
+    assert gui.eco.enabled is True, "hidden switch did not turn eco ON"
+    pygame.event.post(pygame.event.Event(pygame.MOUSEBUTTONDOWN,
+                                         {"pos": (cx, cy), "button": 1}))
+    pygame.event.post(pygame.event.Event(pygame.MOUSEBUTTONUP,
+                                         {"pos": (cx, cy), "button": 1}))
+    gui.handle_events()
+    assert gui.eco.enabled is False, "hidden switch did not turn eco OFF"
+    print("[OK] eco hidden switch toggles (default OFF)")
+    gui.close()
+
+
 if __name__ == "__main__":
     print("===== test_gui.py =====")
     test_gui_panel_boundaries()
@@ -174,4 +199,5 @@ if __name__ == "__main__":
     test_digit_wheel_tuning()
     test_button_tactile_feedback()
     test_header_vertical_separation()
+    test_eco_hidden_switch()
     print("ALL GUI TESTS PASSED!")
