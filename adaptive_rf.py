@@ -450,6 +450,13 @@ class DigitalSelfInterferenceCanceller:
         #      実測: 3次 −24k のみ残存) を、ペア確定した基本波の整数倍
         #      (2〜4倍/分周) 関係から棄却。PCスプリアスは片側単独が原則
         #      (IQイメージは補正器が抑制) のため、これらに該当しない。
+        # (iii) DSB側波帯: ステレオMPXのL-Rは38kHzを挟んで対称な側波帯
+        #      (38k±f) を作る。疎な高域ステレオ番組では孤立線として突出し
+        #      誤採用される (実測: 10kHz→48k採用で分離度 -22.7dB、
+        #      12kHz→26k採用で -25.1dB)。38k対称ペアの同時突出、または
+        #      基本波確定済みの番組線 base に対する |38k±base| を変調積と
+        #      断定して棄却する。パイロット公称38kHzとAFC残差は_mtol
+        #      (≥150Hz) の余裕で吸収する。
         if detected_candidates:
             _bin_hz = float(self.fs) / float(n_fft)
             _mtol = max(150.0, _bin_hz)
@@ -465,10 +472,25 @@ class DigitalSelfInterferenceCanceller:
                             return True
                 return False
 
+            _pilot = 38000.0
+
+            def _is_dsb_partner(f):
+                fa = abs(f)
+                for base in _confirmed:
+                    if (abs(fa - abs(_pilot + base)) <= _mtol
+                            or abs(fa - abs(_pilot - base)) <= _mtol):
+                        return True
+                for g in _freqs_all:
+                    if (abs((2.0 * _pilot - f) - g) <= _mtol
+                            or abs((-2.0 * _pilot - f) - g) <= _mtol):
+                        return True
+                return False
+
             detected_candidates = [
                 (f, p) for (f, p) in detected_candidates
                 if not any(abs(g + f) <= _mtol for g in _freqs_all)
                 and not _is_comb_partner(abs(f))
+                and not _is_dsb_partner(f)
             ]
 
         if detected_candidates:

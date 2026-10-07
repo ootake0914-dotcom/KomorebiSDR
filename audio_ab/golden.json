@@ -76,6 +76,10 @@
       "value": 45.1308,
       "tol": 1.5
     },
+    "wfm_sep_sparse_sicon_db": {
+      "value": 49.8491,
+      "tol": 2.0
+    },
     "wfm_thd_overmod_db": {
       "value": -38.35416664096485,
       "tol": 1.5

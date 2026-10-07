@@ -278,6 +278,55 @@ def test_sparse_program_not_adopted():
         f"program sidebands adopted as spurious: {got}"
 
 
+def _lonly_tone_sep(f, dev, sic_on, dur=2.0):
+    """L-onlyトーンFM (パイロット+DSB含む) のSIC経路込み分離度。"""
+    from dsp import SdrDspPipeline
+    raw = _sparse_tone_raw(f, dev, snr_db=50.0, dur=dur)
+    d = SdrDspPipeline(1152000, 48000)
+    d.set_offset_freq(0.0)
+    d.afc_enabled = False
+    d.cognitive_enabled = False
+    d.slow_agc_enabled = False
+    d.filter_mode = "wide"
+    d.set_stereo_nr(False)
+    d.sic_enabled = bool(sic_on)
+    blk = 132096
+    outs = []
+    for k in range(len(raw) // blk):
+        a, _ = d.process(raw[k * blk:(k + 1) * blk], "WFM")
+        a = np.asarray(a, dtype=np.float32)
+        if a.ndim == 1:
+            a = np.stack([a, a], axis=1)
+        outs.append(a)
+    y = np.concatenate(outs, axis=0)
+    y = y[len(y) // 4:]
+    L = y[:, 0].astype(np.float64)
+    R = y[:, 1].astype(np.float64)
+    n = len(L)
+    WL = np.abs(np.fft.rfft(L * np.hanning(n))) ** 2
+    WR = np.abs(np.fft.rfft(R * np.hanning(n))) ** 2
+    i = int(round(f * n / 48000.0))
+    return float(-20.0 * np.log10(
+        np.sqrt(np.sum(WR[max(0, i - 2):i + 3])
+                / (np.sum(WL[max(0, i - 2):i + 3]) + 1e-24)) + 1e-12))
+
+
+def test_dsb_sideband_not_adopted():
+    """38kHz周りのDSB側波帯 (38k±f) を誤採用しないこと。
+
+    回帰: 10kHz/dev22.5k→−48k採用で分離度 -22.7dB、12kHz→−26k採用で
+    -25.1dB。0Hz対称でも整数倍でもないため第3規則 (DSB対称) が必要。
+    採用ゼロ、かつSIC on/offの分離度が一致することを確認。
+    """
+    for f, dev in ((10000.0, 22500.0), (12000.0, 22500.0)):
+        sep_on = _lonly_tone_sep(f, dev, True)
+        sep_off = _lonly_tone_sep(f, dev, False)
+        print(f"[*] {f / 1000:.0f}k dev={dev / 1000:.1f}k: "
+              f"SICon={sep_on:.2f} SICoff={sep_off:.2f}")
+        assert sep_off - sep_on < 1.5, \
+            f"DSB sideband adopted ({f:.0f}Hz): {sep_on:.2f} vs {sep_off:.2f}"
+
+
 if __name__ == "__main__":
     print("===== Running Digital SIC Tests =====")
     test_single_spurious_cancellation()
@@ -288,4 +337,5 @@ if __name__ == "__main__":
     test_redetect_weight_carryover()
     test_pilot_exclusion()
     test_sparse_program_not_adopted()
+    test_dsb_sideband_not_adopted()
     print("ALL DIGITAL SIC TESTS PASSED!")
