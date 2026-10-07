@@ -890,6 +890,24 @@ class DspWfmMixin:
         s_b = amount(self.stereo_hiss_db, self._nr_lo_db, self._nr_hi_db)
         s_w = amount(self._nr_hiss_slow, self._nr_wiener_lo_db,
                      self._nr_wiener_hi_db)
+        # 帯域外ヒス・プローブ (透明性ゲート): FM番組の音声帯域は15kHzまで
+        # なので、差信号の15.5-16.4kHzは (受信ノイズ以外) 空である。
+        # 番組帯域内HF (6-15k) に対し帯域外が極小 = in-band HFは番組自身
+        # であり、floor/mfベースのヒス推定は誤検出。この比 ob/hf でNR適用を
+        # フェードする (実測 ob/hf: cleanトーン/音楽 -29〜-43dB、ヒス実在の
+        # 弱電界・golden音声 -8.6〜-1.8dB。境界 -20〜-10dB)。
+        # これにより「定常ノイズ様番組」でもノイズ床の実在証拠が無ければ
+        # NRは完全無動作になる (Clean時 on/off一致 = 透明性の要件)。
+        try:
+            _ob = band_power(diff, 15500.0, 16400.0)
+            _ob_db = 10.0 * np.log10((_ob + 1e-12) / (hf + 1e-12))
+            _gx = float(np.clip((_ob_db + 20.0) / 10.0, 0.0, 1.0))
+            hiss_gate = _gx * _gx * (3.0 - 2.0 * _gx)
+        except Exception:
+            hiss_gate = 1.0
+        if hiss_gate < 1.0:
+            s_b *= hiss_gate
+            s_w *= hiss_gate
         # 非対称スムージング: ノイズ増加時は速く、回復はゆっくり
         tau = 0.3 if s_b > self._nr_s else 1.5
         self._nr_s += (1.0 - np.exp(-dt / tau)) * (s_b - self._nr_s)
@@ -911,6 +929,9 @@ class DspWfmMixin:
             _h = float(_h)
         except Exception:
             _h = float(self.stereo_hiss_db)
+        # 透明性ゲート: 帯域外プローブが「ヒス無し」を示す間は天井も
+        # 15kHzへ開放する (hiss_gate=0で-34dB押し下げ → _fix_w=1)。
+        _h = _h - 34.0 * (1.0 - hiss_gate)
         _fix_w = float(np.clip((-26.0 - _h) / 10.0, 0.0, 1.0))
         _fix = 13000.0 + 2000.0 * _fix_w
         self.stereo_cut_hz = min(self.stereo_cut_hz, _fix)
