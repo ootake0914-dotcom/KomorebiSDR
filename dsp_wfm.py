@@ -696,14 +696,59 @@ class DspWfmMixin:
             a_mf = 1.0 - np.exp(-dt / 2.5)
             self._nr_mf_smooth += a_mf * (mf - self._nr_mf_smooth)
         mf = self._nr_mf_smooth
-        # 分母飽和ガード: 300-3kHz番組が前回ノイズ床-20dB未満なら比は不定。
+        # 電界強度を先読み (Kガードの条件に使う。SNR割引より前)。
+        try:
+            _snr_pre = float(getattr(self, "_if_snr_db", 10.0))
+        except Exception:
+            _snr_pre = 10.0
+        # 分母飽和ガード: 300-3kHz番組が前回ノイズ床に対して希薄なら比は不定。
         # 高域のみの番組 (管楽器高音・シンバル・拍手) でヒス推定が非物理値
-        # (+40dB級) に発散しNRが全閉する実害の修正。推定全体を凍結し
-        # (前回値保持)、履歴への学習も止めて番組HFを床と誤学習しない。
-        # 初回 (床未確定) は素通しする。
+        # (+40dB級) に発散しNRが全閉、Sideが90dB消える実害の修正。
+        # 推定全体を凍結し (前回値保持)、履歴への学習も止めて番組HFを
+        # 床と誤学習しない。初回 (床未確定) は素通しする。
+        # 条件は mf/floor < K (K=15) かつ強電界。Kだけでは弱番組＋真性
+        # ヒス (mf/floor=0.49) が被害 (1.2〜6.5) より下に来て分離不能の
+        # ため、SNR割引が全開の強電界 (gate_hi以上。真性ヒスが支配的な
+        # ことは物理的にほぼない) に限定する。弱電界では真性ヒスの
+        # 可能性があるため素通しし、NRを効かせる。
+        _strong = (np.isfinite(_snr_pre)
+                   and _snr_pre >= float(self._nr_snr_gate_hi))
+        # (i) 純音ガード (無条件): MFが事実上空の合成純音用。弱番組＋
+        # 真性ヒス (mf/floor=0.49) は0.01より上にいるため巻き込まない。
         if (self._nr_primed and self._nr_floor_pow > 0.0
                 and mf < self._nr_floor_pow * 0.01):
             return
+        # (ii) 実素材ガード (強電界のみ): FIR裾・クロストークでmfが床を
+        # 上回る高域番組用 (mf/floor 0.05〜6.5)。Kだけでは弱番組＋真性
+        # ヒス (0.49) と分離不能のため強電界に限定 (上記コメント参照)。
+        # 持続性カウンタ: 整定過渡 (golden音声冒頭は最大2連続) と定常
+        # 被害 (全ブロック持続) を分離し、4連続でクリーンへ倒す。
+        # 初回プライムでは倒さない (冒頭2ブロックの誤爆でτ12sスロー
+        # 推定器が汚染され golden が-7.86→-1.51に動いた反省)。
+        if (self._nr_primed and self._nr_floor_pow > 0.0 and _strong
+                and mf < self._nr_floor_pow * float(self._nr_guard_k)):
+            self._nr_k_hits += 1
+            if self._nr_k_hits >= 4:
+                # クリーンへ倒す。fast/slowだけでなく適用度 _nr_s/_nr_s_w
+                # も落とす (凍結中の return は平滑部をスキップするため、
+                # fastだけ倒しても適用度が残って gain が戻らない)。
+                # 派生出力 (gain/cut) も同一式で再計算する (こちらも
+                # 平滑部でしか更新されないため)。
+                self.stereo_hiss_db = -60.0
+                self._nr_hiss_slow = -60.0
+                self._nr_s = 0.0
+                self._nr_s_w = 0.0
+                self.stereo_nr_gain = 1.0
+                self.stereo_cut_hz = min(float(self._nr_cut_max_hz),
+                                         13000.0 + 2000.0 * 1.0)
+                try:
+                    _mw = float(self._nr_mono_w)
+                except (TypeError, ValueError):
+                    _mw = 0.0
+                self._nr_cut_eff = min(float(self.stereo_cut_hz),
+                                       15000.0 - 7000.0 * _mw)
+            return
+        self._nr_k_hits = 0
         # ノイズフロア推定: ~10秒履歴の下位10%を使い、番組自身の高域成分ではなく
         # 定常的に存在するとヒス成分のみを検出する (明るい音楽での過剰なNRを防止)
         self._nr_hist.append(hf)
@@ -743,7 +788,9 @@ class DspWfmMixin:
         dt = len(diff) / self.audio_rate
         if not self._nr_primed:
             # 初回は実測値で即座に初期化 (起動直後のランプを排除)。
-            # ただし初回から不定比 (高域のみ信号) の場合はクリーン既定へ。
+            # ただし初回から不定比 (高域のみ純音) の場合はクリーン既定へ。
+            # K条件では倒さない (整定過渡の誤爆がスローを汚染する)。
+            # 定常被害は持続性カウンタが4ブロック目で倒す。
             self._nr_primed = True
             if floor > 0.0 and mf < floor * 0.01:
                 self.stereo_hiss_db = -60.0
@@ -1850,6 +1897,15 @@ class DspWfmMixin:
         self._nr_cut_eff = 15000.0        # 有効S側カットオフ (モノラル判定反映)
         self._nr_hist = deque(maxlen=100)  # 差分HFパワー履歴 (下位10%をノイズフロア推定に使用)
         self._nr_mf_smooth = 0.0  # 番組パワー平滑値 (未初期化=0で初回に即時セット)
+        # 分母飽和ガードの係数 K (条件: mf/floor < K で凍結)。
+        # 旧0.01 (-40dB) は合成純音しか救えず、実素材の高域番組は
+        # FIR裾・クロストークでmfが床を上回り素通しした (Side 90dB消失)。
+        # 実測 mf/floor 中央値: 被害側 0.05〜6.53 / 正常側 33.3〜1.8e5。
+        # 幾何平均 √(6.53×33.3)≈14.8 → K=15 (両側に約3.5dBの余裕)。
+        # 音声素材 (golden刺激) は33より上の側なので golden 指標は
+        # 原理的に動かない (条件付きガードのため)。
+        self._nr_guard_k = 15.0
+        self._nr_k_hits = 0  # Kガード持続性カウンタ (4連続でクリーンへ)
         self._nr_cut_levels = np.array([2500.0, 4000.0, 6500.0, 10000.0, 15000.0])
         self._nr_filters = [
             design_fir_kaiser(num_taps=65, cutoff_norm=float(c) / self.audio_rate, beta=6.5)

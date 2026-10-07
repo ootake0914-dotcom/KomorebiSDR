@@ -86,12 +86,68 @@ def test_weak_field_hiss_not_frozen():
     print("[OK] weak-field hiss still suppressed")
 
 
+def test_hf_program_strong_field():
+    """実素材の高域寄り番組 (3.5kHz以上) でSideが削られないこと。
+
+    追加改善案§3の被害ケース (mf/floor=2.40、旧ガード素通しで
+    nr_gain=0.089/cut=5514Hzまで崩壊)。K=15ガード＋強電界条件で
+    凍結され、gain/cut共に保全される。Wiener側 (slow) も初回
+    プライムで-60に倒すため、Side抑圧は残らない。
+    """
+    dsp = SdrDspPipeline(1152000, SR)
+    dsp._if_snr_db = 52.0  # C/N=40dB強電界の実測値
+    n = BLK
+    t = np.arange(n) / SR
+    prog_hf = (0.25 * np.sin(2 * np.pi * 3500.0 * t)
+               + 0.25 * np.sin(2 * np.pi * 4000.0 * t)
+               + 0.20 * np.sin(2 * np.pi * 6000.0 * t)
+               + 0.15 * np.sin(2 * np.pi * 8000.0 * t)).astype(np.float32)
+    body_mf = (0.003 * np.sin(2 * np.pi * 500.0 * t)
+               + 0.003 * np.sin(2 * np.pi * 1500.0 * t)
+               + 0.002 * np.sin(2 * np.pi * 2500.0 * t)).astype(np.float32)
+    mono = (prog_hf * 0.5 + body_mf).astype(np.float32)
+    diff = prog_hf.astype(np.float32)
+    for _ in range(100):
+        dsp._update_stereo_nr(diff, mono)
+    print(f"[*] HF-program: hiss={dsp.stereo_hiss_db:+.1f}dB "
+          f"gain={dsp.stereo_nr_gain:.3f} cut_eff={dsp._nr_cut_eff:.0f}Hz "
+          f"wiener_w={dsp._nr_s_w:.3f}")
+    assert dsp.stereo_nr_gain > 0.8, "strong-field HF program wiped Side"
+    assert dsp._nr_cut_eff > 10000.0, "cut collapsed on HF program"
+    assert dsp._nr_s_w < 0.1, "Wiener still suppresses HF program"
+    print("[OK] HF program in strong field preserved")
+
+
+def test_normal_cn10_unchanged():
+    """通常番組C/N10ではガードが発動せず従来通りNRが効くこと。
+
+    追加改善案§3の正常側ケース (mf/floor=33)。K=15でも余裕で
+    素通しし、変更前と同一の振る舞い (gain=0.980) になることの確認。
+    """
+    rng = np.random.default_rng(11)
+    dsp = SdrDspPipeline(1152000, SR)
+    dsp._if_snr_db = 23.0  # C/N=10dBの推定値
+    n = BLK
+    t = np.arange(n) / SR
+    mono = (0.5 * np.sin(2 * np.pi * 1000.0 * t)).astype(np.float32)
+    for _ in range(100):
+        hiss = (rng.standard_normal(n) * 0.5 / (10 ** (10.0 / 20.0))).astype(np.float32)
+        dsp._update_stereo_nr((mono * 0.1 + hiss).astype(np.float32), mono)
+    print(f"[*] CN10 normal: gain={dsp.stereo_nr_gain:.3f} "
+          f"hiss={dsp.stereo_hiss_db:+.1f}dB")
+    assert 0.95 <= dsp.stereo_nr_gain <= 1.0, \
+        f"CN10 behavior changed ({dsp.stereo_nr_gain:.3f} vs 0.980)"
+    print("[OK] CN10 normal program unchanged")
+
+
 def main() -> int:
     try:
         test_hf_only_clean()
         test_legit_hiss_still_caught()
         test_silence_bounded()
         test_weak_field_hiss_not_frozen()
+        test_hf_program_strong_field()
+        test_normal_cn10_unchanged()
     except AssertionError as e:
         print(f"FAILED: {e}")
         return 1

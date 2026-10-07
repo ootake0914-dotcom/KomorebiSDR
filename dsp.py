@@ -515,6 +515,7 @@ class SdrDspPipeline(DspBlackMagicMixin, DspAmMixin, DspNfmMixin,
         self._nr_hist.clear()
         self._nr_mf_smooth = 0.0
         self._nr_primed = False
+        self._nr_k_hits = 0
         self._nr_mono_rho = 0.0
         self._nr_mono_w = 0.0
         self._nr_mono_primed = False
