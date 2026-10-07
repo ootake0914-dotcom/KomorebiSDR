@@ -13,11 +13,17 @@ Native C core boundary (extracted from dsp.py).
 
 import ctypes
 import os
+import sys
 
 
 def _load_native_core():
     base_dir = os.path.dirname(os.path.abspath(__file__))
-    cand_names = ["sdr_core.dll", "sdr_core.so", "sdr_core.dylib"]
+    if sys.platform.startswith("win"):
+        cand_names = ["sdr_core.dll"]
+    elif sys.platform == "darwin":
+        cand_names = ["sdr_core.dylib", "sdr_core.so"]
+    else:
+        cand_names = ["sdr_core.so"]
     target_path = None
     for name in cand_names:
         p = os.path.join(base_dir, name)

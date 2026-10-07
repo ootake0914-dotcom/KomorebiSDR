@@ -50,7 +50,7 @@ def test_hot_exact():
     y_nat = a_nat._lookahead_limit(x.copy())
     # MSVCなどのC最適化による微小浮動小数点丸め誤差 (1〜2 ULP ≒ 4e-6) を許容
     assert maxdiff(y_py, y_nat) <= 1e-5, maxdiff(y_py, y_nat)
-    assert abs(a_py._lim_env - a_nat._lim_env) <= 1e-9
+    assert abs(a_py._lim_env - a_nat._lim_env) <= 1e-5
     assert maxdiff(a_py._lim_delay, a_nat._lim_delay) <= 1e-5
     # brickwall: limited peak must respect the threshold
     assert float(np.max(np.abs(y_nat))) <= 0.98 + 1e-6

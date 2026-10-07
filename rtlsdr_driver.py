@@ -17,34 +17,50 @@ class RtlSdrDriver:
     """RTL-SDR DLL/SO ラッパークラス"""
 
     def __init__(self, dll_path: str = None):
-        if dll_path is None:
+        self._dll = None
+        if dll_path is not None:
+            cand_paths = [dll_path]
+        else:
             # カレントディレクトリ、スクリプト配置ディレクトリ、またはOS標準ライブラリパスから探す
             base_dir = os.path.dirname(os.path.abspath(__file__))
-            cand_paths = [
-                os.path.join(base_dir, "rtlsdr.dll"),
-                "rtlsdr.dll",
-                os.path.join(base_dir, "librtlsdr.so"),
-                os.path.join(base_dir, "librtlsdr.so.0"),
-                "librtlsdr.so",
-                "librtlsdr.so.0",
-                os.path.join(base_dir, "librtlsdr.dylib"),
-                "librtlsdr.dylib",
-            ]
+            cand_paths = []
             system_lib = ctypes.util.find_library("rtlsdr")
             if system_lib:
-                cand_paths.insert(0, system_lib)
-            for p in cand_paths:
-                if os.path.exists(p):
-                    dll_path = p
-                    break
-            if dll_path is None:
-                dll_path = system_lib or ("rtlsdr.dll" if sys.platform.startswith("win") else "librtlsdr.so")
+                cand_paths.append(system_lib)
+            if sys.platform.startswith("win"):
+                cand_paths.extend([
+                    os.path.join(base_dir, "rtlsdr.dll"),
+                    "rtlsdr.dll",
+                ])
+            elif sys.platform == "darwin":
+                cand_paths.extend([
+                    os.path.join(base_dir, "librtlsdr.dylib"),
+                    "librtlsdr.dylib",
+                    os.path.join(base_dir, "librtlsdr.so"),
+                    "librtlsdr.so",
+                ])
+            else:
+                cand_paths.extend([
+                    os.path.join(base_dir, "librtlsdr.so"),
+                    os.path.join(base_dir, "librtlsdr.so.0"),
+                    "librtlsdr.so",
+                    "librtlsdr.so.0",
+                ])
 
         # DLL/SO読み込み
-        try:
-            self._dll = ctypes.CDLL(dll_path)
-        except Exception as e:
-            raise RuntimeError(f"RTL-SDR ライブラリ ({dll_path}) のロードに失敗しました: {e}")
+        last_error = None
+        for p in cand_paths:
+            try:
+                self._dll = ctypes.CDLL(p)
+                dll_path = p
+                break
+            except Exception as e:
+                last_error = e
+                continue
+
+        if self._dll is None:
+            target_desc = dll_path or cand_paths
+            raise RuntimeError(f"RTL-SDR ライブラリ ({target_desc}) のロードに失敗しました: {last_error}")
 
         self._setup_function_signatures()
         self.dev = c_void_p(0)
