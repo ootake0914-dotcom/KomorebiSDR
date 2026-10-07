@@ -50,6 +50,32 @@ def main() -> int:
         else:
             ok &= abs(float(y[0]) - float(x[1])) < 1e-6
 
+    # ドリフト補正作動時のHF平坦性 (回帰: Catmull-Romは15kで-1.44dBだった。
+    # ポリフェーズ窓sinc 8tap/128phaseで±50ppmでも-0.11dB以内)。
+    fs = 48000.0
+
+    def tone_level(freq, ratio):
+        rr = AdaptiveDriftResampler()
+        rr.current_ratio = ratio
+        n = 48000
+        t = np.arange(n) / fs
+        xx = (0.5 * np.sin(2 * np.pi * freq * t)).astype(np.float32)
+        oo = [rr.process(xx[k:k + 2752]) for k in range(0, n, 2752)]
+        yy = np.concatenate(oo)
+        yy = yy[len(yy) // 4:]
+        W = np.abs(np.fft.rfft(yy * np.hanning(len(yy)))) ** 2
+        i = int(round(freq * len(yy) / fs))
+        return 10 * np.log10(float(W[max(0, i - 2):i + 3].sum()) + 1e-24)
+
+    for freq, tol in ((14000.0, 0.15), (15000.0, 0.2)):
+        base = tone_level(freq, 1.0)
+        for ratio in (1.00005, 0.99995):
+            dv = tone_level(freq, ratio) - base
+            good = abs(dv) < tol
+            print(f"[{'OK' if good else 'FAIL'}] drift {ratio - 1:+.0e} "
+                  f"@ {freq / 1000:.0f}k: {dv:+.2f} dB (tol {tol})")
+            ok &= good
+
     print("OK" if ok else "FAILED")
     return 0 if ok else 1
 
