@@ -140,6 +140,74 @@ def test_normal_cn10_unchanged():
     print("[OK] CN10 normal program unchanged")
 
 
+def test_side_decode_preserved():
+    """高域番組の実デコードでSideがNR off参照と一致すること。
+
+    追加改善案の検証項目そのまま (Side 9-12kHzが参照比-20dB以内)。
+    L=4k+9k / R=3.5k+11kのHFステレオ番組をRF合成→process()全段で
+    デコードし、NR on/offのSide帯域パワーを比べる。
+    """
+    RF = 1152000.0
+    CHUNK = 132096
+    dur_s = 3.0
+    n = int(dur_s * RF)
+    t = np.arange(n) / RF
+    l = (0.30 * np.sin(2 * np.pi * 4000.0 * t)
+         + 0.20 * np.sin(2 * np.pi * 9000.0 * t)
+         + 0.004 * np.sin(2 * np.pi * 1000.0 * t))
+    r = (0.30 * np.sin(2 * np.pi * 3500.0 * t)
+         + 0.20 * np.sin(2 * np.pi * 11000.0 * t)
+         + 0.004 * np.sin(2 * np.pi * 1000.0 * t))
+    mpx = (0.45 * (l + r) + 0.45 * (l - r) * np.sin(2 * np.pi * 38000.0 * t)
+           + 0.09 * np.sin(2 * np.pi * 19000.0 * t))
+    mpx = mpx / (float(np.max(np.abs(mpx))) + 1e-9)
+    ph = 2 * np.pi * 30000.0 * np.cumsum(mpx) / RF
+    iq = 0.6 * np.exp(1j * ph).astype(np.complex64)
+    rng = np.random.default_rng(3)
+    p = 0.36 / 10 ** (40.0 / 10.0)
+    iq = iq + np.sqrt(p / 2.0) * (rng.standard_normal(n)
+                                  + 1j * rng.standard_normal(n))
+    raw = np.empty(2 * n, dtype=np.uint8)
+    raw[0::2] = np.clip(np.round(iq.real * 127.5 + 127.5), 0, 255)
+    raw[1::2] = np.clip(np.round(iq.imag * 127.5 + 127.5), 0, 255)
+
+    def decode(nr_on):
+        dsp = SdrDspPipeline(1152000, SR)
+        dsp.set_offset_freq(0.0)
+        dsp.afc_enabled = False
+        dsp.cognitive_enabled = False
+        dsp.slow_agc_enabled = False
+        dsp.set_stereo_nr(nr_on)
+        outs = []
+        for k in range(len(raw) // CHUNK):
+            a, _ = dsp.process(raw[k * CHUNK:(k + 1) * CHUNK], "WFM")
+            a = np.asarray(a, dtype=np.float32)
+            if a.ndim == 1:
+                a = np.stack([a, a], axis=1)
+            outs.append(a)
+        y = np.concatenate(outs, axis=0)
+        return y[len(y) // 2:]
+
+    def band(x, lo, hi, nn=2752):
+        fr = np.fft.rfftfreq(nn, 1.0 / SR)
+        sel = (fr >= lo) & (fr <= hi)
+        vals = [float(np.mean(np.abs(np.fft.rfft(
+            x[k * nn:(k + 1) * nn] * np.hanning(nn)))[sel] ** 2))
+            for k in range(len(x) // nn)]
+        return 10 * np.log10(float(np.mean(vals)) + 1e-24)
+
+    y_on = decode(True)
+    y_off = decode(False)
+    for lo, hi in ((6000, 9000), (9000, 12000), (12000, 15000)):
+        s_on = band((y_on[:, 0] - y_on[:, 1]) * 0.5, lo, hi)
+        s_off = band((y_off[:, 0] - y_off[:, 1]) * 0.5, lo, hi)
+        print(f"[*] Side {lo}-{hi}: on={s_on:+.1f}dB off={s_off:+.1f}dB "
+              f"ratio={s_on - s_off:+.1f}dB")
+        assert s_on - s_off > -20.0, \
+            f"Side wiped in {lo}-{hi}Hz ({s_on - s_off:+.1f}dB)"
+    print("[OK] decoded Side preserved vs NR-off reference")
+
+
 def main() -> int:
     try:
         test_hf_only_clean()
@@ -148,6 +216,7 @@ def main() -> int:
         test_weak_field_hiss_not_frozen()
         test_hf_program_strong_field()
         test_normal_cn10_unchanged()
+        test_side_decode_preserved()
     except AssertionError as e:
         print(f"FAILED: {e}")
         return 1
