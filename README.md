@@ -65,6 +65,8 @@ python main.py
 ```
 
 *Note for Windows users: Optional native C acceleration can be compiled using `build_native.bat`.*
+*Note for Linux users: Build it with `sh build_native.sh` (needs a C compiler). The loader also accepts a system `librtlsdr`.*
+
 
 ---
 

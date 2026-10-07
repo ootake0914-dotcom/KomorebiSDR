@@ -35,7 +35,9 @@
 
 SDR_EXPORT int sdr_version(void)
 {
-    return 7;  /* 7: sdr_lookahead_limiter 追加 */
+    /* 8: lookaheadのenv_stateをdouble化 (v7はfloat/double混在のため
+     * ABI判別不能。v7バイナリではlookaheadを有効化しないこと) */
+    return 8;
 }
 
 /* denormal(非正規化数)対策: FTZ/DAZを有効化。

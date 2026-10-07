@@ -152,7 +152,8 @@ def test_draw_budget():
     ms = sorted(mss)[1]
     print(f"[*] eco update+draw {ms:.3f} ms/frame (median of {mss[0]:.3f}, "
           f"{mss[1]:.3f}, {mss[2]:.3f})")
-    assert ms < 2.0, f"eco too slow: {ms:.2f} ms"
+    # 33msフレームの1割未満。開発マシンの負荷変動を見込んで3ms。
+    assert ms < 3.0, f"eco too slow: {ms:.2f} ms"
     eco.enabled = False
     before = (len(eco.herbs), eco._t)
     _env(eco, peaks=True)

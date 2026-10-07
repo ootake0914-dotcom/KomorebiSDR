@@ -90,12 +90,19 @@ def _load_native_core():
             lib.sdr_dft_bins.restype = None
             NATIVE_DFTBINS = True
         if hasattr(lib, "sdr_lookahead_limiter"):
-            lib.sdr_lookahead_limiter.argtypes = [
-                pf, pf, ctypes.c_int, pf, ctypes.c_int,
-                f, ctypes.c_double, ctypes.POINTER(ctypes.c_double),
-            ]
-            lib.sdr_lookahead_limiter.restype = None
-            NATIVE_LOOKAHEAD = True
+            # v7はenv_stateのfloat/doubleが混在しABI判別不能のため、
+            # v8以降でのみ有効化する (不一致だとゲイン誤動作→音量異常)。
+            try:
+                _look_ver = int(lib.sdr_version())
+            except Exception:
+                _look_ver = 0
+            if _look_ver >= 8:
+                lib.sdr_lookahead_limiter.argtypes = [
+                    pf, pf, ctypes.c_int, pf, ctypes.c_int,
+                    f, ctypes.c_double, ctypes.POINTER(ctypes.c_double),
+                ]
+                lib.sdr_lookahead_limiter.restype = None
+                NATIVE_LOOKAHEAD = True
         if hasattr(lib, "sdr_fast_fpu"):
             try:
                 lib.sdr_fast_fpu()  # FTZ/DAZ有効化 (denormalジッタ対策)

@@ -11,7 +11,22 @@ sounddeviceの `sd.default.device` はPortAudio初期化時に固定されるた
 import ctypes
 import sys
 from ctypes import byref, POINTER, c_void_p, c_ulong
-from ctypes import wintypes
+try:
+    from ctypes import wintypes
+except ImportError:
+    # 非Windowsにはctypes.wintypesが存在しない。構造体定義用に等価な
+    # ダミーを与え、モジュールimport自体は成功させる (各関数は
+    # sys.platformガードでNone/[]を返す)。
+    class _WinTypesFallback:
+        WORD = ctypes.c_uint16
+        DWORD = ctypes.c_uint32
+        BOOL = ctypes.c_int
+        BYTE = ctypes.c_ubyte
+        USHORT = ctypes.c_ushort
+        HANDLE = c_void_p
+        HWND = c_void_p
+        LPWSTR = ctypes.c_wchar_p
+    wintypes = _WinTypesFallback()
 
 
 class GUID(ctypes.Structure):
