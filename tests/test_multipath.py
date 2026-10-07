@@ -51,6 +51,40 @@ def _synth_echo(freq_hz, tau_us, alpha, snr_db=40.0, seed=99,
     return raw
 
 
+def _synth_hf_prog_echo(tau_us, alpha, seed=3):
+    """高域のみ番組 (3.5kHz以上) ＋静止エコー。検証指摘§2-2の回帰用。
+    NRが潰れても (nr_gain→0) トリムは動かねばならない。"""
+    n = int(DUR_S * RF)
+    t = np.arange(n) / RF
+    prog_hf = (0.25 * np.sin(2 * np.pi * 3500.0 * t)
+               + 0.25 * np.sin(2 * np.pi * 4000.0 * t)
+               + 0.20 * np.sin(2 * np.pi * 6000.0 * t)
+               + 0.15 * np.sin(2 * np.pi * 8000.0 * t))
+    body = 0.2 * (0.003 * np.sin(2 * np.pi * 500.0 * t)
+                  + 0.003 * np.sin(2 * np.pi * 1500.0 * t))
+    m = prog_hf * 0.5 + body
+    s = prog_hf
+    l, r = (m + s) * 0.5, (m - s) * 0.5
+    mpx = (0.45 * (l + r) + 0.45 * (l - r) * np.sin(2 * np.pi * 38000.0 * t)
+           + 0.09 * np.sin(2 * np.pi * 19000.0 * t))
+    mpx = mpx / (float(np.max(np.abs(mpx))) + 1e-9)
+    ph = 2 * np.pi * 30000.0 * np.cumsum(mpx) / RF
+    iq = 0.6 * np.exp(1j * ph).astype(np.complex64)
+    if tau_us > 0:
+        d = max(1, int(tau_us * 1e-6 * RF))
+        echo = np.zeros_like(iq)
+        echo[d:] = iq[:-d] * alpha
+        iq = iq + echo
+    rng = np.random.default_rng(seed)
+    p = 0.36 / 10 ** 40.0
+    iq = iq + np.sqrt(p / 2.0) * (rng.standard_normal(n)
+                                  + 1j * rng.standard_normal(n))
+    raw = np.empty(2 * n, dtype=np.uint8)
+    raw[0::2] = np.clip(np.round(iq.real * 127.5 + 127.5), 0, 255)
+    raw[1::2] = np.clip(np.round(iq.imag * 127.5 + 127.5), 0, 255)
+    return raw
+
+
 def _decode(raw):
     dsp = SdrDspPipeline(1152000, 48000)
     dsp.set_offset_freq(0.0)
@@ -116,12 +150,26 @@ def test_canceller_bypass_restores():
     print("[OK] strong-echo stereo partly restored")
 
 
+def test_trim_runs_on_hf_program_echo():
+    """高域のみ番組＋静止エコーでも検出器が発動すること (検証指摘§2-2)。
+
+    旧トリムゲート (nr_gain>0.7) は高域番組で0に落ち、静止10usが
+    あっても amount=0 のままだった。ゲート撤廃後は発動する。"""
+    _, dsp = _decode(_synth_hf_prog_echo(10.0, 0.6))
+    print(f"[*] HFprog+echo10: nr_gain={dsp.stereo_nr_gain:.3f} "
+          f"trim={dsp.stereo_phase_offset:+.4f} "
+          f"amount={dsp.multipath_amount:.3f}")
+    assert dsp.multipath_amount > 0.3, "HF-program echo missed (trim frozen?)"
+    print("[OK] HF-program echo fires detector")
+
+
 def main() -> int:
     try:
         test_detector_fires_static_echo()
         test_detector_fires_drift_echo()
         test_detector_silent_clean()
         test_canceller_bypass_restores()
+        test_trim_runs_on_hf_program_echo()
     except AssertionError as e:
         print(f"FAILED: {e}")
         return 1

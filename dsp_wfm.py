@@ -135,16 +135,18 @@ class DspWfmMixin:
 
             # 38kHz 直交副搬送波マルチパス適応キャンセラ (Quadrature MPX Decoupler)
             # 強エコー下ではQ腕サーボが誤追従して歪みを足す実測
-            # (静止30us: sep 0.1dB/THD-28.8dB → バイパスで9.3dB/-31.3dB)。
-            # 検出量0.3以上で素通しし、未発動時は従来通り。
+            # (静止30us: sep 0.1dB/THD-28.8dB → バイパスで改善)。
+            # 検出量0.3以上で process のみ素通しする。Q腕 (diff_q) 自体は
+            # 計算し続けてトリム Costas へ渡す (検証指摘§2-3: 陳腐化Qでの
+            # サーボ継続を防ぐ。Noneフォールバックではなく新鮮Qを維持)。
+            # 未発動時は従来通り。
             _mp_bypass = False
             try:
                 _mp_bypass = float(self.multipath_amount) >= 0.3
             except (TypeError, ValueError):
                 _mp_bypass = False
             if (getattr(self, "mpx_canceller", None) is not None
-                    and self.mpx_canceller.enabled and self._last_cos2 is not None
-                    and not _mp_bypass):
+                    and self.mpx_canceller.enabled and self._last_cos2 is not None):
                 carrier_q = -self._last_cos2
                 if abs(self.stereo_phase_offset) > 1e-6:
                     carrier_q = carrier_q * co + self._last_sin2 * si
@@ -153,7 +155,8 @@ class DspWfmMixin:
                                                     self.audio_decim, "history_lpr_q") * 2.0
                 if len(diff_q) == len(diff_raw):
                     self._last_diff_q = diff_q
-                    diff_raw = self.mpx_canceller.process(diff_raw, diff_q)
+                    if not _mp_bypass:
+                        diff_raw = self.mpx_canceller.process(diff_raw, diff_q)
                 else:
                     self._last_diff_q = None
 
@@ -287,6 +290,10 @@ class DspWfmMixin:
         # 0. マルチパス検出 (3系統OR)
         # 平滑は鈍め (測定1.0秒・反映1.5秒): 速すぎると番組の包絡変動や
         # フェージングの瞬時値にステレオ幅が呼吸してしまう (市街地局で実測)
+        # 射程 (独立検証で確定): 静止 ~6us未満 (経路差1.8km未満) は3系統
+        # すべて不感 (包絡は静止に不感、ピークは漂動前提、トリムはΔφが
+        # 0.3°不感帯以下)。都市部300m〜1.5kmの静止反射は保護対象外。
+        # なお静止3usでは分離度も無傷 (47dB) のため実害なし。
         if self.multipath_enabled:
             env = np.abs(iq_if)
             var = float(np.std(env) / (np.mean(env) + 1e-12))
@@ -1079,13 +1086,17 @@ class DspWfmMixin:
         誤差の符号付き推定になり、δ += k·err で幾何収束する。番組レベルに不変。
         Q腕が無い場合 (キャンセラ無効時) はL-R電力の摂動観測へフォールバック。
         更新はブロック毎・比例ゲイン0.5・±15°クランプ。ゲート: パイロット
-        ロック・高ブレンド・低ヒス・有音声時のみ。短時間テストにはほぼ無影響。"""
+        ロック・高ブレンド・有音声時のみ。短時間テストにはほぼ無影響。
+        NOTE (検証指摘§2-2): 旧ゲートの nr_gain>0.7 は高域のみ番組で
+        誤った0に落ち、トリム (＝検出器の静止エコー眼) ごと凍結した。
+        ヒス上での彷徨は不感帯・den床・EMAが受け持つため nr_gain 条件は
+        撤廃し、_stereo_blend (パイロット由来・番組HFに鈍い) のみ残す。"""
         if not self.stereo_trim_enabled:
             return
         try:
             if not (abs(float(self.stereo_pilot_lock)) > 0.5):
                 return
-            if not (float(self._stereo_blend) > 0.5 and float(self.stereo_nr_gain) > 0.7):
+            if not (float(self._stereo_blend) > 0.5):
                 return
             if len(diff) < 64 or len(mono) < 64:
                 return
