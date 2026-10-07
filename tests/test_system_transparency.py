@@ -195,6 +195,118 @@ def test_non_cognitive_path_transparent():
     print("[OK] non-cognitive path system-transparent")
 
 
+def test_demod_helpers_strong_field_noop():
+    """強電界ではEKF/Riemann/TDAが一切呼ばれず、出力がビット一致すること。
+
+    境界 (EKF C/N26-20 / Riemann 28-22 / TDA gate30) より十分上では
+    重み0で完全無動作。サブシステムon/offでビット同一を要求する。"""
+    raw = _tonal_music()
+    calls = {"ekf": 0, "riemann": 0, "tda": 0}
+
+    def run(disable):
+        d = _make(cognitive=True)
+        if disable:
+            d.ekf_enabled = False
+            d.riemann_demodulator.enabled = False
+            d.tda_click.enabled = False
+        else:
+            _e = d.ekf_demod.demodulate
+
+            def ekf_spy(x, _e=_e):
+                calls["ekf"] += 1
+                return _e(x)
+            d.ekf_demod.demodulate = ekf_spy
+            _r = d.riemann_demodulator.demodulate
+
+            def r_spy(x, _r=_r):
+                calls["riemann"] += 1
+                return _r(x)
+            d.riemann_demodulator.demodulate = r_spy
+            _t = d.tda_click.process_with_mask
+
+            def t_spy(x, _t=_t):
+                calls["tda"] += 1
+                return _t(x)
+            d.tda_click.process_with_mask = t_spy
+        return _decode(d, raw), d
+
+    y_on, d_on = run(False)
+    y_off, _ = run(True)
+    print(f"[*] strong field: calls={calls} if_snr={d_on._if_snr_db:.1f} "
+          f"bit-identical={np.array_equal(y_on, y_off)}")
+    assert calls == {"ekf": 0, "riemann": 0, "tda": 0}, \
+        f"demod helpers called in strong field: {calls}"
+    assert np.array_equal(y_on, y_off), "strong-field output not bit-identical"
+    print("[OK] EKF/Riemann/TDA strong-field no-op")
+
+
+def test_ekf_mono_strong_noop():
+    """EKFゲート条件 (blend<=0.05) が成立する強電界モノラルでも無動作。"""
+    n = int(2.0 * RF)
+    t = np.arange(n) / RF
+    mono = 0.9 * np.sin(2 * np.pi * 1000.0 * t)
+    ph = 2 * np.pi * 22500.0 * np.cumsum(mono) / RF
+    iq = 0.6 * np.exp(1j * ph).astype(np.complex64)
+    raw = _to_raw(iq)
+    calls = [0]
+
+    def run(ekf_on):
+        d = _make(cognitive=False)
+        d.ekf_enabled = ekf_on
+        if ekf_on:
+            _e = d.ekf_demod.demodulate
+
+            def spy(x, _e=_e):
+                calls[0] += 1
+                return _e(x)
+            d.ekf_demod.demodulate = spy
+        outs = []
+        for k in range(len(raw) // BLK):
+            d._stereo_blend = 0.0  # モノラル時と同条件を強制
+            a, _ = d.process(raw[k * BLK:(k + 1) * BLK], "WFM")
+            a = np.asarray(a, dtype=np.float32)
+            if a.ndim == 1:
+                a = np.stack([a, a], axis=1)
+            outs.append(a)
+        return np.concatenate(outs), d
+
+    y_on, d_on = run(True)
+    y_off, _ = run(False)
+    print(f"[*] mono strong: ekf_calls={calls[0]} "
+          f"if_snr={d_on._if_snr_db:.1f} "
+          f"bit-identical={np.array_equal(y_on, y_off)}")
+    assert calls[0] == 0, "EKF ran in strong field"
+    assert np.array_equal(y_on, y_off), "mono strong-field output altered"
+    print("[OK] EKF mono strong-field no-op")
+
+
+def test_ultra_squelch_strong_transparent():
+    """ultra squelch有効でも強電界ではゲイン1.0のビット透過。"""
+    raw = _tonal_music(seed=5)
+    d_off = _make(cognitive=False)
+    d_on = _make(cognitive=False)
+    d_on.ultra_squelch.enabled = True
+    y_off = _decode(d_off, raw)
+    y_on = _decode(d_on, raw)
+    print(f"[*] ultra on: gain={d_on.ultra_squelch.current_gain:.4f} "
+          f"bit-identical={np.array_equal(y_on, y_off)}")
+    assert d_on.ultra_squelch.current_gain > 0.999
+    assert np.array_equal(y_on, y_off), "ultra squelch altered strong field"
+    print("[OK] ultra squelch strong-field transparent")
+
+
+def test_fir_audio_flat_dly_pure_delay():
+    """最大帯域開放時の素通しFIRが完全な単一遅延 (リップル0) であること。"""
+    d = _make(cognitive=True)
+    h = np.asarray(d.fir_audio_flat_dly)
+    idx = int(np.argmax(np.abs(h)))
+    print(f"[*] flat_dly: taps={len(h)} peak_idx={idx} sum={h.sum():.4f}")
+    assert abs(float(h.sum()) - 1.0) < 1e-6
+    assert abs(float(np.abs(h).sum()) - 1.0) < 1e-6, "not a single tap"
+    assert idx == (len(h) - 1) // 2, "delay tap not centered"
+    print("[OK] flat delay is ripple-free")
+
+
 def main() -> int:
     try:
         test_clean_tonal_music_transparent()
@@ -202,6 +314,10 @@ def main() -> int:
         test_non_cognitive_path_transparent()
         test_resampler_bit_transparent_at_zero_drift()
         test_bss_gate_transparent()
+        test_demod_helpers_strong_field_noop()
+        test_ekf_mono_strong_noop()
+        test_ultra_squelch_strong_transparent()
+        test_fir_audio_flat_dly_pure_delay()
     except AssertionError as e:
         print(f"FAILED: {e}")
         return 1

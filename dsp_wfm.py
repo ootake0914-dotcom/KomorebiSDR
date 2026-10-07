@@ -526,7 +526,11 @@ class DspWfmMixin:
         # 超音波三角ノイズ比追従型 オートスケルチ
         ultra_gain = 1.0
         if getattr(self, "ultra_squelch", None) is not None and self.ultra_squelch.enabled:
-            ultra_gain, _ = self.ultra_squelch.process(demod)
+            try:
+                _stereo_pl = abs(float(self.stereo_pilot_lock)) > 0.2
+            except (TypeError, ValueError):
+                _stereo_pl = False
+            ultra_gain, _ = self.ultra_squelch.process(demod, stereo=_stereo_pl)
 
         # 黒魔法C: 確率共鳴は検出用副経路のみ。メインのdemod配列には一切触らない。
         # confidenceを属性 (bm_sr_confidence) として公開するだけで、

@@ -125,6 +125,11 @@ class UltrasonicSquelchTracker:
         self.sample_rate = float(sample_rate)
         # 超音波ハイパスフィルタ状態 (遮断周波数 45kHz)
         # y[n] = x[n] - x[n-1] + R * y[n-1]
+        # NOTE: 本フィルタは微分型強調 (高域ほど利得増) のため、ステレオ
+        # MPXのDSB (23〜53kHz) も強調されquieting比を押し下げる。
+        # 次数・遮断ではDSBと超音波ノイズを分離できないため、ステレオ局
+        # (パイロットロック) はprocess(stereo=True)で開を維持する方式に
+        # した (下記 process 参照)。
         fc = 45000.0
         self.r = float(np.exp(-2.0 * np.pi * fc / self.sample_rate))
         self.hp_x1 = 0.0
@@ -168,10 +173,16 @@ class UltrasonicSquelchTracker:
         self.is_open = True
         self.current_gain = 1.0
 
-    def process(self, demod_baseband: np.ndarray) -> tuple[float, bool]:
+    def process(self, demod_baseband: np.ndarray,
+                stereo: bool = False) -> tuple[float, bool]:
         """
         FM復調直後のベースバンド信号 (288kHz) から超音波ノイズレベルを追従し、
         ソフトフェードゲイン (0.0〜1.0) と オープン状態 (bool) を返す。
+
+        stereo: パイロットロック中 (ステレオ局) は局在の直接証拠なので
+        quieting判定より優先して開を維持する。DSB (23-53kHz) が超音波帯へ
+        漏れてquieting比を押し下げるため、これが無いとステレオ音楽番組で
+        誤ミュートする (実測: HFステレオ音楽で比2.6dB<close閾値3.0)。
         """
         if not self.enabled or len(demod_baseband) == 0:
             return 1.0, True
@@ -247,6 +258,10 @@ class UltrasonicSquelchTracker:
         quieting_db = float(self.prog_db - self.noise_db)
         if not getattr(self, "_primed", False):
             self._primed = True
+        elif stereo:
+            # パイロットロック = 局在の直接証拠。DSB漏れに依存する
+            # quieting判定を無効化して開を維持 (誤ミュート防止)。
+            self.is_open = True
         elif self.is_open:
             if quieting_db < 3.0:
                 self.is_open = False  # 局間ノイズへ突入 -> ミュート
