@@ -81,6 +81,74 @@ class DspWfmMixin:
             return np.nan_to_num(iq_if, nan=0.0, posinf=1.0, neginf=-1.0)
         return y
 
+    def _update_diff_gain_track(self, demod: np.ndarray):
+        """ピーク偏移フォロワ＋差信号振幅校正の追従係数更新。
+
+        FM占有帯域は偏移に比例し、IF切落とし量 (=必要gain) が変わる。
+        ブロック瞬時ピーク偏移のピークホールド (立上り即時・解放τ4秒)
+        で局のドライブレベルを鈍く追い、番組緩急でのゲインポンピングを
+        防ぐ。無音 (ピーク0) では係数は下限へ戻るが無信号同然で無害。
+        """
+        try:
+            if demod is None or len(demod) == 0:
+                return
+            # 復調直後の2ブロックは空白 (フィルタ履歴・PLL整定過渡が
+            # 140kHz級の偽ピークを作り、ピークホールドを汚染するため)。
+            if getattr(self, "_diff_gain_blank", 0) > 0:
+                self._diff_gain_blank -= 1
+                return
+            dt = len(demod) / float(self.if_rate)
+            # 瞬時ピークではなく99.9%点: ADC量子化・IFリンギング・
+            # クリックスパイクの単発大振幅を除外する (maxだと30%変調を
+            # 3倍過大評価した)。partitionでソートより安く求める。
+            a = np.abs(np.asarray(demod, dtype=np.float32).reshape(-1))
+            k = min(len(a) - 1, int(0.999 * len(a)))
+            peak = float(np.partition(a, k)[k])
+            if not math.isfinite(peak):
+                return
+            dev = peak * float(self.if_rate) / (2.0 * math.pi)
+            if self._diff_gain_dev is None:
+                self._diff_gain_dev = dev
+            elif dev > self._diff_gain_dev:
+                self._diff_gain_dev = dev
+            else:
+                self._diff_gain_dev += (1.0 - math.exp(-dt / 4.0)) * (dev - self._diff_gain_dev)
+            tbl = self._diff_gain_table
+            dd = float(np.clip(self._diff_gain_dev, tbl[0][0], tbl[-1][0]))
+            tgt_g = tbl[-1][1]
+            for (x0, y0), (x1, y1) in zip(tbl[:-1], tbl[1:]):
+                if dd <= x1:
+                    tgt_g = y0 + (y1 - y0) * ((dd - x0) / max(x1 - x0, 1e-9))
+                    break
+            # IF重み: 既定IF (100kHz) では表通り、広帯域IF (122kHz〜。
+            # Hyper域) では切落としが無く一律1.000が正しい。非認知経路の
+            # fir_ifは固定のため常に表通り。 eff = base * (T/1.03)^w で、
+            # w=1・100%時は base そのもの (=golden不変)、w=0では表を
+            # 参照せず base を通す (手動校正を尊重)。
+            try:
+                _cog = bool(self.cognitive_enabled)
+                _ifbw = float(self.applied_if_bw_hz)
+            except (TypeError, ValueError):
+                _cog, _ifbw = False, 100000.0
+            if _cog:
+                w_if = float(np.clip((122000.0 - _ifbw) / 22000.0, 0.0, 1.0))
+            else:
+                w_if = 1.0
+            ratio = float(np.clip(tgt_g / 1.03, 0.90, 1.05))
+            tgt = ratio ** w_if if w_if > 0.0 else 1.0
+            tgt = float(np.clip(tgt, 0.95, 1.0))
+            a_g = 1.0 - math.exp(-dt / 0.5)
+            self._diff_gain_f += a_g * (tgt - self._diff_gain_f)
+        except Exception:
+            pass
+
+    def _diff_gain_eff(self) -> float:
+        """実効差信号ゲイン = 手動校正値 × 追従係数。"""
+        try:
+            return float(self.stereo_diff_gain) * float(self._diff_gain_f)
+        except (TypeError, ValueError):
+            return 1.03
+
     def _update_cma_auto_gate(self) -> bool:
         """CMA自動介入ゲート（ヒステリシス＋信号存在条件）。
 
@@ -176,7 +244,7 @@ class DspWfmMixin:
                     stereo_diff = self._freq_dependent_blend(diff, blend)
                     # IF切落としによる差信号振幅不足を校正 (NR推定は無倍率で観測)
                     stereo_diff = (stereo_diff
-                                   * float(self.stereo_diff_gain)).astype(np.float32)
+                                   * float(self._diff_gain_eff())).astype(np.float32)
                     # 差信号FIRの群遅延を補償 (mono/diffの位相ズレによる分離度劣化を防止)
                     mono = self._delay_mono(mono)
                 else:
@@ -187,7 +255,7 @@ class DspWfmMixin:
                     stereo_diff = (diff_raw
                                    * (self._stereo_blend * self.multipath_gain
                                       * self.aci_gain
-                                      * float(self.stereo_diff_gain))).astype(np.float32)
+                                      * float(self._diff_gain_eff()))).astype(np.float32)
                     self._delay_mono(mono)
                     self.stereo_wiener_gain = 1.0
 
@@ -531,6 +599,7 @@ class DspWfmMixin:
         # 3. 適切な名目オーディオゲインにスケーリング
         # 日本規格の最大周波数偏移(±75kHz)でも振幅0.95以内に収め、過変調時のソフトリミッターポンピング歪みを抑制
         demod_scaled = demod * 0.58
+        self._update_diff_gain_track(demod)
 
         # 3b. 差分検波アパーチャ逆補正 (M/D共通前段。mono/差/RDSすべて
         # 同一遅延で通るため分離度の時間整合は不変)
@@ -667,6 +736,19 @@ class DspWfmMixin:
         # 0.3msの節約より適応特性の保存を優先する。
         n = 1024
         if len(diff) < 128 or len(mono) < 128:
+            return
+        # 無音凍結: -40dBFS未満は推定も学習も止めて前値保持する。
+        # 無音 (dead air・停波キャリア) では mf→0 で比が非物理値に発散し、
+        # 20秒以上の無音で全閉→番組復帰後も約3.8秒ステレオが潰れる実害。
+        # _update_stereo_trim と同一パターン (mono_rms<0.01) の移植。
+        # 実測分離: 病的側max 0.00386 / 正当側min 0.01551。
+        try:
+            _mrms = float(np.sqrt(np.mean(
+                np.asarray(mono, dtype=np.float64) ** 2)))
+        except Exception:
+            _mrms = 1.0
+        if not _mrms >= 0.01:
+            self._nr_k_hits = 0
             return
         bin_hz = self.audio_rate / n
 
@@ -1846,7 +1928,23 @@ class DspWfmMixin:
         # する 1.03 へ再校正した (L単音75kHz偏移で55.6dB=旧55.9dBと等価、
         # 2トーン75kHzで-40.0dB・30kHzで-30.3dB。内容依存の最適値は
         # 1.02〜1.03に分布し、どちらも可聴限界 (-30dB) を十分上回る)。
+        # NOTE (改善案diff_gain): 上は100%変調の一点校正。30〜60%変調
+        # (通常番組) では切落としが無く最適1.000のため、1.03のままでは
+        # 分離度を10〜14dB損する。瞬時ピーク偏移フォロワで下表を補間する。
+        # 表のx軸は「測定偏移」: 既定IFでの切落としで高偏移ほど過小に
+        # 読める (75k→68k) ため、真値ではなく測定値座標で校正してある
+        # (既定fir_if固定の非認知経路で有効。認知経路の広帯域IFでは
+        # そもそも切落としが無く一律1.000が正しいため、w_ifで混ぜる)。
+        # 測定点 (dev_meas→gain): 21.8k→1.000 / 46.3k→1.000 /
+        # 54.3k→1.015 / 68.0k→1.030。
         self.stereo_diff_gain = 1.03
+        self._diff_gain_dev = None  # ピーク偏移推定 [Hz]
+        self._diff_gain_f = 1.0     # 追従係数平滑値
+        self._diff_gain_blank = 2   # 整定過渡ブランク
+        self._diff_gain_table = ((0.0, 1.000),
+                                 (46300.0, 1.000),
+                                 (54252.0, 1.015),
+                                 (67959.0, 1.030))
         # ===== ステレオノイズリダクション =====
         # 弱電界でステレオ化すると増えるヒスノイズを、(L-R)差信号の高域/中域パワー比から
         # 検出し、ノイズ量に応じて 1) サブバンドWiener抑圧 2) 可変ローパス

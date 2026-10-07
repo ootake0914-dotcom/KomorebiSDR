@@ -42,6 +42,8 @@ TOLS = {
     "real_fm_nhk60_nr_gain_min": 0.15,
     "wfm_fr_excess_15k_db": 0.8,
     "wfm_sep_1k_db": 1.5,
+    "wfm_sep_1k_mod30_db": 1.5,
+    "wfm_sep_1k_mod60_db": 1.5,
     "wfm_thd_overmod_db": 1.5,
     "wfm_clip_pin_frac": 0.002,
     "real_fm_lucky60_clip_flat_frac": 0.002,
@@ -296,6 +298,16 @@ def measure(full=False):
     m["wfm_sep_1k_db"] = float(10.0 * np.log10(
         (_tone_pow(seg[:, 0], 1000.0) + 1e-24)
         / (_tone_pow(seg[:, 1], 1000.0) + 1e-24)))
+    # 変調深度軸 (改善案diff_gain 4-1): 1k分離度は100%変調の一点校正で、
+    # 通常番組変調 (30〜60%) の分離劣化を検出できない。追従gain導入後の
+    # 値をベースライン化する (修正前: 30%→34.7 / 60%→35.4dB)。
+    for _dev, _tag in ((22500.0, "30"), (45000.0, "60")):
+        y_m = _decode_stereo(_wf_front(), _wfm_tone_raw(1000.0, dev_hz=_dev,
+                                                        dur=5.0),
+                            BLOCK_WFM)[-FS:]
+        m[f"wfm_sep_1k_mod{_tag}_db"] = float(10.0 * np.log10(
+            (_tone_pow(y_m[:, 0], 1000.0) + 1e-24)
+            / (_tone_pow(y_m[:, 1], 1000.0) + 1e-24)))
     y_om = _decode_stereo(_wf_front(), _wfm_tone_raw(1000.0, dev_hz=100000.0),
                           BLOCK_WFM)[:, 0]
     m["wfm_thd_overmod_db"] = _thd_plus_n(y_om[-FS:], 1000.0)

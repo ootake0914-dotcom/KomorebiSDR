@@ -68,6 +68,14 @@
       "value": 55.913,
       "tol": 1.5
     },
+    "wfm_sep_1k_mod30_db": {
+      "value": 48.7093,
+      "tol": 1.5
+    },
+    "wfm_sep_1k_mod60_db": {
+      "value": 45.1308,
+      "tol": 1.5
+    },
     "wfm_thd_overmod_db": {
       "value": -38.35416664096485,
       "tol": 1.5

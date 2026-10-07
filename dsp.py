@@ -432,6 +432,8 @@ class SdrDspPipeline(DspBlackMagicMixin, DspAmMixin, DspNfmMixin,
             self._mp_var_peak = 0.0
             self.multipath_amount = 0.0
             self.multipath_gain = 1.0
+            self._diff_gain_dev = None
+            self._diff_gain_blank = 2
         except Exception:
             pass
         try:

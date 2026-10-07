@@ -208,6 +208,31 @@ def test_side_decode_preserved():
     print("[OK] decoded Side preserved vs NR-off reference")
 
 
+def test_silence_freeze_holds_and_recovers():
+    """長時間無音でNRが全閉せず、番組復帰が即時であること。
+
+    改善案§6-1: 無音 (mono_rms<0.01) では推定・学習とも凍結する。
+    凍結なしでは20秒超の無音で全閉し、番組復帰後も約3.8秒潰れる。
+    """
+    rng = np.random.default_rng(21)
+    dsp = SdrDspPipeline(1152000, SR)
+    dsp._if_snr_db = 37.0
+    n = BLK
+    w = (rng.standard_normal(n) * 0.004).astype(np.float32)
+    for _ in range(400):  # 約23秒の無音
+        dsp._update_stereo_nr(w, w)
+    print(f"[*] silence 23s: hiss={dsp.stereo_hiss_db:+.1f}dB "
+          f"gain={dsp.stereo_nr_gain:.3f}")
+    assert dsp.stereo_nr_gain > 0.9, "silence collapsed NR"
+    t = np.arange(n) / SR
+    mono = (0.5 * np.sin(2 * np.pi * 1000.0 * t)).astype(np.float32)
+    for _ in range(5):
+        dsp._update_stereo_nr((mono * 0.1).astype(np.float32), mono)
+    print(f"[*] program back 5blk: gain={dsp.stereo_nr_gain:.3f}")
+    assert dsp.stereo_nr_gain > 0.9, "slow recovery after silence"
+    print("[OK] silence frozen, instant recovery")
+
+
 def main() -> int:
     try:
         test_hf_only_clean()
@@ -217,6 +242,7 @@ def main() -> int:
         test_hf_program_strong_field()
         test_normal_cn10_unchanged()
         test_side_decode_preserved()
+        test_silence_freeze_holds_and_recovers()
     except AssertionError as e:
         print(f"FAILED: {e}")
         return 1
