@@ -60,11 +60,50 @@ def test_manual_gain_respected():
     print("[OK] manual gain scales relatively")
 
 
+def _run_cog(dev_hz, if_bw=145000.0):
+    dsp = SdrDspPipeline(1152000, FS)
+    dsp.set_offset_freq(0.0)
+    dsp.afc_enabled = False
+    dsp.cognitive_enabled = True
+    dsp.slow_agc_enabled = False
+    dsp.filter_mode = "wide"
+    dsp.set_stereo_nr(False)
+    dsp.applied_if_bw_hz = float(if_bw)
+    y = _decode_stereo(dsp, _wfm_tone_raw(1000.0, dev_hz=dev_hz, dur=4.0),
+                       BLOCK_WFM)[-FS:]
+    sep = float(10.0 * np.log10((_tone_pow(y[:, 0], 1000.0) + 1e-24)
+                                / (_tone_pow(y[:, 1], 1000.0) + 1e-24)))
+    return dsp, sep
+
+
+def test_cognitive_path_tracks():
+    """認知経路 (出荷既定・広帯域IF) でも追従すること (検証指摘の回帰)。
+
+    旧式は w_if=0 で倍率1.0=eff 1.03に張り付き no-op だった。
+    広帯域IFでは切落としが無く一律1.000が正しい。
+    """
+    dsp, sep = _run_cog(22500.0)
+    eff = dsp._diff_gain_eff()
+    print(f"[*] cog 30%: eff={eff:.4f} sep={sep:.1f}dB (was 34.7)")
+    assert abs(eff - 1.000) < 0.005, f"cognitive no-op ({eff:.4f})"
+    assert sep > 40.0, f"cognitive 30% separation lost ({sep:.1f})"
+    dsp60, sep60 = _run_cog(45000.0)
+    print(f"[*] cog 60%: eff={dsp60._diff_gain_eff():.4f} sep={sep60:.1f}dB")
+    assert sep60 > 40.0, f"cognitive 60% separation lost ({sep60:.1f})"
+    dsp100, sep100 = _run_cog(75000.0)
+    print(f"[*] cog 100%: eff={dsp100._diff_gain_eff():.4f} "
+          f"sep={sep100:.1f}dB")
+    assert abs(dsp100._diff_gain_eff() - 1.03) < 0.005
+    assert sep100 > 50.0, f"cognitive 100% regressed ({sep100:.1f})"
+    print("[OK] cognitive path tracks")
+
+
 def main() -> int:
     try:
         test_tracks_low_deviation()
         test_holds_full_deviation()
         test_manual_gain_respected()
+        test_cognitive_path_tracks()
     except AssertionError as e:
         print(f"FAILED: {e}")
         return 1

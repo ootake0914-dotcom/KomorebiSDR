@@ -120,22 +120,14 @@ class DspWfmMixin:
                 if dd <= x1:
                     tgt_g = y0 + (y1 - y0) * ((dd - x0) / max(x1 - x0, 1e-9))
                     break
-            # IF重み: 既定IF (100kHz) では表通り、広帯域IF (122kHz〜。
-            # Hyper域) では切落としが無く一律1.000が正しい。非認知経路の
-            # fir_ifは固定のため常に表通り。 eff = base * (T/1.03)^w で、
-            # w=1・100%時は base そのもの (=golden不変)、w=0では表を
-            # 参照せず base を通す (手動校正を尊重)。
-            try:
-                _cog = bool(self.cognitive_enabled)
-                _ifbw = float(self.applied_if_bw_hz)
-            except (TypeError, ValueError):
-                _cog, _ifbw = False, 100000.0
-            if _cog:
-                w_if = float(np.clip((122000.0 - _ifbw) / 22000.0, 0.0, 1.0))
-            else:
-                w_if = 1.0
-            ratio = float(np.clip(tgt_g / 1.03, 0.90, 1.05))
-            tgt = ratio ** w_if if w_if > 0.0 else 1.0
+            # IF重みは無い: 測定偏移はIF帯域 (100k/145k/190k) を変えても
+            # 同一値に読める (30%→21.8k / 60%→46.4k / 80%→54.4k /
+            # 100%→67.9k。占有帯域がどのIFをも上回るため圧縮され方が
+            # 変わらない)。よって単一表が認知・非認知の両経路で有効。
+            # 広IF+100%でも最適1.030は不変と実測 (145k/190kとも56.9dB)。
+            # eff = base * (T/1.03)。100%時は base そのもの (=golden不変)。
+            # 旧 w_if 式は認知経路で eff 1.03 に張り付く不具合だった。
+            tgt = float(np.clip(float(tgt_g) / 1.03, 0.90, 1.05))
             tgt = float(np.clip(tgt, 0.95, 1.0))
             a_g = 1.0 - math.exp(-dt / 0.5)
             self._diff_gain_f += a_g * (tgt - self._diff_gain_f)
