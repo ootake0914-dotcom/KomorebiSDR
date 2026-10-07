@@ -917,10 +917,16 @@ class DspWfmMixin:
         if hiss_gate < 1.0:
             s_b *= hiss_gate
             s_w *= hiss_gate
+        # 透明性ゲート由来の復帰加速: 帯域外プローブが「ヒス証拠なし」を
+        # 示している間は、in-band HFをヒスと誤認した残留 (起動過渡・番組
+        # HF) をτ1.5/2.5sのゆっくり復帰で残さない。証拠が無いならNRも
+        # 無動作が透明性の要件 (実測: 15k帯域制限した実番組2話者で
+        # Side 14-15.5k -3.3dB が残留していた)。ゲート全開時は通常動特性。
+        _rel_fast = 0.05 + 0.95 * hiss_gate
         # 非対称スムージング: ノイズ増加時は速く、回復はゆっくり
-        tau = 0.3 if s_b > self._nr_s else 1.5
+        tau = 0.3 if s_b > self._nr_s else 1.5 * _rel_fast
         self._nr_s += (1.0 - np.exp(-dt / tau)) * (s_b - self._nr_s)
-        tau_w = 0.25 if s_w > self._nr_s_w else 2.5
+        tau_w = 0.25 if s_w > self._nr_s_w else 2.5 * _rel_fast
         self._nr_s_w += (1.0 - np.exp(-dt / tau_w)) * (s_w - self._nr_s_w)
         self.stereo_nr_gain = 1.0 - self._nr_s
         self.stereo_cut_hz = self._nr_cut_max_hz * (

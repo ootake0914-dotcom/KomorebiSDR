@@ -111,12 +111,15 @@ class QuadratureMpxCanceller:
             self.cancellation_amount = 0.9 * self.cancellation_amount + 0.1 * leak_norm
             return clean_i
 
+        # ゲート外 (直交歪み無し) で古い重みを適用し続けると、重みが学習時と
+        # 異なるQ成分 (静止位相オフセットのヒルベルト成分等) に掛かり、5タップ
+        # FIRの周波数形状がそのまま残差傾斜になる。実測: クリーン15kで
+        # Side-Mid +0.15dB (1k比) を足し、高域分離度の天井を 50.8→36dB へ
+        # 押し下げていた (検証レポート§4の真因)。相殺は適応と同じゲート内
+        # でのみ適用し、ゲート外は速やかに忘却する (再開時は再適応で復帰)。
         if np.any(np.abs(self.weights) > 1e-4):
-            self.weights *= 0.95
-            if np.any(np.abs(self.weights) > 1e-3):
-                win_q = np.lib.stride_tricks.sliding_window_view(q_ext, self.taps)
-                est_distortion = win_q @ self.weights
-                return (diff_i - est_distortion).astype(np.float32)
+            self.weights *= 0.6
+            self.cancellation_amount *= 0.9
         return diff_i
 
 

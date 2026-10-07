@@ -233,6 +233,66 @@ def test_stationary_noise_program_bounded():
     print("[OK] stationary noise program bounded (documented ambiguity)")
 
 
+def test_hiss_recovery_releases_fast():
+    """弱電界ヒス→強電界クリーン番組の切替でNR残留が速やかに消えること。
+
+    透明性ゲート (帯域外15.5-16.4kにヒス証拠なし) が閉じたら、in-band HFを
+    ヒスと誤認した残留をτ1.5/2.5sのゆっくり復帰で残してはならない。
+    実測 (復帰加速の修正前): 15k帯域制限した独立L/R番組で Side 14-15.5k
+    -3.3dB が残留 (cut 14.4k / _nr_s_w 0.49)。放送帯域 (15k) に無い帯域外
+    証拠が無い以上、NRは無動作が透明性の要件。
+    """
+    n = int(5.0 * RF)
+    t = np.arange(n) / RF
+
+    def band_noise(seed):
+        r = np.random.default_rng(seed)
+        fr = np.fft.rfftfreq(n, 1.0 / RF)
+        f = np.fft.rfft(r.standard_normal(n))
+        f[np.abs(fr) > 15000.0] = 0
+        f[np.abs(fr) < 300.0] = 0
+        x = np.fft.irfft(f, n=n)
+        return x / (np.max(np.abs(x)) + 1e-9) * 0.6
+
+    l = band_noise(7)
+    r = band_noise(8)
+    mpx = (0.45 * (l + r) + 0.45 * (l - r) * np.sin(2 * np.pi * 38000.0 * t)
+           + 0.09 * np.sin(2 * np.pi * 19000.0 * t))
+    mpx = mpx / (float(np.max(np.abs(mpx))) + 1e-9)
+    ph = 2 * np.pi * 22500.0 * np.cumsum(mpx) / RF
+    iq = 0.6 * np.exp(1j * ph).astype(np.complex64)
+    # 前半2秒だけ弱電界 (C/N12) → 後半は強電界クリーン
+    rng = np.random.default_rng(11)
+    p = 0.36 / 10 ** (12.0 / 10.0)
+    nz = np.sqrt(p / 2.0) * (rng.standard_normal(n) + 1j * rng.standard_normal(n))
+    k = int(2.0 * RF)
+    iq[:k] += nz[:k]
+    raw = np.empty(2 * n, dtype=np.uint8)
+    raw[0::2] = np.clip(np.round(iq.real * 127.5 + 127.5), 0, 255)
+    raw[1::2] = np.clip(np.round(iq.imag * 127.5 + 127.5), 0, 255)
+
+    d_off, y_off = _run(raw, nr_on=False)
+    d_on, y_on = _run(raw, nr_on=True)
+    tail = 3 * FS // 2  # 後半クリーン区間の終端1.5秒
+    S_off = (y_off[-tail:, 0].astype(np.float64) - y_off[-tail:, 1]) * 0.5
+    S_on = (y_on[-tail:, 0].astype(np.float64) - y_on[-tail:, 1]) * 0.5
+
+    def band(x, lo, hi):
+        nn = len(x)
+        frq = np.fft.rfftfreq(nn, 1.0 / FS)
+        W = np.abs(np.fft.rfft(x * np.hanning(nn))) ** 2
+        return 10 * np.log10(float(W[(frq >= lo) & (frq <= hi)].sum()) + 1e-24)
+
+    d_hf = band(S_on, 10000.0, 15000.0) - band(S_off, 10000.0, 15000.0)
+    print(f"[*] hiss->clean recovery: dSide10-15k={d_hf:+.2f} "
+          f"cut={d_on._nr_cut_eff:.0f} gain={d_on.stereo_nr_gain:.3f} "
+          f"nr_w={d_on._nr_s_w:.3f} gate={d_on._nr_hiss_gate:.3f}")
+    assert d_on._nr_cut_eff > 14900.0, "NR cut did not reopen after hiss"
+    assert d_on.stereo_nr_gain > 0.98, "NR gain did not release after hiss"
+    assert abs(d_hf) < 0.5, "NR left residual suppression on clean program"
+    print("[OK] hiss recovery releases fast")
+
+
 def main() -> int:
     try:
         test_clean_strong_field_transparent()
@@ -240,6 +300,7 @@ def main() -> int:
         test_weak_field_program_retained()
         test_modulated_program_clean_field_untouched()
         test_stationary_noise_program_bounded()
+        test_hiss_recovery_releases_fast()
     except AssertionError as e:
         print(f"FAILED: {e}")
         return 1
