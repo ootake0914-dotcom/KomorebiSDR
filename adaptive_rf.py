@@ -355,6 +355,9 @@ class DigitalSelfInterferenceCanceller:
         - passband_hz: IFフィルタ通過帯域 (Hz)。阻止域の過小パワーによるメディアン歪みを防止。
         - exclude_bands: [(中心Hz, 半幅Hz), ...] の除外帯域 (WFMのパイロット±19kHz・
           副搬送波±38kHz等。検出精度が上がるとパイロットを消してステレオが落ちるため必須)。
+        - 対称ペア拒否: ±f の両方が突出する候補は搬送波変調積 (番組・パイロット) と
+          みなし棄却する。PCスプリアスは片側単独のため区別できる (狭帯域トーン番組の
+          誤消去対策。exclude_bandsはマルチパスで対称性が崩れた場合の保険として残す)。
         - 延長ケーブル使用等でスプリアスが消失した場合は自動で周波数リストを空にし、
           即座にバイパス（計算コストゼロ・歪みなし）へ移行。
         """
@@ -435,6 +438,38 @@ class DigitalSelfInterferenceCanceller:
             # 局所的にもグローバルにも突出している針状ピークのみを採用
             if local_prom >= prominence_db and global_prom >= prominence_db:
                 detected_candidates.append((f, global_prom))
+
+        # 搬送波変調積の保護:
+        # FM番組のスペクトル線 (トーン番組のベッセル側波帯・パイロット等) は
+        # 搬送波=0Hz を挟んで ±f の対称ペアとして現れる。狭帯域トーン
+        # (変調指数が小さい高域番組・静かなパッセージ) では側波帯が孤立し
+        # 突出度40dB超えで番組自身をPCスプリアスと誤採用→消去する実害を
+        # 確認 (8kHzトーン: ±8k/±16k が SNR50〜20dB で誤検出)。
+        # (i) 対称ペア: 鏡像 (−f) も突出している候補は搬送波変調積と断定。
+        # (ii) 高調波: 片側だけ突出した高次側波帯 (過渡・傾斜で非対称化、
+        #      実測: 3次 −24k のみ残存) を、ペア確定した基本波の整数倍
+        #      (2〜4倍/分周) 関係から棄却。PCスプリアスは片側単独が原則
+        #      (IQイメージは補正器が抑制) のため、これらに該当しない。
+        if detected_candidates:
+            _bin_hz = float(self.fs) / float(n_fft)
+            _mtol = max(150.0, _bin_hz)
+            _freqs_all = [c[0] for c in detected_candidates]
+            _confirmed = [abs(f) for f in _freqs_all
+                          if abs(f) > 1.0
+                          and any(abs(g + f) <= _mtol for g in _freqs_all)]
+
+            def _is_comb_partner(fabs):
+                for base in _confirmed:
+                    for k in (2.0, 3.0, 4.0, 0.5, 1.0 / 3.0, 0.25):
+                        if abs(fabs - k * base) <= _mtol:
+                            return True
+                return False
+
+            detected_candidates = [
+                (f, p) for (f, p) in detected_candidates
+                if not any(abs(g + f) <= _mtol for g in _freqs_all)
+                and not _is_comb_partner(abs(f))
+            ]
 
         if detected_candidates:
             # 突出度 (フロア比) が最も強力なスプリアスから優先して上位 max_tones 件を登録

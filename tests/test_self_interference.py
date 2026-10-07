@@ -205,8 +205,10 @@ def test_redetect_weight_carryover():
 
 def test_pilot_exclusion():
     """WFM無音＋パイロットのみのFMで、パイロット由来線 (±19/38/57/76kHzの
-    ベッセル側波帯) をPCノイズと誤検出しないこと。除外なしでは検出される
-    (テスト妥当性) が、除外ありでは弾かれ、真のスプリアスは検出される。"""
+    ベッセル側波帯) をPCノイズと誤検出しないこと。対称ペア拒否 (±f が
+    両方突出する候補は搬送波変調積) により除外リスト無しでも弾かれ、
+    exclude_bands はマルチパス等で対称性が崩れた場合の保険として機能する。
+    真のスプリアス (±片側単独) は検出される。"""
     fs = 288000.0
     n = int(0.5 * fs)
     t = np.arange(n, dtype=np.float64) / fs
@@ -217,9 +219,8 @@ def test_pilot_exclusion():
             (57000.0, 1500.0), (76000.0, 1500.0)]
     s0 = DigitalSelfInterferenceCanceller(sample_rate=fs)
     s0.auto_detect_spurious(iq)
-    assert any(abs(abs(f) - 19000.0) < 1500.0 or abs(abs(f) - 38000.0) < 1500.0
-               for f in s0.spurious_freqs), \
-        f"test setup broken: pilot not detected without exclusion {s0.spurious_freqs}"
+    assert not s0.spurious_freqs, \
+        f"symmetric modulation comb adopted without exclusion {s0.spurious_freqs}"
     s1 = DigitalSelfInterferenceCanceller(sample_rate=fs)
     s1.auto_detect_spurious(iq, exclude_bands=excl)
     bad = [f for f in s1.spurious_freqs
@@ -236,6 +237,47 @@ def test_pilot_exclusion():
     print("[OK] test_pilot_exclusion passed")
 
 
+def _sparse_tone_raw(f, dev, snr_db=40.0, dur=4.0):
+    """高域トーン (疎なベッセル線) のFM生IQ。実ノイズ付き。"""
+    rf = 1152000.0
+    n = int(dur * rf)
+    t = np.arange(n) / rf
+    l = 0.95 * np.sin(2 * np.pi * f * t)
+    mpx = (0.45 * l + 0.45 * l * np.sin(2 * np.pi * 38000.0 * t)
+           + 0.09 * np.sin(2 * np.pi * 19000.0 * t))
+    mpx = mpx / (float(np.max(np.abs(mpx))) + 1e-9)
+    ph = 2 * np.pi * float(dev) * np.cumsum(mpx) / rf
+    iq = 0.6 * np.exp(1j * ph).astype(np.complex64)
+    rng = np.random.default_rng(99)
+    p = 0.36 / 10 ** (float(snr_db) / 10.0)
+    iq = iq + np.sqrt(p / 2.0) * (rng.standard_normal(n)
+                                  + 1j * rng.standard_normal(n))
+    raw = np.empty(2 * n, dtype=np.uint8)
+    raw[0::2] = np.clip(np.round(iq.real * 127.5 + 127.5), 0, 255)
+    raw[1::2] = np.clip(np.round(iq.imag * 127.5 + 127.5), 0, 255)
+    return raw
+
+
+def test_sparse_program_not_adopted():
+    """出荷既定 (sic_enabled=True) で疎な高域トーン番組の側波帯を
+    スプリアス誤採用しないこと (回帰: ±8k/±16kを消去しSideが消失)。"""
+    from dsp import SdrDspPipeline
+    raw = _sparse_tone_raw(8000.0, 22500.0, snr_db=40.0, dur=1.0)
+    d = SdrDspPipeline(1152000, 48000)
+    d.set_offset_freq(0.0)
+    d.afc_enabled = False
+    d.cognitive_enabled = False
+    d.slow_agc_enabled = False
+    assert d.sic_enabled is True
+    blk = 132096
+    for k in range(min(3, len(raw) // blk)):
+        d.process(raw[k * blk:(k + 1) * blk], "WFM")
+    got = list(d.sic_detected_spurious)
+    print(f"[*] adopted spurious (must be empty): {got}")
+    assert not any(6000.0 < abs(f) < 26000.0 for f in got), \
+        f"program sidebands adopted as spurious: {got}"
+
+
 if __name__ == "__main__":
     print("===== Running Digital SIC Tests =====")
     test_single_spurious_cancellation()
@@ -245,4 +287,5 @@ if __name__ == "__main__":
     test_offgrid_spurious_cancellation()
     test_redetect_weight_carryover()
     test_pilot_exclusion()
+    test_sparse_program_not_adopted()
     print("ALL DIGITAL SIC TESTS PASSED!")
