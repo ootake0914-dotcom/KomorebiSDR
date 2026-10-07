@@ -6,6 +6,7 @@ SdrDspPipeline の mixin として動作する (純粋移動・動作同一)。
 
 import ctypes
 import math
+import sys
 from collections import deque
 
 import numpy as np
@@ -133,8 +134,17 @@ class DspWfmMixin:
                                                   self.audio_decim, "history_lpr") * 2.0
 
             # 38kHz 直交副搬送波マルチパス適応キャンセラ (Quadrature MPX Decoupler)
+            # 強エコー下ではQ腕サーボが誤追従して歪みを足す実測
+            # (静止30us: sep 0.1dB/THD-28.8dB → バイパスで9.3dB/-31.3dB)。
+            # 検出量0.3以上で素通しし、未発動時は従来通り。
+            _mp_bypass = False
+            try:
+                _mp_bypass = float(self.multipath_amount) >= 0.3
+            except (TypeError, ValueError):
+                _mp_bypass = False
             if (getattr(self, "mpx_canceller", None) is not None
-                    and self.mpx_canceller.enabled and self._last_cos2 is not None):
+                    and self.mpx_canceller.enabled and self._last_cos2 is not None
+                    and not _mp_bypass):
                 carrier_q = -self._last_cos2
                 if abs(self.stereo_phase_offset) > 1e-6:
                     carrier_q = carrier_q * co + self._last_sin2 * si
@@ -274,7 +284,7 @@ class DspWfmMixin:
         if self.squelch_enabled and power_db < self.squelch_threshold:
             return np.zeros(len(iq_if) // self.audio_decim, dtype=np.float32)
 
-        # 0. マルチパス検出 (包絡線の変動 = PM→AM変換量)
+        # 0. マルチパス検出 (3系統OR)
         # 平滑は鈍め (測定1.0秒・反映1.5秒): 速すぎると番組の包絡変動や
         # フェージングの瞬時値にステレオ幅が呼吸してしまう (市街地局で実測)
         if self.multipath_enabled:
@@ -284,6 +294,51 @@ class DspWfmMixin:
             self._mp_var += (1.0 - np.exp(-dt_mp / 1.0)) * (var - self._mp_var)
             x = float(np.clip((self._mp_var - self.mp_lo) / (self.mp_hi - self.mp_lo), 0.0, 1.0))
             s = x * x * (3.0 - 2.0 * x)
+            # (ii) 包絡ピークホールド: 漂動エコーの周期的深フェードは中央値
+            # では埋もれる (実測: 3us漂動でmed 0.07/CN12番組 0.07と衝突、
+            # maxは0.14/0.08で分離)。即時アタック＋緩やかリリースで保持し、
+            # 中央値に対する比でC/N変動と区別する (FM改善案§2)。
+            # 強電界のみ (弱電界の真性フェードではNR側に任せる)。
+            if var > self._mp_var_peak:
+                self._mp_var_peak = var
+            else:
+                self._mp_var_peak += (1.0 - np.exp(-dt_mp / 3.0)) * (var - self._mp_var_peak)
+            try:
+                _snr_mp = float(getattr(self, "_if_snr_db", 10.0))
+            except Exception:
+                _snr_mp = 10.0
+            _peak_ratio = (self._mp_var_peak
+                           / max(self._mp_var, 1e-6))
+            if (self._mp_var_peak > self.mp_peak_lo
+                    and _peak_ratio > self.mp_peak_ratio
+                    and np.isfinite(_snr_mp)
+                    and _snr_mp > self.mp_peak_snr):
+                xp = float(np.clip((self._mp_var_peak - self.mp_peak_lo)
+                                   / (self.mp_peak_hi - self.mp_peak_lo),
+                                   0.0, 1.0))
+                s_peak = xp * xp * (3.0 - 2.0 * xp)
+            else:
+                s_peak = 0.0
+            # (iii) 38kHz搬送波トリム偏移: 静止エコーは包絡を変えないため
+            # (i)(ii)とも不感だが、副搬送波位相は確実にずれる (実測: 静止
+            # 10usでトリム±15°レール張付き、クリーンは±6°以内)。PLLの
+            # L-R電力最大サーボの偏移量をそのまま指標にする。パイロット
+            # lock外 (無信号・モノラル) の彷徨は拾わないよう存在ゲート付き。
+            try:
+                _lock_mp = abs(float(self.stereo_pilot_lock))
+                _s_mp = float(self.s_meter_dbfs)
+            except (TypeError, ValueError):
+                _lock_mp, _s_mp = 0.0, -90.0
+            if (math.isfinite(_lock_mp) and math.isfinite(_s_mp)
+                    and _lock_mp > 0.2 and _s_mp > -60.0):
+                xt = float(np.clip((abs(float(self.stereo_phase_offset))
+                                    - self.mp_trim_lo)
+                                   / (self.mp_trim_hi - self.mp_trim_lo),
+                                   0.0, 1.0))
+                s_trim = xt * xt * (3.0 - 2.0 * xt)
+            else:
+                s_trim = 0.0
+            s = max(s, s_peak, s_trim)
             tau = 1.5 if s > self.multipath_amount else 2.5
             self.multipath_amount += (1.0 - np.exp(-dt_mp / tau)) * (s - self.multipath_amount)
             self.multipath_gain = 1.0 - self.mp_depth * self.multipath_amount
@@ -1316,6 +1371,14 @@ class DspWfmMixin:
             self._blend_release()
             return
         if not (self.stereo_enabled or self.rds_enabled) or _NATIVE is None or len(mpx) < 64:
+            # Cコア無しではパイロットPLLが無くステレオに上がれない。
+            # 毎ブロック出さず初回のみ警告 (FM改善案§4b: 原因不明の悩み時間防止)。
+            if _NATIVE is None and not getattr(self, "_pilot_no_native_warned", False):
+                print("[WARN] sdr_core unavailable: 19kHz pilot PLL "
+                      "needs the native core; stereo stays mono. "
+                      "Build it (build_native.bat / sh build_native.sh).",
+                      file=sys.stderr)
+                self._pilot_no_native_warned = True
             self._stereo_blend *= 0.9
             self.stereo_blend = self._stereo_blend
             return
@@ -1696,6 +1759,8 @@ class DspWfmMixin:
         # BS.450/EN 50067準拠キャリア生成のため追加回転は不要 (0.0)
         self.rds_phase_offset = 0.0
         self._stereo_blend = 0.0
+        # Cコア不在警告の重複抑止フラグ (FM改善案§4b)
+        self._pilot_no_native_warned = False
         # パイロット瞬断用フライホイール: ロック喪失直後はブレンドを凍結し、
         # 短い発作 (1.4秒/25ブロックまで) ではステレオ像を維持する
         self._pilot_hold_max = 25
@@ -1871,6 +1936,17 @@ class DspWfmMixin:
         self._mp_var = 0.0
         self.mp_lo = 0.10
         self.mp_hi = 0.35
+        # 包絡ピークホールド系のしきい値 (3シード×7条件で検証)。
+        # lo=0.09: CN12番組max 0.076とのマージン0.014＋比条件で二重化。
+        self._mp_var_peak = 0.0
+        self.mp_peak_lo = 0.09
+        self.mp_peak_hi = 0.25
+        self.mp_peak_ratio = 1.5
+        self.mp_peak_snr = 35.0
+        # 38kトリム偏移系のしきい値 (rad)。クリーン±0.10以内に対し
+        # 静止10usエコーは0.25レール張付き。存在ゲートはCMAと同一。
+        self.mp_trim_lo = 0.13
+        self.mp_trim_hi = 0.22
         # 0.7→0.5へ緩和 (反射波での三重積によるステレオ痩せ・呼吸を軽減。
         # 最小gain 0.3→0.5。歪み抑制はCMA自動等化側に委ねる)
         self.mp_depth = 0.5
@@ -1892,6 +1968,11 @@ class DspWfmMixin:
         # 強歪み (低CN) では等化が効くが、比較的クリーンなマルチパスでは
         # 等化人工物が逆に了解度を落とす (ESTOIで+0.09/-0.03を確認)。
         # CNで重み付けし、効く条件でのみ混ぜる。
+        # NOTE (FM改善案§2bの結論): 強電界エコーではブラインドCMA自体が
+        # 有害と実測 (3us反射で分離度17.3→2.9dBに悪化) したため、この窓を
+        # 開くことはしない。強電界エコーの能動対策は narrowing
+        # (multipath_gain) と cancellerバイパスであり、どちらも
+        # multipath_amount駆動 (C/N非依存) になっている。
         self.cma_cn_hi = 28.0
         self.cma_cn_lo = 23.0
         self.cma_w_max = 1.0

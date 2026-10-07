@@ -66,11 +66,32 @@ def test_silence_bounded():
     print("[OK] silence bounded")
 
 
+def test_weak_field_hiss_not_frozen():
+    """弱電界の真性ヒスは緩和ガードで凍結されずNRが効くこと
+
+    緩和ガード (mf<floor*10) は強電界 (gate_hi以上) 限定。
+    弱電界では真性ヒスがあり得るため素通しし、Wienerが立たねばならない。
+    """
+    rng = np.random.default_rng(7)
+    dsp = SdrDspPipeline(1152000, SR)
+    dsp._if_snr_db = 15.0  # 弱電界: 割引なし
+    n = BLK
+    t = np.arange(n) / SR
+    mono = (0.05 * np.sin(2 * np.pi * 1000.0 * t)).astype(np.float32)
+    for _ in range(60):
+        hiss = (rng.standard_normal(n) * 0.15).astype(np.float32)
+        dsp._update_stereo_nr((mono * 0.1 + hiss).astype(np.float32), mono)
+    print(f"[*] weak-field hissy: wiener_w={dsp._nr_s_w:.3f}")
+    assert dsp._nr_s_w > 0.5, "weak-field hiss missed (over-frozen)"
+    print("[OK] weak-field hiss still suppressed")
+
+
 def main() -> int:
     try:
         test_hf_only_clean()
         test_legit_hiss_still_caught()
         test_silence_bounded()
+        test_weak_field_hiss_not_frozen()
     except AssertionError as e:
         print(f"FAILED: {e}")
         return 1

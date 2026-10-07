@@ -192,7 +192,10 @@ class SdrDspPipeline(DspBlackMagicMixin, DspAmMixin, DspNfmMixin,
         self._init_bm_state()
 
         # ノイズフィルターモード ("clean", "wide", または "narrow")
-        self.filter_mode = "clean"
+        # 既定はwide開放。clean(8.5kHz)はノイズクリーナーであって既定の音では
+        # ない (非認知時に9kHz以上が-26〜-87dB削られる実害。FM改善案§3)。
+        # 弱電界の狭窄はHyper/Cascadeが担う。
+        self.filter_mode = "wide"
 
         # ===== Hyper連続認知制御パラメータ (Cascadeの離散切替を無段階モーフィングへ) =====
         self.cognitive_enabled = False
@@ -426,6 +429,7 @@ class SdrDspPipeline(DspBlackMagicMixin, DspAmMixin, DspNfmMixin,
         # AM/SSBのAGCレベルは意図的に維持し音量ポンピングを避ける)
         try:
             self._mp_var = 0.0
+            self._mp_var_peak = 0.0
             self.multipath_amount = 0.0
             self.multipath_gain = 1.0
         except Exception:

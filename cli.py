@@ -86,7 +86,7 @@ def main():
     parser.add_argument("--gain", default="auto", help="ゲイン (auto/hyper [自律最適化] / cascade [従来版] / 数値dB)")
     parser.add_argument("--controller", default="hyper", choices=["hyper", "cascade"], help="自律最適化エンジン種別")
     parser.add_argument("--vol", type=float, default=0.7, help="音量 (0.0〜1.0)")
-    parser.add_argument("--filter", default="clean", choices=["clean", "wide", "narrow"], help="ノイズフィルタ (wide / clean / narrow)")
+    parser.add_argument("--filter", default="wide", choices=["clean", "wide", "narrow"], help="ノイズフィルタ (wide / clean / narrow)")
     parser.add_argument("--dx", action="store_true", help="DX超高感度モード（微弱局用：狭帯域IF＋最大ゲイン＋音声ノイズカット）")
     args = parser.parse_args()
 
