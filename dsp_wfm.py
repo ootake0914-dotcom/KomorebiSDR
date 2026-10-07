@@ -1022,23 +1022,12 @@ class DspWfmMixin:
             # per-frameの平滑・マスキング行列(43×10 numpy呼出≒5ms)を丸ごと省略。
             # _wf_p/_wf_gは凍結するが、復帰時は0.5重みで数フレーム(10ms)で再収束する。
             if sw < 0.02:
+                # クリーン時はゲイン=1のSTFT往復のみ (遅延保存のため。
+                # 往復はCOLAで数値誤差のみ)。旧実装はここでパイロット
+                # lock時にSide 10kHz超へ-1.5dBを常時適用していたが、
+                # 透明性最優先の監査により撤去 (クリーン時のNR on/offは
+                # 一致が要件。ヒス実在時は下段Wienerが担当する)。
                 gmix = np.ones_like(specs, dtype=np.float32)
-                # 強電界マイクロトリム: パイロットロック時のみ差信号10kHz超へ
-                # -1.5dB (実機83.2MHzでS床-16.6→-18.0dBを確認、波形相関0.99維持)。
-                # STFT域のため群遅延は補償済み。1k/5k分離トーン・19k抑圧に無影響で
-                # 透明性テスト (clean差分<0.05・分離度-18dB) のマージン内に収まる。
-                try:
-                    _lock = abs(float(getattr(self, "stereo_pilot_lock", 0.0)))
-                except Exception:
-                    _lock = 0.0
-                if _lock > 0.5 and self.stereo_nr_enabled:
-                    _mt = getattr(self, "_wf_micro_mask", None)
-                    if _mt is None or len(_mt) != gmix.shape[1]:
-                        _bins = np.fft.rfftfreq(self._wf_n, 1.0 / float(self.audio_rate))
-                        _mt = (_bins > 10000.0)
-                        self._wf_micro_mask = _mt
-                    if bool(np.any(_mt)):
-                        gmix[:, _mt] = np.float32(0.841)
                 self.stereo_wiener_gain = 1.0
             else:
                 powers = np.abs(specs) ** 2 + 1e-12
@@ -1997,9 +1986,14 @@ class DspWfmMixin:
         self._nr_guard_k = 15.0
         self._nr_k_hits = 0  # Kガード持続性カウンタ (4連続でクリーンへ)
         self._nr_cut_levels = np.array([2500.0, 4000.0, 6500.0, 10000.0, 15000.0])
+        # 最上位 (15000) の実フィルタは -6dB@16.5kHz。放送帯域は15kHzまで
+        # なのに -6dB点を15kHzに置くと 14k -0.4dB / 15k -6dB となり、
+        # クリーン時のNR on/off透明性を壊していた (超慎重監査)。上位は
+        # 音声系fir_audio_wideと同じ16.5kで「開」を平坦化する。
+        self._nr_filter_cutoffs = (2500.0, 4000.0, 6500.0, 10000.0, 16500.0)
         self._nr_filters = [
             design_fir_kaiser(num_taps=65, cutoff_norm=float(c) / self.audio_rate, beta=6.5)
-            for c in self._nr_cut_levels
+            for c in self._nr_filter_cutoffs
         ]
         self.history_nr_lp = np.zeros(64, dtype=np.float32)
         self._nr_delay = (len(self._nr_filters[0]) - 1) // 2  # 線形位相FIRの群遅延
