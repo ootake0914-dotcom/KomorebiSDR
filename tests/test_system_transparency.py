@@ -142,7 +142,46 @@ def test_clean_tonal_music_transparent():
     assert d._nr_cut_eff >= 14900.0
     assert not list(d.sic_detected_spurious)
     assert d.is_stereo
+    assert d._nr_hiss_gate < 0.05, "clean field must show no hiss evidence"
     print("[OK] tonal music system-transparent")
+
+
+def test_resampler_bit_transparent_at_zero_drift():
+    """ドリフト≈0では分数補間せず、入力をそのまま返す (ビット透過)。"""
+    from dsp_resampler import AdaptiveDriftResampler
+    r = AdaptiveDriftResampler()
+    r.update_feedback(8.0)  # 不感帯中央 → ratio 1.0
+    assert r.current_ratio == 1.0
+    rng = np.random.default_rng(1)
+    for stereo in (False, True):
+        x = (rng.standard_normal((2752, 2) if stereo else 2752)
+             * 0.5).astype(np.float32)
+        y = r.process(x)
+        assert np.array_equal(y, x), \
+            f"resampler altered clean audio (stereo={stereo})"
+    print("[OK] resampler bit-transparent at zero drift")
+
+
+def test_bss_gate_transparent():
+    """BSSはhiss_gate=0で遅延素通し (透明) になること。
+
+    原理ゲート: 帯域外プローブがヒス無しを示す場では、BSSの抑圧を
+    無効化して入力の24サンプル遅延コピーを返す (独立L/R番組の
+    デコリレート成分をヒスと誤認しない)。"""
+    from adaptive_stereo import SuperSpatialBssStereoSeparator
+    rng = np.random.default_rng(3)
+    n = 2752
+    l = rng.standard_normal(n).astype(np.float64) * 0.3
+    r = rng.standard_normal(n).astype(np.float64) * 0.3
+    b = SuperSpatialBssStereoSeparator(sample_rate=48000.0)
+    out_l, out_r = b.process(l.copy(), r.copy(), stereo_blend=1.0,
+                             hiss_gate=0.0)
+    d = int(b.delay)
+    # 素通し (遅延d) との一致を確認 (履歴ゼロ初期なので末尾のみ有効)
+    err = float(np.max(np.abs(out_l[d:] - l[:-d])))
+    print(f"[*] BSS gate=0 passthrough max err={err:.2e} (delay={d})")
+    assert err < 1e-6, f"BSS gate=0 not transparent ({err:.2e})"
+    print("[OK] BSS gate transparency")
 
 
 def test_clean_independent_noise_transparent():
@@ -161,6 +200,8 @@ def main() -> int:
         test_clean_tonal_music_transparent()
         test_clean_independent_noise_transparent()
         test_non_cognitive_path_transparent()
+        test_resampler_bit_transparent_at_zero_drift()
+        test_bss_gate_transparent()
     except AssertionError as e:
         print(f"FAILED: {e}")
         return 1

@@ -156,9 +156,15 @@ class SuperSpatialBssStereoSeparator:
         self.hist_m.fill(0)
         self._tonal = 0.0
 
-    def process(self, l_audio: np.ndarray, r_audio: np.ndarray, stereo_blend: float = 1.0) -> tuple:
+    def process(self, l_audio: np.ndarray, r_audio: np.ndarray,
+                stereo_blend: float = 1.0, hiss_gate: float = 1.0) -> tuple:
         """
         L/Rオーディオ配列を受け取り、BSS分離によりヒスノイズ低減を試みた (L, R) を返す。
+
+        hiss_gate: ヒス実在の確度 (0..1)。0で抑圧を完全に無効化し、
+        内部遅延 (delayサンプル) だけの素通しへ連続的に戻す
+        (帯域外ヒス・プローブ由来。ノイズ床の実在証拠が無い場では
+        番組のデコリレート成分をヒスと誤認しないための透明性ゲート)。
         """
         if not self.enabled or len(l_audio) == 0 or stereo_blend < 0.05:
             return l_audio, r_audio
@@ -234,8 +240,10 @@ class SuperSpatialBssStereoSeparator:
         self._tonal = float(getattr(self, "_tonal", 0.0)) + a_t * (tonal - float(getattr(self, "_tonal", 0.0)))
         gain_hf = float(1.0 - (1.0 - self._tonal) * (1.0 - gain_hf))
 
-        # ブレンド量と連動
-        effective_gain = 1.0 - float(stereo_blend) * (1.0 - gain_hf)
+        # ブレンド量と連動。hiss_gate=0 で effective_gain=1 →
+        # s_lp + s_hp*1 = s_d となり遅延素通し (透明)。
+        effective_gain = 1.0 - (float(stereo_blend) * (1.0 - gain_hf)
+                                * float(np.clip(hiss_gate, 0.0, 1.0)))
 
         # 4. Side高域ノイズの直交相殺 (遅延系で一貫: s_lp + s_hp = s_d)
         s_clean = (s_lp + s_hp * effective_gain).astype(np.float32)

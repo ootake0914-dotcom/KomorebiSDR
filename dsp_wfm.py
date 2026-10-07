@@ -270,10 +270,14 @@ class DspWfmMixin:
                 left, right = self._mid_side_mono_nr(left, right)
 
             # BSSステレオ分離器 (FastICA。差信号中の逆相寄りヒスノイズ低減)
+            # hiss_gate: 帯域外プローブ (15.5-16.4kにヒス証拠が無い場) で
+            # 抑圧を原理的に無効化し、番組デコリレート成分の誤抑圧を防ぐ。
             if (getattr(self, "bss_separator", None) is not None
                     and self.bss_separator.enabled
                     and (self.cognitive_enabled or getattr(self, "bss_always", False))):
-                left, right = self.bss_separator.process(left, right, stereo_blend=self._stereo_blend)
+                left, right = self.bss_separator.process(
+                    left, right, stereo_blend=self._stereo_blend,
+                    hiss_gate=float(getattr(self, "_nr_hiss_gate", 1.0)))
 
             if ultra_gain < 0.999:
                 left = left * ultra_gain
@@ -905,6 +909,7 @@ class DspWfmMixin:
             hiss_gate = _gx * _gx * (3.0 - 2.0 * _gx)
         except Exception:
             hiss_gate = 1.0
+        self._nr_hiss_gate = float(hiss_gate)  # BSS透明性ゲートへ共有
         if hiss_gate < 1.0:
             s_b *= hiss_gate
             s_w *= hiss_gate
@@ -2006,6 +2011,7 @@ class DspWfmMixin:
         # 原理的に動かない (条件付きガードのため)。
         self._nr_guard_k = 15.0
         self._nr_k_hits = 0  # Kガード持続性カウンタ (4連続でクリーンへ)
+        self._nr_hiss_gate = 1.0  # 帯域外ヒス・プローブ由来の透明性ゲート
         self._nr_cut_levels = np.array([2500.0, 4000.0, 6500.0, 10000.0, 15000.0])
         # 最上位 (15000) の実フィルタは -6dB@16.5kHz。放送帯域は15kHzまで
         # なのに -6dB点を15kHzに置くと 14k -0.4dB / 15k -6dB となり、
