@@ -634,6 +634,14 @@ class DspWfmMixin:
             a_mf = 1.0 - np.exp(-dt / 2.5)
             self._nr_mf_smooth += a_mf * (mf - self._nr_mf_smooth)
         mf = self._nr_mf_smooth
+        # 分母飽和ガード: 300-3kHz番組が前回ノイズ床-20dB未満なら比は不定。
+        # 高域のみの番組 (管楽器高音・シンバル・拍手) でヒス推定が非物理値
+        # (+40dB級) に発散しNRが全閉する実害の修正。推定全体を凍結し
+        # (前回値保持)、履歴への学習も止めて番組HFを床と誤学習しない。
+        # 初回 (床未確定) は素通しする。
+        if (self._nr_primed and self._nr_floor_pow > 0.0
+                and mf < self._nr_floor_pow * 0.01):
+            return
         # ノイズフロア推定: ~10秒履歴の下位10%を使い、番組自身の高域成分ではなく
         # 定常的に存在するとヒス成分のみを検出する (明るい音楽での過剰なNRを防止)
         self._nr_hist.append(hf)
@@ -666,12 +674,19 @@ class DspWfmMixin:
                 -float(self._nr_snr_penalty_db) * (1.0 - _rel) / 10.0)
         self._nr_floor_pow = floor
         ratio_db = 10.0 * np.log10((floor + 1e-12) / (mf + 1e-12))
+        # ベルト兼用クランプ: 白色雑音でも+5dB程度が上限のため+12dB、
+        # 下側は実測クリーン (-78dB) に余裕を見て-80dB。
+        ratio_db = float(np.clip(ratio_db, -80.0, 12.0))
 
         dt = len(diff) / self.audio_rate
         if not self._nr_primed:
-            # 初回は実測値で即座に初期化 (起動直後のランプを排除)
+            # 初回は実測値で即座に初期化 (起動直後のランプを排除)。
+            # ただし初回から不定比 (高域のみ信号) の場合はクリーン既定へ。
             self._nr_primed = True
-            self.stereo_hiss_db = ratio_db
+            if floor > 0.0 and mf < floor * 0.01:
+                self.stereo_hiss_db = -60.0
+            else:
+                self.stereo_hiss_db = ratio_db
         else:
             a = 1.0 - np.exp(-dt / 0.35)
             self.stereo_hiss_db += a * (ratio_db - self.stereo_hiss_db)
