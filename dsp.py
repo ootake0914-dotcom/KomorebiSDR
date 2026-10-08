@@ -603,10 +603,10 @@ class SdrDspPipeline(DspBlackMagicMixin, DspAmMixin, DspNfmMixin,
         dither: bool = None,
     ):
         """
-        高級オーディオ処理の動的設定。
+        オーディオ処理 (apodizer/DC servo/dither) の動的設定 (いずれも既定OFF)。
         :param apodizing: 最小位相アポダイジングフィルタ (インパルス応答のプリリンギング低減)
         :param dc_servo: 位相回転の少ないDCサーボ (20Hz〜300Hzの低域位相歪み抑制)
-        :param dither: TPDFディザー & 音響心理ノイズシェーピング (16bit量子化歪み・階段歪み排除)
+        :param dither: TPDFディザー & 音響心理ノイズシェーピング (16bit量子化歪みの低減)
         """
         if dc_servo is not None:
             self.dc_servo.enabled = bool(dc_servo)

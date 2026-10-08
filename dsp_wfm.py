@@ -1868,7 +1868,7 @@ class DspWfmMixin:
         # 高域高調波補完エキサイター (Harmonic Exciter: 15kHz以上の高域倍音付加)
         # NOTE: 実機実測(ラッキーFM 94.6MHz 強電界)で無音時の12-15kHzを+18.7dB
         # 持ち上げ、静かな場面に合成ヒスが乗ることを確認したため既定OFF。
-        # 再有効化は .enabled=True (弱局で空気感を出したい場合のみ推奨)。
+        # 再有効化は .enabled=True (既定OFF。HF倍音を付加するため原音は変わる)。
         self.holographic_enhancer = HolographicAudioEnhancer(sample_rate=self.audio_rate, air_gain=0.08)
         self.holographic_enhancer.enabled = False
 

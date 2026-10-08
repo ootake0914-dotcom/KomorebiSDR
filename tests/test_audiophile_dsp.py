@@ -1,9 +1,9 @@
 """
 Unit tests for audiophile_dsp.py
-高級オーディオ数理モジュールの単体検証テスト。
-1. TPDFディザー＆音響心理ノイズシェーピングによる微小信号量子化歪みの消滅
-2. 最小位相アポダイジング変換によるプリリンギング（予兆波紋）の完全消滅
-3. アクティブDCサーボによる可聴低域位相回転ゼロ・直流完全相殺
+オーディオ数理モジュール (dither/apodizer/DC servo) の単体検証テスト。
+1. TPDFディザー＆音響心理ノイズシェーピングによる微小信号量子化歪みの低減
+2. 最小位相アポダイジング変換によるプリリンギング（予兆波紋）の低減
+3. アクティブDCサーボによる可聴低域位相回転の低減・直流除去
 """
 
 import os
@@ -174,7 +174,7 @@ def test_pipeline_audiophile_integration():
     audio, spec = pipeline.process(raw_dummy, mode="WFM")
     assert audio is not None
     assert len(audio) > 0
-    print("[OK] SdrDspPipeline への高級オーディオ統合テスト成功")
+    print("[OK] SdrDspPipeline へのオーディオモジュール統合テスト成功")
 
 
 if __name__ == "__main__":
