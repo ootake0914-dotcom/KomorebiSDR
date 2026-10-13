@@ -112,6 +112,11 @@ except ImportError:
     AdaptiveNotchCanceller = None
 
 
+# スローAGC (局間音量レベリング) の既定ON/OFF。強い曲で音量の動きを避けたい場合は False にする。
+# False では音量は一切動かず、音声経路は AGC 段を素通しする (透明性優先)。
+SLOW_AGC_DEFAULT = True
+
+
 class SdrDspPipeline(DspBlackMagicMixin, DspAmMixin, DspNfmMixin,
                        DspWfmMixin):
     """低ノイズ SDR 信号処理パイプライン"""
@@ -264,7 +269,7 @@ class SdrDspPipeline(DspBlackMagicMixin, DspAmMixin, DspNfmMixin,
         # レベル差だけを均す: 時定数は秒〜十秒オーダー、範囲は±6dBに制限。
         # 短い時定数・広い範囲にすると番組ダイナミクスを潰してパンピング
         # (サビが小さく・出頭が爆音に) するため厳禁)
-        self.slow_agc_enabled = True
+        self.slow_agc_enabled = SLOW_AGC_DEFAULT
         self.slow_agc_target = 0.10      # 目標RMS (-20dBFS)
         self.slow_agc_min = 0.5          # -6dB (過大局の絞り)
         self.slow_agc_max = 2.0          # +6dB (微弱局の持ち上げ上限)

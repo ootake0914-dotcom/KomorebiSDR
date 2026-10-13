@@ -79,6 +79,9 @@ class AudioOutput:
         self.overflow_count = 0
         self.callback_errors = 0
         self.status_underflows = 0
+        # ルックアヘッドリミッタ発動統計 (音量前0.98閾値の効き具合の要否判断用)
+        self.limiter_total_blocks = 0
+        self.limiter_hot_blocks = 0
         self.total_callbacks = 0
         self.total_frames_played = 0
         self.callback_us_max = 0.0
@@ -175,7 +178,9 @@ class AudioOutput:
             # キューが空なら再プレロール(3チャンク)して小刻みなバタつきを防止
             if self.audio_queue.empty() and len(self.remainder) == 0:
                 self.is_prerolled = False
-                self.preroll_threshold = 3
+                # 再プレロールを3→既定値(5)へ。浅い水位で再開すると連続アンダーラン
+                # (ブツッ・ブツブツ音) を起こしやすいため、クッションを戻してから再生する
+                self.preroll_threshold = self._preroll_default
 
         data = scratch[:frames]
 
@@ -451,6 +456,27 @@ class AudioOutput:
         self.is_running = False
         return False
 
+    def _check_underrun_log(self):
+        """アンダーラン増加を検出し、時刻付きで underrun_log.txt へ追記する。
+        監視スレッドから呼ぶ (リアルタイムのオーディオコールバックには触れない)。
+        音声サンプルは一切変更しないため、透明性には影響しない。"""
+        try:
+            cur = int(self.underrun_count)
+            last = getattr(self, "_ur_logged", 0)
+            if cur > last:
+                import datetime
+                import os
+                path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                    "underrun_log.txt")
+                with open(path, "a", encoding="utf-8") as f:
+                    f.write(f"{datetime.datetime.now().isoformat(timespec='seconds')} "
+                            f"underrun +{cur - last} (total {cur}, "
+                            f"queue {self.audio_queue.qsize()}, "
+                            f"preroll {self.preroll_threshold})\n")
+            self._ur_logged = cur
+        except Exception:
+            pass
+
     def _start_device_watch(self):
         """Windows既定再生デバイスを監視し、変更時にストリームを再オープンする。
         - 既定デバイス名の変化 (Headphones⇔Speakers)
@@ -518,6 +544,7 @@ class AudioOutput:
                             self._reopened_for_name = name
                 except Exception:
                     pass
+                self._check_underrun_log()
                 # 0.5秒間隔 (Core Audioクエリ約10ms。抜き差し検出の遅延を最小化)
                 stop_ev.wait(0.5)
 
@@ -586,7 +613,9 @@ class AudioOutput:
         except Exception:
             pass
         self.is_prerolled = False
-        self.preroll_threshold = 3
+        # 再プレロールと同じ既定値で再開する。浅い水位(旧3)で始めると選局直後の
+        # 処理過渡と重なって連続アンダーランしやすいため (再プレロール側と同一理由)
+        self.preroll_threshold = self._preroll_default
         self._needs_fade_in = True
 
     def _lookahead_limit(self, arr: np.ndarray) -> np.ndarray:
@@ -601,6 +630,13 @@ class AudioOutput:
         n = len(arr)
         if n == 0:
             return arr
+        # 発動判定: 窓maxの最大値は遅延線+入力の最大絶対値に等しいため、
+        # いずれかが閾値を超えればホットパスに入る (C/純Python両経路共通)。
+        # 音声サンプルは一切変えない (カウンタのみ)。
+        self.limiter_total_blocks += 1
+        if (bool(np.max(np.abs(arr)) > self._lim_thr)
+                or bool(np.max(np.abs(self._lim_delay)) > self._lim_thr)):
+            self.limiter_hot_blocks += 1
         try:
             import dsp_native as _dn
             if (_dn._NATIVE is not None and _dn.NATIVE_LOOKAHEAD
@@ -706,6 +742,8 @@ class AudioOutput:
             "fill_ratio": self.get_buffer_fill_ratio(),
             "underrun_count": self.underrun_count,
             "overflow_count": self.overflow_count,
+            "limiter_total_blocks": self.limiter_total_blocks,
+            "limiter_hot_blocks": self.limiter_hot_blocks,
             "total_callbacks": self.total_callbacks,
             "total_frames_played": self.total_frames_played,
         }

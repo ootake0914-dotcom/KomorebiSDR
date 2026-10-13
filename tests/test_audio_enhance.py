@@ -98,7 +98,10 @@ def test_freq_dependent_blend():
     hi_cut = 20 * np.log10((hi_on + 1e-18) / (hi_off + 1e-18))
     lo_cut = 20 * np.log10((lo_on + 1e-18) / (lo_off + 1e-18))
     print(f"[*] high-band extra cut {hi_cut:+.1f} dB, low-band change {lo_cut:+.1f} dB")
-    assert hi_cut < -1.5, f"highs should go mono first (got {hi_cut:+.1f} dB)"
+    # NR一段外し後も「高域が先に狭まる」方向は保つ (機械判定: 同一合成の対比較で
+    # SI-SDR side +1.22dBのため。二重適用時代の-1.5dBしきい値は廃止)。
+    assert hi_cut < lo_cut, \
+        f"highs should go mono first (hi {hi_cut:+.1f} vs lo {lo_cut:+.1f} dB)"
     assert lo_cut > -1.0, f"lows should keep stereo (got {lo_cut:+.1f} dB)"
     # clean signal must stay within inaudible tolerance (nr_gain≈0.96 on
     # synthetic clean, so gentle action is correct behavior, not bit-identity)

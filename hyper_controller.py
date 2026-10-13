@@ -670,21 +670,30 @@ class HyperController:
                 if_bw = min(if_bw, 145000.0)
             # 強電界では番組内容に関係なく帯域を開く: C/Nが十分なら
             # 狭帯域化で隠すヒスが無く、絞る理由がない (呼吸の主因対策)。
+            # 下限15kHzは出力段の素通し域 (applied>=14800でFIR平坦遅延) に
+            # 入るため、上端まで減衰なく開放できる。
             _fw = float(np.clip((sig_c - 0.85) / 0.15, 0.0, 1.0))
             _fw = _fw * _fw * (3.0 - 2.0 * _fw)
-            cutoff = max(cutoff, 13000.0 * _fw)
+            cutoff = max(cutoff, 15000.0 * _fw)
 
         # 帯域別バイアス自動選択 (第2段): 学習済み弱電界帯のみ到達点を
         # 少し狭め寄せする。手動override時は尊重し適用しない。
         # 未学習時は0.0のため従来動作と完全同一 (テスト互換)。
+        # WFM強電界ではバイアスを無効化する: bias_hzのゲートは帯域の長期平均
+        # のため、普段弱い帯域では強い局にも負バイアスが掛かり、直上の強電界
+        # 下限を割り込む (_fwはWFM分岐でのみ定義されるため他モードは従来通り)。
+        _bias = 0.0
         if not self.filter_override:
             try:
                 _prof = getattr(self, "band_profiler", None)
                 _bk = getattr(self, "_last_band", None)
                 if _prof is not None and _bk:
-                    cutoff += float(_prof.bias_hz(_bk))
+                    _bias = float(_prof.bias_hz(_bk))
+                    if mode == "WFM":
+                        _bias *= (1.0 - _fw)
+                    cutoff += _bias
             except Exception:
-                pass
+                _bias = 0.0
 
         if self.filter_override == "wide":
             cutoff = 15000.0
@@ -715,6 +724,18 @@ class HyperController:
                 rate = 8000.0 if abs(delta) > 3000.0 else 4000.0
                 step = rate * dt
                 cutoff = prev + float(np.clip(delta, -step, step))
+
+        # 診断用スナップショット (cutoff内訳の切り分け用。制御には不使用)。
+        # 11.3kHz中央値問題の原因特定 (式項/bias/floorのどれで決まったか) に使う。
+        try:
+            self._dbg_map = {
+                "s": float(s), "sig_c": float(sig_c), "sig_a": float(sig_a),
+                "fw": float(_fw) if mode == "WFM" else 0.0,
+                "bias_hz": float(_bias),
+                "cutoff_hz": float(cutoff),
+            }
+        except Exception:
+            pass
 
         self.target_cutoff_hz = cutoff
         self.target_hf_gain = hf

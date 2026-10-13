@@ -227,7 +227,11 @@ class DspWfmMixin:
                 self._update_stereo_trim(diff_raw, mono)
                 if self.stereo_nr_enabled:
                     cut = self._nr_cut_eff
-                    blend = self._stereo_blend * self.stereo_nr_gain
+                    # nr_gainは_freq_dependent_blend内で高域に掛かるため
+                    # ここでは掛けない (掛けると高域がnr^3になる)。
+                    # 機械判定 (SI-SDR side +1.2dB、Scoreq MOS向上、同一合成の
+                    # 対比較) で一段外しが勝ったため。mp/aciはここで折り込む。
+                    blend = self._stereo_blend
                     blend *= self.multipath_gain * self.aci_gain
                     diff = self._diff_lowpass(diff_raw, cut)
                     diff = self._wiener_diff(diff)

@@ -10,6 +10,8 @@ FM復調系の適応モジュール群の正準の保持場所:
 `adaptive_dsp.py` は後方互換のため同名を再エクスポートする。
 """
 
+import math
+
 import numpy as np
 
 
@@ -24,8 +26,14 @@ class DeepSpaceEkfDemodulator:
 
     def __init__(self, sample_rate: float = 288000.0,
                  q_theta: float = 1e-4, q_omega: float = 0.08, r_obs: float = 0.35,
-                 huber_delta: float = 0.65):
+                 huber_delta: float = 1.0):
         self.sample_rate = float(sample_rate)
+        # Huber閾値。innovation は単位円の外積 sin(位相誤差) のため |err| ≤ 1 で、
+        # 1.0 以上ではクランプが働かない (実質無効)。旧値 0.65 は約40°超の正当な
+        # 位相変化まで抑え、偏移40kHz・C/N 15〜20dB で 14kHz の振幅を約-17dB 減衰
+        # (通常復調比)、10-15kHz の SNR を約20dB 悪化させていた。クリック抑圧は
+        # 閾値によらずEKF追従自体が担い、インパルス/バースト試験の |y|>0.8 個数は
+        # 同等以下。ただし強いバースト時の最大値は増える (1.42→1.62 rad/sample、plainは3.10)。
         self.huber_delta = float(huber_delta)
 
         # 状態変数 [theta (位相), omega (瞬時周波数偏移)]
@@ -54,7 +62,6 @@ class DeepSpaceEkfDemodulator:
             return np.zeros(0, dtype=np.float32)
 
         n = len(iq_samples)
-        out_demod = np.empty(n, dtype=np.float32)
 
         th = float(self.theta)
         om = float(self.omega)
@@ -62,11 +69,17 @@ class DeepSpaceEkfDemodulator:
         k_om = float(self.k_omega)
         delta = float(self.huber_delta)
         two_pi = 2.0 * np.pi
+        pi = float(np.pi)
 
         # 複素サンプルの正規化 (振幅変動の影響を遮断)
         mags = np.abs(iq_samples) + 1e-12
-        i_norm = (np.real(iq_samples) / mags).astype(np.float64)
-        q_norm = (np.imag(iq_samples) / mags).astype(np.float64)
+        # 逐次ループ内の np.cos/np.sin とNumPyスカラー演算が遅く、1ブロック約70msで
+        # 実時間(57.3ms)を超えていた。Python float と math に置換 (数式は同一)。
+        i_list = (np.real(iq_samples) / mags).astype(np.float64).tolist()
+        q_list = (np.imag(iq_samples) / mags).astype(np.float64).tolist()
+        cos = math.cos
+        sin = math.sin
+        out = [0.0] * n
 
         for i in range(n):
             # 1. 状態予測 (Time Update / Prediction)
@@ -74,26 +87,21 @@ class DeepSpaceEkfDemodulator:
             om_pred = 0.9995 * om  # 音声信号の連続性事前分布
 
             # 位相ラップ正規化 (-pi 〜 +pi)
-            th_pred = (th_pred + np.pi) % two_pi - np.pi
+            th_pred = (th_pred + pi) % two_pi - pi
 
-            # 2. 観測残差 (イノベーション) の計算
-            cos_th = np.cos(th_pred)
-            sin_th = np.sin(th_pred)
-            # 複素外積による瞬時位相誤差
-            err = q_norm[i] * cos_th - i_norm[i] * sin_th
+            # 2. 観測残差 (イノベーション): 複素外積による瞬時位相誤差
+            err = q_list[i] * cos(th_pred) - i_list[i] * sin(th_pred)
 
             # 3. ロバストHuber M推定器による位相スリップ (クリックスパイク) 阻止
             # 巨大なノイズ外れ値でカルマンゲインが暴走するのを防ぐ
             if err > delta:
-                err_robust = delta
+                err = delta
             elif err < -delta:
-                err_robust = -delta
-            else:
-                err_robust = err
+                err = -delta
 
             # 4. カルマン状態更新 (Measurement Update)
-            th = th_pred + k_th * err_robust
-            om = om_pred + k_om * err_robust
+            th = th_pred + k_th * err
+            om = om_pred + k_om * err
             # 発散防止: 瞬時偏移を物理上限 (±75kHz@288k=1.64radに余裕を見て±2.0) で
             # クランプ。他復調器はdev_limitでクランプ済み、ここだけ無防備だった。
             if om > 2.0:
@@ -102,11 +110,11 @@ class DeepSpaceEkfDemodulator:
                 om = -2.0
 
             # 5. 最小平均二乗誤差 (MMSE) 瞬時周波数偏移を出力
-            out_demod[i] = om
+            out[i] = om
 
-        self.theta = float((th + np.pi) % two_pi - np.pi)
+        self.theta = float((th + pi) % two_pi - pi)
         self.omega = float(om)
-        return out_demod
+        return np.asarray(out, dtype=np.float32)
 
 
 class KalmanPilotTracker:

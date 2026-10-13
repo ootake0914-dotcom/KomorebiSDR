@@ -7,9 +7,11 @@
 検証:
 1) 強信号で聴感SNRが激しく振れても target_cutoff が安定 (遅いEMA＋
    不感帯＋スルーレート)
-2) 強信号ではカットオフ下限13kHzが効く (C/N十分で絞る理由がない)
+2) 強信号ではカットオフ下限15kHzが効く (C/N十分で絞る理由がない)
 3) 弱信号へは数秒で狭窄側へ適応する (鈍らせても追従は死なない)
 4) 手動overrideは即時反映 (遅延を入れない)
+5) 学習バイアスは強電界で無効・弱電界で有効 (帯域平均SNR<8の-1500Hzが
+   強電界下限を割り込まないこと)
 """
 
 import os
@@ -18,7 +20,9 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import numpy as np
+import time as _time
 import hyper_controller as hc_mod
+from antenna_profiler import AntennaProfiler
 from dsp import SdrDspPipeline
 from hyper_controller import HyperController
 
@@ -76,10 +80,10 @@ def test_strong_stable() -> bool:
     tail = np.asarray(vals[300:])
     std = float(np.std(tail))
     p2p = float(np.max(tail) - np.min(tail))
-    floor_ok = float(np.min(tail)) >= 13000.0
+    floor_ok = float(np.min(tail)) >= 14500.0
     ok = std < 150.0 and p2p < 600.0
     print(f"[{'OK' if ok else 'FAIL'}] strong stable: std={std:.1f}Hz "
-          f"p2p={p2p:.0f}Hz floor13k={floor_ok} "
+          f"p2p={p2p:.0f}Hz floor15k={floor_ok} "
           f"(need std<150, p2p<600)")
     return bool(ok and floor_ok)
 
@@ -141,11 +145,73 @@ def test_mode_switch_settles() -> bool:
     return ok
 
 
+def _inject_weak_band(hc, snr=3.0, n=50):
+    """帯域学習済みの弱電界バイアス (-937.5Hz) を注入する。
+    bias = -1500 * min(1, (8-3)/8)。_last_band='FM' (FM帯は単一キー)。"""
+    hc.band_profiler = AntennaProfiler()
+    hc.band_profiler.bands["FM"] = {"snr": float(snr), "floor": -20.0,
+                                    "n": int(n), "t": _time.time()}
+    hc._last_band = "FM"
+
+
+def test_strong_bias_ignored() -> bool:
+    """強電界 (s=40) では学習バイアスが無効で15kHzに張り付くこと。
+    旧動作では 15000-937.5=14062Hz になるため、14500以上で判別できる。"""
+    real_time = hc_mod.time.time
+    hc_mod.time.time = _FakeClock(0.0573).time
+    try:
+        dsp, hc = _make()
+        _inject_weak_band(hc)
+        hc.state_channel_snr = 40.0
+        hc.state_audio_snr = 30.0
+        for _ in range(400):
+            hc._map_continuous_parameters("WFM")
+        final = float(hc.target_cutoff_hz)
+        dbg = dict(getattr(hc, "_dbg_map", {}))
+        raw_bias = float(hc.band_profiler.bias_hz("FM"))
+    finally:
+        hc_mod.time.time = real_time
+    ok = final >= 14900.0
+    # 学習バイアス自体は -937.5Hz で存在し、適用時に重み0になること
+    ok &= abs(raw_bias + 937.5) < 1.0
+    ok &= abs(float(dbg.get("bias_hz", 999.0))) < 1.0
+    ok &= float(dbg.get("fw", 0.0)) > 0.99
+    print(f"[{'OK' if ok else 'FAIL'}] strong bias ignored: final={final:.0f}Hz "
+          f"(need >=14900) raw_bias={raw_bias:.1f}Hz applied={dbg.get('bias_hz', 0.0):.1f}Hz "
+          f"fw={dbg.get('fw', 0.0):.3f}")
+    return bool(ok)
+
+
+def test_weak_bias_applies() -> bool:
+    """弱電界 (s=5) ではバイアスが有効のまま (従来動作を保つ)。
+    式項のみなら約5865Hz、バイアス込みで約4928Hz になる。"""
+    real_time = hc_mod.time.time
+    hc_mod.time.time = _FakeClock(0.0573).time
+    try:
+        dsp, hc = _make()
+        _inject_weak_band(hc)
+        hc.state_channel_snr = 5.0
+        hc.state_audio_snr = 5.0
+        for _ in range(400):
+            hc._map_continuous_parameters("WFM")
+        final = float(hc.target_cutoff_hz)
+        dbg = dict(getattr(hc, "_dbg_map", {}))
+    finally:
+        hc_mod.time.time = real_time
+    ok = 4000.0 < final < 5600.0
+    ok &= float(dbg.get("fw", 1.0)) < 0.01
+    print(f"[{'OK' if ok else 'FAIL'}] weak bias applies: final={final:.0f}Hz "
+          f"(need 4000-5600) fw={dbg.get('fw', 0.0):.3f}")
+    return bool(ok)
+
+
 def main() -> int:
     ok = test_strong_stable()
     ok &= test_weak_adapts()
     ok &= test_override_immediate()
     ok &= test_mode_switch_settles()
+    ok &= test_strong_bias_ignored()
+    ok &= test_weak_bias_applies()
     print("OK" if ok else "FAILED")
     return 0 if ok else 1
 

@@ -5,6 +5,7 @@ Unit tests for adaptive_dsp.py
 
 import os
 import sys
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -518,12 +519,104 @@ def test_rmt_hankel_denoiser():
     print("[OK] ハンケル行列SVDノイズ除去テスト成功")
 
 
+def _ekf_reference_loop(demod, iq_samples):
+    """EKF逐次ループの参照実装 (高速化前のNumPyスカラー版)。数値等価性の検証用。"""
+    n = len(iq_samples)
+    out = np.empty(n, dtype=np.float32)
+    th, om = float(demod.theta), float(demod.omega)
+    k_th, k_om = float(demod.k_theta), float(demod.k_omega)
+    delta = float(demod.huber_delta)
+    two_pi = 2.0 * np.pi
+    mags = np.abs(iq_samples) + 1e-12
+    i_norm = (np.real(iq_samples) / mags).astype(np.float64)
+    q_norm = (np.imag(iq_samples) / mags).astype(np.float64)
+    for i in range(n):
+        th_pred = th + om
+        om_pred = 0.9995 * om
+        th_pred = (th_pred + np.pi) % two_pi - np.pi
+        err = q_norm[i] * np.cos(th_pred) - i_norm[i] * np.sin(th_pred)
+        err_robust = min(max(err, -delta), delta)
+        th = th_pred + k_th * err_robust
+        om = min(max(om_pred + k_om * err_robust, -2.0), 2.0)
+        out[i] = om
+    demod.theta = float((th + np.pi) % two_pi - np.pi)
+    demod.omega = float(om)
+    return out
+
+
+def test_ekf_fastpath_equivalence_and_budget():
+    print("\n===== test_ekf_fastpath_equivalence_and_budget =====")
+    fs = 288000.0
+    n = 16512  # 57.3 ms ブロック (288kHz IF)
+    rng = np.random.default_rng(7)
+    t = np.arange(3 * n) / fs
+    m = np.sin(2 * np.pi * 1000.0 * t) + 0.3 * np.sin(2 * np.pi * 9000.0 * t)
+    x = np.exp(1j * 2 * np.pi * 40000.0 * np.cumsum(m) / fs)
+    x = x + 0.1 * (rng.standard_normal(len(x)) + 1j * rng.standard_normal(len(x))) / np.sqrt(2)
+    spk = rng.choice(len(x), 60, replace=False)
+    x[spk] += 3.0 * (rng.standard_normal(60) + 1j * rng.standard_normal(60))
+    x = x.astype(np.complex64)
+
+    # 1. 数値等価性: 高速版 vs 参照版 (ブロック連続・内部状態を含む。クリックも含む)
+    fast = DeepSpaceEkfDemodulator(sample_rate=fs)
+    ref = DeepSpaceEkfDemodulator(sample_rate=fs)
+    worst = 0.0
+    for k in range(2):
+        blk = x[k * n:(k + 1) * n]
+        y_fast = fast.demodulate(blk).astype(np.float64)
+        y_ref = _ekf_reference_loop(ref, blk).astype(np.float64)
+        worst = max(worst, float(np.max(np.abs(y_fast - y_ref))))
+    print(f"[*] 高速版と参照版の最大差分: {worst:.2e}")
+    assert worst < 1e-6, f"EKF高速化で出力が変化しました: {worst:.2e}"
+    assert abs(fast.theta - ref.theta) < 1e-9 and abs(fast.omega - ref.omega) < 1e-9, \
+        "EKF内部状態が参照版と一致しません"
+
+    # 2. 実時間予算: 1ブロック (57.3ms) の半分以内 (中央値)。旧実装は約70ms/ブロック
+    times = []
+    for k in range(3):
+        blk = x[k * n:(k + 1) * n]
+        t0 = time.perf_counter()
+        fast.demodulate(blk)
+        times.append((time.perf_counter() - t0) * 1000.0)
+    med = float(np.median(times))
+    print(f"[*] EKF 1ブロック処理時間: 中央値 {med:.1f} ms (予算 57.3 ms の半分 = 28.7 ms)")
+    assert med < 28.7, f"EKFが実時間予算を超過しています: {med:.1f} ms/block"
+    print("[OK] EKF高速化: 出力一致・実時間予算内")
+
+
+def test_ekf_highband_response():
+    """弱電界・モノラルでEKFが高域を削らないこと (旧 Huber 閾値 0.65 では 14kHz が約-17dB)。"""
+    print("\n===== test_ekf_highband_response =====")
+    fs = 288000.0
+    n = 57600
+    k0 = 4000
+    dev = 40000.0
+    idx = np.arange(n)
+    t = idx / fs
+    nominal = 2.0 * np.pi * dev / fs  # 単位振幅トーンの理想出力 (rad/sample)
+    rng = np.random.default_rng(3)
+    for cn_db in (15.0, 20.0):
+        for f_tone in (10000.0, 14000.0):
+            m = np.sin(2.0 * np.pi * f_tone * t)
+            x = np.exp(1j * 2.0 * np.pi * dev * np.cumsum(m) / fs)
+            x = x + 10 ** (-cn_db / 20) * (rng.standard_normal(n) + 1j * rng.standard_normal(n)) / np.sqrt(2)
+            y = DeepSpaceEkfDemodulator(sample_rate=fs).demodulate(x.astype(np.complex64)).astype(np.float64)
+            a = 2.0 * abs(np.mean(y[k0:] * np.exp(-2j * np.pi * f_tone * idx[k0:] / fs)))
+            gain_db = 20.0 * np.log10(a / nominal)
+            print(f"[*] C/N {cn_db:.0f}dB, {f_tone / 1000:.0f}kHz トーン: EKF利得 {gain_db:+.1f} dB")
+            assert gain_db > -3.0, \
+                f"EKFが高域を減衰させています (C/N {cn_db:.0f}dB, {f_tone / 1000:.0f}kHz): {gain_db:+.1f} dB"
+    print("[OK] EKF高域応答: 10/14kHz とも -3dB 以内")
+
+
 if __name__ == "__main__":
     test_iq_imbalance_correction()
     test_ultrasonic_squelch()
     test_cognitive_speech_music_tracker()
     test_quadrature_mpx_canceller()
     test_deep_space_ekf_demodulator()
+    test_ekf_fastpath_equivalence_and_budget()
+    test_ekf_highband_response()
     test_kalman_pilot_tracker()
     test_holographic_audio_enhancer()
     test_riemannian_topological_demodulator()

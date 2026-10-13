@@ -107,8 +107,8 @@ def main() -> int:
     # キューを空にしてアンダーラン → 再プレロール → 復帰
     out = np.zeros((BLOCK, 2), dtype=np.float32)
     ao4._audio_callback(out, BLOCK, None, None)
-    # 再プレロール閾値(4)を満たすよう個別チャンクで4つ投入
-    for _ in range(4):
+    # 再プレロール閾値 (現行の既定値。アンダーラン後は既定値へ戻る) を満たすまで投入
+    for _ in range(ao4.preroll_threshold):
         put(ao4, np.full((BLOCK, 2), 0.5, dtype=np.float32))
     out = np.zeros((BLOCK, 2), dtype=np.float32)
     ao4._audio_callback(out, BLOCK, None, None)
