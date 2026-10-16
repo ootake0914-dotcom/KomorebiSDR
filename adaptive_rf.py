@@ -63,30 +63,63 @@ class AdaptiveIqCorrector:
                 return np.ascontiguousarray(iq_samples)
         except Exception:
             return iq_samples
-        si = np.real(st).astype(np.float32)
-        sq = np.imag(st).astype(np.float32)
+        si = np.real(st).astype(np.float64)
+        sq = np.imag(st).astype(np.float64)
         mean_i2 = float(np.mean(si * si))
         mean_q2 = float(np.mean(sq * sq))
-        mean_iq = float(np.mean(si * sq))
 
         # 2. 時間ベースの適応ステップ幅 (dt / tau)
         dt = n / self.sample_rate
         alpha = float(1.0 - np.exp(-dt / self.tau))
 
         # 微小信号（無信号・ノイズフロア付近）では補正係数の更新を凍結し、直前値で通過
-        if mean_i2 >= 1e-5 and mean_q2 >= 1e-5:
-            # 直交化係数の目標値: target_c = <I*Q> / <I^2>
-            target_c = mean_iq / (mean_i2 + 1e-12)
-            target_c = float(np.clip(target_c, -0.5, 0.5))
-            self.coeff_c += alpha * (target_c - self.coeff_c)
+        if mean_i2 >= 1e-5 and mean_q2 >= 1e-5 and len(si) >= 32:
+            # 現在の補正係数で直交化・振幅整合した Q_c と包絡線二乗 R^2 = I^2 + Q_c^2
+            # ゼロIFの角度変調波 (FM/PM) では上下側波帯がコヒーレント結合し E[z^2] != 0 となるため、
+            # 単純な2次モーメント法 (E[I^2]=E[Q^2], E[I*Q]=0) は変調波の非円対称性を
+            # 偽のIQインバランスとして誤学習し、2次高調波歪みとステレオ分離度劣化を引き起こす。
+            # 三角関数の恒等式 cos^2(theta) + sin^2(theta) = 1 に基づき、
+            # 包絡線二乗変動 R^2 / E[R^2] - 1 を 2倍角基底 u1=(I^2-Q_c^2)/R^2, u2=2*I*Q_c/R^2 に
+            # 2x2線形回帰することで、非円対称性 E[z^2] に一切影響されず真のIQインバランスのみを抽出する。
+            qc = (sq - self.coeff_c * si) * self.coeff_g
+            r2 = si * si + qc * qc
+            mean_r2 = float(np.mean(r2))
+            if mean_r2 > 1e-8:
+                inv_r2 = 1.0 / np.maximum(r2, mean_r2 * 1e-3)
+                u1 = (si * si - qc * qc) * inv_r2
+                u2 = (2.0 * si * qc) * inv_r2
+                r2_norm = r2 / mean_r2 - 1.0
 
-            # ゲイン整合係数の目標値: target_g = sqrt(<I^2> / <(Q')^2>)
-            # (Q'統計も間引きで同一期待値)
-            qp = sq - self.coeff_c * si
-            mean_q_prime2 = float(np.mean(qp * qp))
-            target_g = float(np.sqrt(mean_i2 / (mean_q_prime2 + 1e-12)))
-            target_g = float(np.clip(target_g, 0.5, 2.0))
-            self.coeff_g += alpha * (target_g - self.coeff_g)
+                u1_d = u1 - np.mean(u1)
+                u2_d = u2 - np.mean(u2)
+                r2_d = r2_norm - np.mean(r2_norm)
+
+                var_r2 = float(np.mean(r2_d * r2_d))
+                s11 = float(np.mean(u1_d * u1_d))
+                s22 = float(np.mean(u2_d * u2_d))
+                s12 = float(np.mean(u1_d * u2_d))
+                det = s11 * s22 - s12 * s12
+
+                if det > 1e-7:
+                    b1 = float(np.mean(r2_d * u1_d))
+                    b2 = float(np.mean(r2_d * u2_d))
+                    k1 = (s22 * b1 - s12 * b2) / det
+                    k2 = (-s12 * b1 + s11 * b2) / det
+
+                    # 2倍角モデルによる説明分散と残差包絡線分散の検証 (AM/SSBやマルチパス誤追従を防止)
+                    var_explained = k1 * b1 + k2 * b2
+                    var_res = max(0.0, var_r2 - var_explained)
+                    std_res = float(np.sqrt(var_res))
+                    r2_fit = var_explained / (var_r2 + 1e-12)
+
+                    if std_res < 0.20 and (r2_fit > 0.08 or (std_res < 0.005 and r2_fit > 0.02)):
+                        step = min(1.0, alpha * 2.5)
+                        self.coeff_c = float(
+                            np.clip(self.coeff_c + step * (k2 / max(self.coeff_g, 0.5)), -0.5, 0.5)
+                        )
+                        self.coeff_g = float(
+                            np.clip(self.coeff_g * (1.0 + step * 0.5 * k1), 0.5, 2.0)
+                        )
 
         # 3. 直交・振幅補正の適用 (フルレート・in-place・complex64直接)
         out = np.empty(n, dtype=np.complex64)

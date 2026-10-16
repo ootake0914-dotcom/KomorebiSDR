@@ -1962,10 +1962,10 @@ class DspWfmMixin:
         self._diff_gain_dev = None  # ピーク偏移推定 [Hz]
         self._diff_gain_f = 1.0     # 追従係数平滑値
         self._diff_gain_blank = 2   # 整定過渡ブランク
-        self._diff_gain_table = ((0.0, 1.000),
-                                 (46300.0, 1.000),
-                                 (54252.0, 1.015),
-                                 (67959.0, 1.030))
+        self._diff_gain_table = ((0.0, 0.9982),
+                                 (44000.0, 0.9991),
+                                 (54252.0, 1.0145),
+                                 (67900.0, 1.0304))
         # ===== ステレオノイズリダクション =====
         # 弱電界でステレオ化すると増えるヒスノイズを、(L-R)差信号の高域/中域パワー比から
         # 検出し、ノイズ量に応じて 1) サブバンドWiener抑圧 2) 可変ローパス
@@ -2034,8 +2034,11 @@ class DspWfmMixin:
         self._nr_filter_cutoffs = (2500.0, 4000.0, 6500.0, 10000.0, 16500.0)
         self._nr_filters = [
             design_fir_kaiser(num_taps=65, cutoff_norm=float(c) / self.audio_rate, beta=6.5)
-            for c in self._nr_filter_cutoffs
+            for c in self._nr_filter_cutoffs[:-1]
         ]
+        _nr_flat = np.zeros(65, dtype=np.float32)
+        _nr_flat[32] = 1.0
+        self._nr_filters.append(_nr_flat)
         self.history_nr_lp = np.zeros(64, dtype=np.float32)
         self._nr_delay = (len(self._nr_filters[0]) - 1) // 2  # 線形位相FIRの群遅延
 

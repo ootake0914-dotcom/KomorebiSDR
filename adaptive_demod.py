@@ -337,7 +337,18 @@ class TopologicalClickSuppressor:
                         dtheta.astype(np.float64))))
                     sums = cs[i1 + 1] - cs[i0]
                     resid = sums - 0.5 * (left + right) * k
-                    hit = keep & (np.abs(resid) > self.slip_thresh_rad)
+                    # 分岐切断 (±π) をまたいで折り返したスリップは区間和 sums が
+                    # 正負で相殺されるため、ディップ区間内に単発インパルスまたは
+                    # 過大跳躍が複数ある場合も区間全体を一括で補修対象にする
+                    # (1サンプルだけマスクすると逆極性の残差が巨大クリックになる)。
+                    over_cs = np.concatenate((
+                        [0],
+                        np.cumsum((np.abs(dtheta) > self.max_dtheta * 1.15).astype(np.int32)),
+                    ))
+                    n_over = over_cs[i1 + 1] - over_cs[i0]
+                    imp_cs = np.concatenate(([0], np.cumsum(impulse_mask.astype(np.int32))))
+                    has_imp = (imp_cs[i1 + 1] - imp_cs[i0]) > 0
+                    hit = keep & ((np.abs(resid) > self.slip_thresh_rad) | has_imp | (n_over >= 2))
                     # 区間塗りを差分配列でベクトル化 (ヒット数百の
                     # Pythonループで数msかかっていた)。
                     if np.any(hit):
