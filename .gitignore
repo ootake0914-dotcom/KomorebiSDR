@@ -15,6 +15,8 @@ dist/
 *.log
 *.csv
 *.db
+*_log.txt
+underrun_log.txt
 
 # OS / Editor generated
 .DS_Store
