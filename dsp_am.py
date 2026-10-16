@@ -83,7 +83,8 @@ class DspAmMixin:
             #    ピークであることが保証される。放物線補間で細分化し、
             #    位相はブロック跨ぎで連続させる (SSBの_ssb_bp_phaseと同型)。
             fs = float(self.if_rate)
-            Xs = np.fft.fft(iq)
+            # Hann窓で矩形窓のリークによる放物線補間バイアスを抑える
+            Xs = np.fft.fft(iq * np.hanning(n))
             fr = np.fft.fftfreq(n, 1.0 / fs)
             win = np.flatnonzero(np.abs(fr) <= 3000.0)
             mags = np.abs(Xs[win])
@@ -148,8 +149,12 @@ class DspAmMixin:
             # 分離が悪い (dirty 0.43)。不平衡はclean -0.4dB/dirty +2.5dBと
             # 分離良好 (合成条件での実測)。符号が汚染側を示す。
             # プログラム自体は鏡像対称のため、音楽・音声でも不平衡は出ない。
-            eUac = float(np.mean(np.abs(U - mU) ** 2)) + 1e-24
-            eLac = float(np.mean(np.abs(L - mL) ** 2)) + 1e-24
+            # 音声通過帯域 (100-4500Hz) のスペクトルパワーで評価する。
+            # 時間領域の全帯域平均では後段LPFで捨てる帯域外雑音が支配的になり、
+            # 妨害による不平衡と重み比が希釈されてしまう。
+            p_spec = (X.real * X.real + X.imag * X.imag) / (float(n) * float(n))
+            eUac = float(np.sum(p_spec[(freqs >= 100.0) & (freqs <= 4500.0)])) + 1e-24
+            eLac = float(np.sum(p_spec[(freqs <= -100.0) & (freqs >= -4500.0)])) + 1e-24
             imb_db = 10.0 * float(np.log10(eUac / eLac))
             if not np.isfinite(imb_db):
                 raise ValueError("non-finite imb")
@@ -207,8 +212,9 @@ class DspAmMixin:
                 wL = min(eLac, float(baseL)) / max(eLac, float(baseL))
             except Exception:
                 wU, wL = 0.5, 0.5
-            wU = float(min(max(wU, 0.2), 1.0))
-            wL = float(min(max(wL, 0.2), 1.0))
+            # 下限0.01 (最大100:1) 。誤判定時はdirty判定側のヒステリシスで有界化する。
+            wU = float(min(max(wU, 0.01), 1.0))
+            wL = float(min(max(wL, 0.01), 1.0))
             out_sb = (wU * aU + wL * aL) / (wU + wL)
             if not bool(np.all(np.isfinite(out_sb))):
                 raise ValueError("non-finite out_sb")

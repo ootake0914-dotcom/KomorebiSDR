@@ -2,10 +2,10 @@
   "version": 1,
   "full": true,
   "provenance": {
-    "date": "2026-10-16T18:49:43",
+    "date": "2026-10-16T20:35:29",
     "python": "3.11.15",
     "numpy": "1.26.4",
-    "git_head": "d19986d",
+    "git_head": "3ec7e16",
     "git_dirty": true,
     "faster_whisper": "1.2.1",
     "onnxruntime": "1.30.0",
@@ -13,11 +13,11 @@
   },
   "metrics": {
     "ssb_clean_blank_changed": {
-      "value": 37.0,
+      "value": 3.0,
       "tol": 120.0
     },
     "ssb_click_resid_db": {
-      "value": -9.243842274534181,
+      "value": -9.24641524927698,
       "tol": 0.8
     },
     "wfm_side_hiss_db": {
@@ -29,11 +29,11 @@
       "tol": 1.5
     },
     "am_sinr_gain_db": {
-      "value": 0.453840154283367,
+      "value": 13.710321733177366,
       "tol": 1.0
     },
     "nr_ssb_delta_rms_db": {
-      "value": -0.5183096016156836,
+      "value": -0.5185121739706211,
       "tol": 0.5
     },
     "ssb_cer_off_0db": {
@@ -137,7 +137,7 @@
       "tol": 2.0
     },
     "sic_offgrid_cancel_db": {
-      "value": 26.901478874116332,
+      "value": 32.00722871391005,
       "tol": 3.0
     }
   }

@@ -182,6 +182,17 @@ def blank_impulses_iq(iq_if: np.ndarray, thr_k: float = 6.0,
         ends_a = np.asarray(ends[:512], dtype=np.int32)
         valid = (widths > 0) & (widths <= max_width)
         if np.any(valid):
+            # 孤立突出チェック: 真のインパルスは直前/直後の振幅より急峻に突出する。
+            # 滑らかな音声包絡クレストの頂上が閾値を僅かに超えただけのものは除外。
+            magp = np.append(mag, np.float32(0.0))
+            idx = np.empty(2 * len(starts_a), dtype=np.int64)
+            idx[0::2] = starts_a
+            idx[1::2] = ends_a
+            peak = np.maximum.reduceat(magp, idx)[0::2]
+            bound = np.maximum(
+                np.where(starts_a > 0, magp[np.maximum(starts_a - 1, 0)], 0.0),
+                magp[ends_a])
+            valid &= peak > bound * 1.35
             wv = widths[valid]
             sv = starts_a[valid]
             ev = ends_a[valid]

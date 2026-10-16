@@ -589,19 +589,26 @@ class DigitalSelfInterferenceCanceller:
             e = out - i_hat
 
             # 4. NLMS 適応重み更新: w <- w + mu * <e * conj(basis)>
-            corr = np.mean(e * np.conj(basis))
-            w_new = w + self.mu * corr
-
-            # 5. 周波数追従: 重みのブロック間位相回転から基底周波数誤差を
-            # 推定する (検出の格子量子化・ドリフト吸収)。振幅が育ってから
-            # 開始し、トーン不在時は補正を0へ戻す (再捕捉の妨げ防止)。
+            # ロック初期 (age<6) は引き込みを加速する (1ブロック1更新のため
+            # mu=0.08のままでは40ブロックでも残留が大きい)。
             age = int(self._lock_age[i]) if i < len(self._lock_age) else 0
+            corr = np.mean(e * np.conj(basis))
+            mu_eff = max(float(self.mu), 0.35 if age < 6 else float(self.mu))
+            w_new = w + mu_eff * corr
+
+            # 5. 周波数追従: 瞬時重み推定 (w+corr) とブロック前重みの位相差から
+            # 基底周波数誤差を推定する (検出の格子量子化・ドリフト吸収)。
+            # 更新後の重みで見るとmu倍に縮退するため瞬時推定を使う。
+            # 振幅が育ってから開始し、トーン不在時は補正を0へ戻す。
             self._lock_age[i] = age + 1
             if abs(corr) > self.proj_min:
-                if age >= 3 and abs(w) > 1e-9:
-                    dphi = np.angle(complex(w_new) * np.conj(complex(w)))
+                if age >= 1 and abs(w) > 1e-6:
+                    w_inst = complex(w) + complex(corr)
+                    dphi = np.angle(w_inst * np.conj(complex(w)))
                     df_est = float(dphi) / (2.0 * np.pi * (n / self.fs))
-                    c = float(self.freq_corr[i]) + self.track_gain * df_est
+                    # ロックが進むほど追従ゲインを絞り、他成分による推定ジッタを平均化する
+                    gain = self.track_gain / (1.0 + age / 6.0)
+                    c = float(self.freq_corr[i]) + max(gain, 0.02) * df_est
                     c = max(-self.track_max_corr_hz,
                             min(self.track_max_corr_hz, c))
                     self.freq_corr[i] = c
@@ -609,7 +616,8 @@ class DigitalSelfInterferenceCanceller:
                 self.freq_corr[i] = float(self.freq_corr[i]) * 0.9
             self.weights[i] = complex(w_new)
 
-            out = e
+            # 更新後の重みで消去した信号を出力する
+            out = out - complex(w_new) * basis
 
         p_clean = float(np.mean(np.abs(out) ** 2)) + 1e-12
         if p_orig > p_clean:
